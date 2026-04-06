@@ -1,5 +1,5 @@
 # 💫 About Me:
-I am a vibe coder <br>I am a UI/UX designer <br>I am a copywritter<br>I am an agency owner
+I am a vibe coder <br>I am a UI/UX designer <br>I am a copywriter <br>I am an agency owner
 
 
 ## 🌐 Socials:
