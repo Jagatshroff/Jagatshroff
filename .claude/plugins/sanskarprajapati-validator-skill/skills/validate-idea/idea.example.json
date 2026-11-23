@@ -1,0 +1,25 @@
+{
+  "idea": "One inbox for every messaging app, grouped by person, with local AI that says who you owe a reply.",
+  "target": "Solo recruiters who work leads across email, LinkedIn and WhatsApp.",
+  "problem": "Replies get missed because conversations are spread over four apps and nobody tracks who is waiting.",
+  "hypothesis": "Solo recruiters lose placements to missed replies and would pay $20 to $40 a month to see every waiting conversation in one place.",
+  "search": {
+    "terms": ["\"unified inbox\"", "\"too many messaging apps\"", "\"missed a message\" linkedin whatsapp"],
+    "subreddits": ["recruiting", "beeper", "productivity"],
+    "competitor_apps": [
+      {"name": "Beeper", "app_store_id": "6499013100"}
+    ]
+  },
+  "bar": {
+    "evidence": {
+      "min_complaints": 100,
+      "min_money_signals": 10,
+      "max_age_months": 24
+    },
+    "real_world": [
+      "200 waitlist signups from strangers",
+      "10 paid, refundable preorders"
+    ]
+  },
+  "created": "2026-10-26"
+}

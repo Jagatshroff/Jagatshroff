@@ -1,0 +1,5 @@
+{"feed": {"entry": [
+  {"author": {"name": {"label": "Rev One"}}, "updated": {"label": "2026-10-23T10:39:07-07:00"}, "im:rating": {"label": "2"}, "id": {"label": "9001"}, "title": {"label": "Banned on WhatsApp"}, "content": {"label": "Got my WhatsApp number banned just by connecting Facebook."}},
+  {"author": {"name": {"label": "Rev Two"}}, "updated": {"label": "2026-10-20T08:00:00-07:00"}, "im:rating": {"label": "5"}, "id": {"label": "9002"}, "title": {"label": "Love it"}, "content": {"label": "Best app ever, everything in one place."}},
+  {"author": {"name": {"label": "Rev Three"}}, "updated": {"label": "2026-10-18T08:00:00-07:00"}, "im:rating": {"label": "3"}, "id": {"label": "9003"}, "title": {"label": "Drains battery"}, "content": {"label": "Works, but the bridges drain my battery by noon."}}
+]}}

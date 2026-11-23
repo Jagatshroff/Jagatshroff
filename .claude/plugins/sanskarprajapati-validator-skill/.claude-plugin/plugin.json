@@ -1,0 +1,21 @@
+{
+  "name": "validator-skill",
+  "description": "Eleven free Claude skills that test a startup idea against up to 1,000 real complaints before you build it: mine Reddit, Hacker News and app reviews, score the pain, find who pays, then put the idea on trial. Free, MIT.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Sanskar Prajapati",
+    "url": "https://theaiadventurer.com"
+  },
+  "homepage": "https://github.com/sanskarprajapati/validator-skill",
+  "repository": "https://github.com/sanskarprajapati/validator-skill",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "claude-skills",
+    "startup",
+    "idea-validation",
+    "market-research",
+    "customer-discovery",
+    "subagents"
+  ]
+}

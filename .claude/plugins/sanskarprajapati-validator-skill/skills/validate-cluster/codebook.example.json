@@ -1,0 +1,10 @@
+{
+  "themes": [
+    {"key": "too-many-apps", "name": "Too many apps to check", "definition": "Conversations are spread over several apps and checking them all is a chore."},
+    {"key": "missed-replies", "name": "Missed or late replies", "definition": "A message was lost, forgotten or answered too late because of where it landed."},
+    {"key": "connections-drop", "name": "Connections drop or get banned", "definition": "An existing multi-app tool disconnects, stops syncing, or gets an account flagged."},
+    {"key": "no-triage", "name": "No sense of what matters", "definition": "Everything looks equally urgent; the writer cannot tell who is waiting on them."},
+    {"key": "team-handoff", "name": "Team cannot see each other's chats", "definition": "Leads and customers live in one person's phone, so colleagues cannot follow up."},
+    {"key": "price", "name": "Existing tools cost too much", "definition": "The writer finds current tools overpriced or will not pay for them."}
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "validator-skill",
+  "description": "The Validator skill pack for Claude",
+  "owner": {
+    "name": "Sanskar Prajapati",
+    "url": "https://theaiadventurer.com"
+  },
+  "plugins": [
+    {
+      "name": "validator-skill",
+      "description": "Eleven Claude skills that test a startup idea against real complaints: intake, a complaint miner, a pain mapper, a pain index, a beachhead picker, a price reader, competitor gaps, a prospect list, an interview kit, a smoke test and a trial that rules go, narrow or kill.",
+      "source": "./",
+      "category": "productivity",
+      "homepage": "https://github.com/sanskarprajapati/validator-skill"
+    }
+  ]
+}

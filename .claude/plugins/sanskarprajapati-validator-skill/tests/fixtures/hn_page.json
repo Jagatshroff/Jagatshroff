@@ -1,0 +1,5 @@
+{"nbPages": 1, "page": 0, "hits": [
+  {"objectID": "101", "author": "hn_one", "title": null, "comment_text": "I built my own unified inbox script because nothing else handled &quot;who do I owe a reply&quot;.<p>Took a weekend.", "story_text": null, "created_at": "2026-10-07T03:33:59Z", "created_at_i": 1791344039, "points": null, "_tags": ["comment", "story_100"]},
+  {"objectID": "102", "author": "hn_two", "title": "Ask HN: Anyone happy with a unified inbox?", "comment_text": null, "story_text": "Looking for one that covers Slack and email.", "created_at": "2026-10-01T10:00:00Z", "created_at_i": 1790848800, "points": 12, "_tags": ["story", "ask_hn"]},
+  {"objectID": "103", "author": "hn_three", "title": null, "comment_text": "The amendment was unified in purpose but the inbox of history is long.", "story_text": null, "created_at": "2026-09-23T19:25:41Z", "created_at_i": 1790191541, "points": null, "_tags": ["comment"]}
+]}
