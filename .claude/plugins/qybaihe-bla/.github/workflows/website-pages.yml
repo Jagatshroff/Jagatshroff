@@ -1,0 +1,28 @@
+name: Website Check
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/website-pages.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "website/**"
+  workflow_dispatch:
+
+# Read-only: this workflow only checks out the tree and runs shell assertions
+# over checked-in website files. It never writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  check-website:
+    name: Verify website HTML, assets & links
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify website pages, CSP headers, assets, and internal links
+        run: node scripts/verify-website.mjs
