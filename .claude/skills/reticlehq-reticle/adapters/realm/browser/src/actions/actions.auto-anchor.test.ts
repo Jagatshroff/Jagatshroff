@@ -1,0 +1,244 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { executeAction } from './actions.js';
+import { refs } from '@/dom/addressing/refs.js';
+import { registerAdapter, type ComponentInfo } from '@/registry/stores/adapters.js';
+
+/**
+ * Auto-anchor capture at act time: when an acted element has NO data-testid, the result carries the
+ * element's component name + source (from the framework adapter) so the server compiles a STABLE
+ * component anchor instead of a degraded ref. A testid still wins (lean — no component noise).
+ */
+beforeEach(() => {
+  document.body.innerHTML = '';
+});
+
+describe('act result — auto-anchor fallback (component/source when no testid)', () => {
+  it('attaches component + source for an element with no testid', async () => {
+    // Fake adapter: read component identity from data-component / data-src attributes.
+    registerAdapter({
+      name: 'aa-fake',
+      identify: (el: Element): ComponentInfo | null => {
+        const owner = el.closest('[data-component]');
+        const name = owner?.getAttribute('data-component');
+        if (null === name || name === undefined) {
+          return null;
+        }
+        const src = owner?.getAttribute('data-src');
+        const info: ComponentInfo = { componentStack: [name] };
+        if (src !== null && src !== undefined) {
+          const [file, line] = src.split(':');
+          if (file !== undefined && line !== undefined) {
+            info.source = { file, line: Number(line) };
+          }
+        }
+        return info;
+      },
+    });
+    document.body.innerHTML =
+      '<div data-component="NewDeployButton" data-src="src/Deployments.tsx:107"><button>Open panel</button></div>';
+    const btn = document.querySelector('button') as HTMLButtonElement;
+    const res = await executeAction(refs.refFor(btn), 'click', {});
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) {
+      throw new Error('expected ok');
+    }
+    expect(res.testid).toBeUndefined();
+    expect(res.component).toBe('NewDeployButton');
+    expect(res.source).toEqual({ file: 'src/Deployments.tsx', line: 107 });
+  });
+
+  /**
+   * ANCHOR and SOURCE answer different questions, and collapsing them cost us the more valuable one.
+   *
+   *   anchor — how do I find this element again on the next run?   (testid wins; stays lean)
+   *   source — where in the codebase is this element defined?       (always worth carrying)
+   *
+   * The original rule was "a testid wins, so skip the component walk", which silently made source
+   * conditional on the element NOT having a testid. The perverse result: an app that followed
+   * Reticle's own advice and added data-testid everywhere got fewer source pointers than an
+   * uninstrumented one. Since locating the right file is the most valuable thing we can hand an
+   * agent, the anchor's leanness is not worth paying for with it.
+   */
+  it('carries source even when a testid is present', async () => {
+    registerAdapter({
+      name: 'aa-fake',
+      identify: (el: Element): ComponentInfo | null => {
+        const owner = el.closest('[data-component]');
+        const name = owner?.getAttribute('data-component');
+        if (null === name || name === undefined) {
+          return null;
+        }
+        return { componentStack: [name], source: { file: 'src/Topbar.tsx', line: 31 } };
+      },
+    });
+    document.body.innerHTML =
+      '<div data-component="Topbar" data-src="src/Topbar.tsx:31">' +
+      '<button data-testid="new-deploy">Open panel</button></div>';
+    const btn = document.querySelector('button') as HTMLButtonElement;
+    const res = await executeAction(refs.refFor(btn), 'click', {});
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) {
+      throw new Error('expected ok');
+    }
+    expect(res.testid).toBe('new-deploy');
+    expect(res.source).toEqual({ file: 'src/Topbar.tsx', line: 31 });
+    expect(res.component).toBe('Topbar');
+  });
+
+  it('still reports the testid as the anchor when no source is discoverable', async () => {
+    registerAdapter({ name: 'aa-fake', identify: (): ComponentInfo | null => null });
+    document.body.innerHTML = '<button data-testid="new-deploy">Open panel</button>';
+    const btn = document.querySelector('button') as HTMLButtonElement;
+    const res = await executeAction(refs.refFor(btn), 'click', {});
+
+    expect(res.ok).toBe(true);
+    if (!res.ok) {
+      throw new Error('expected ok');
+    }
+    expect(res.testid).toBe('new-deploy');
+    expect(res.source).toBeUndefined();
+  });
+});
+
+/**
+ * An element with a role but NO accessible name reported neither.
+ *
+ * `anchorOf` set `role` and `name` together or not at all. An icon button, a clickable div, a
+ * control whose label is an SVG — all have a role and no name, and once `identifyComponent`
+ * (React-specific) also returns nothing, the act reply carried NO identity whatsoever.
+ *
+ * Two features read that identity and both quietly degrade without it: the flow recorder anchors a
+ * step by it, and `reticle_coverage` recognises a control it already drove across a re-render by it.
+ * Reported from a sweep as `exercised: 0` after four successful acts, on the non-React stacks.
+ *
+ * A role alone is not a unique anchor and nothing here pretends it is — the flow compiler still
+ * requires role AND name before it will anchor a step that way. But it is real information, and
+ * reporting it is strictly better than reporting nothing.
+ */
+describe('anchor identity when there is no accessible name', () => {
+  it('reports the role even when the name is empty', async () => {
+    document.body.innerHTML = '<button id="icon"><svg></svg></button>';
+    const el = document.querySelector('#icon');
+    if (null === el) {
+      throw new Error('fixture missing');
+    }
+    const ref = refs.refFor(el);
+    const out = await executeAction(ref, 'click', {});
+    expect(out.role).toBe('button');
+    expect(out.name).toBeUndefined();
+  });
+
+  /*
+   * A table row of icon-only buttons (QR, edit, delete) between named ones. Without a position the
+   * saved step could not tell the edit button from the delete button, so it could not replay.
+   */
+  it('reports the position among the NAMELESS controls of the role', async () => {
+    document.body.innerHTML =
+      '<button>Copy</button><button id="qr"><svg></svg></button><button id="edit"><svg></svg></button><button>Close</button><button id="del"><svg></svg></button>';
+    const edit = document.querySelector('#edit');
+    if (null === edit) {
+      throw new Error('fixture missing');
+    }
+    const out = await executeAction(refs.refFor(edit), 'click', {});
+    if (!out.ok) {
+      throw new Error('expected ok');
+    }
+    expect([out.nth, out.of]).toEqual([1, 3]);
+  });
+
+  it('reports no position for the only nameless control of its role', async () => {
+    document.body.innerHTML = '<button>Copy</button><button id="icon"><svg></svg></button>';
+    const el = document.querySelector('#icon');
+    if (null === el) {
+      throw new Error('fixture missing');
+    }
+    const out = await executeAction(refs.refFor(el), 'click', {});
+    if (!out.ok) {
+      throw new Error('expected ok');
+    }
+    expect([out.nth, out.of]).toEqual([undefined, undefined]);
+  });
+
+  it('still reports both when both exist', async () => {
+    document.body.innerHTML = '<button id="named">Details</button>';
+    const el = document.querySelector('#named');
+    if (null === el) {
+      throw new Error('fixture missing');
+    }
+    const out = await executeAction(refs.refFor(el), 'click', {});
+    expect(out.role).toBe('button');
+    expect(out.name).toBe('Details');
+  });
+});
+
+/** From a recorded drive: a sidebar link and a card link both named "Transactions". */
+describe('act result — which of several same-named controls', () => {
+  it('reports the position among namesakes, and nothing when the name is unique', async () => {
+    document.body.innerHTML =
+      '<nav><a href="#/t">Transactions</a></nav><main><a href="#/t">Transactions</a><a href="#/s">Settings</a></main>';
+    const links = document.querySelectorAll('a');
+    const second = await executeAction(refs.refFor(links[1] as HTMLElement), 'click', {});
+    if (!second.ok) {
+      throw new Error('expected ok');
+    }
+    expect([second.nth, second.of]).toEqual([1, 2]);
+    const unique = await executeAction(refs.refFor(links[2] as HTMLElement), 'click', {});
+    if (!unique.ok) {
+      throw new Error('expected ok');
+    }
+    expect([unique.nth, unique.of]).toEqual([undefined, undefined]);
+  });
+
+  /*
+   * A password field labelled in French was saved in clear: the server knew the field only by its
+   * name. The act result says the target holds a secret, so the server redacts by what the field is.
+   */
+  it('marks an act on a password input secret, and leaves a plain field unmarked', async () => {
+    document.body.innerHTML =
+      '<label>Mot de passe <input type="password"></label><label>Nom <input type="text"></label>';
+    const [pw, plain] = Array.from(document.querySelectorAll('input'));
+    if (pw === undefined || plain === undefined) {
+      throw new Error('no inputs');
+    }
+    const secret = await executeAction(refs.refFor(pw), 'fill', { value: 'x' });
+    const open = await executeAction(refs.refFor(plain), 'fill', { value: 'x' });
+    if (!secret.ok || !open.ok) {
+      throw new Error('expected ok');
+    }
+    expect(secret.secret).toBe(true);
+    expect(open.secret).toBeUndefined();
+  });
+});
+
+/**
+ * A test id several elements share is not an anchor: a replay takes the first. Measured on a
+ * dashboard where `runs-result` sat on six buttons and `fact-more` on twenty-two, so a saved step
+ * replayed onto another row. The act result says how many share it, so the save can choose.
+ */
+describe('act result — a shared test id is counted', () => {
+  it('says how many elements carry the acted test id when more than one does', async () => {
+    document.body.innerHTML =
+      '<button data-testid="runs-result">Run 1</button><button data-testid="runs-result">Run 2</button>';
+    const second = document.querySelectorAll('button')[1] as HTMLButtonElement;
+    const res = await executeAction(refs.refFor(second), 'click', {});
+    if (!res.ok) {
+      throw new Error('expected ok');
+    }
+    expect(res.testid).toBe('runs-result');
+    expect(res.testidOf).toBe(2);
+    // Which of them was acted on, in page order, so a replay can take the same one (#2135).
+    expect(res.testidNth).toBe(1);
+  });
+
+  it('says nothing for a test id only one element carries', async () => {
+    document.body.innerHTML = '<button data-testid="save">Save</button>';
+    const btn = document.querySelector('button') as HTMLButtonElement;
+    const res = await executeAction(refs.refFor(btn), 'click', {});
+    if (!res.ok) {
+      throw new Error('expected ok');
+    }
+    expect(res.testidOf).toBeUndefined();
+  });
+});

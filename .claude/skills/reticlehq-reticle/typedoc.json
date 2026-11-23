@@ -1,0 +1,26 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "Reticle API Reference",
+  "entryPointStrategy": "resolve",
+  "entryPoints": [
+    "core/src/index.ts",
+    "adapters/realm/browser/src/index.ts",
+    "adapters/framework/react/src/index.ts",
+    "server/src/index.ts",
+    "spec-runner/src/index.ts",
+    "adapters/build/vite/src/index.ts"
+  ],
+  "exclude": ["**/*.test.ts", "**/*.integration.test.ts", "**/node_modules/**"],
+  "out": "docs-api",
+  "includeVersion": true,
+  "hideGenerator": true,
+  "navigationLinks": {
+    "Guides": "https://github.com/reticlehq/reticle/tree/main/docs",
+    "GitHub": "https://github.com/reticlehq/reticle"
+  },
+  "readme": "none",
+  "excludePrivate": true,
+  "excludeInternal": true,
+  "skipErrorChecking": true,
+  "githubPages": true
+}

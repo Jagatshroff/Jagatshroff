@@ -1,15 +1,32 @@
 ---
 name: frontend-patterns
-description: React、Next.js、状態管理、パフォーマンス最適化、UIベストプラクティスのためのフロントエンド開発パターン。
+description: Frontend development patterns for React, Next.js, state management, performance optimization, and UI best practices. Use when building or reviewing React or Next.js components, state, or render performance.
+license: MIT
 ---
 
-# フロントエンド開発パターン
+# Frontend Development Patterns
 
-React、Next.js、高性能ユーザーインターフェースのためのモダンなフロントエンドパターン。
+Modern frontend patterns for React, Next.js, and performant user interfaces.
 
-## コンポーネントパターン
+## When to Activate
 
-### 継承よりコンポジション
+- Building React components (composition, props, rendering)
+- Managing state (useState, useReducer, Zustand, Context)
+- Implementing data fetching (SWR, React Query, server components)
+- Optimizing performance (memoization, virtualization, code splitting)
+- Working with forms (validation, controlled inputs, Zod schemas)
+- Handling client-side routing and navigation
+- Building accessible, responsive UI patterns
+
+## Privacy and Data Boundaries
+
+Frontend examples should use synthetic or domain-generic data. Do not collect, log, persist, or display credentials, access tokens, SSNs, health data, payment details, private emails, phone numbers, or other sensitive personal data unless the user explicitly requests a scoped implementation with appropriate validation, redaction, and access controls.
+
+Avoid adding analytics, tracking pixels, third-party scripts, or external data sinks without explicit approval. When handling user data, prefer least-privilege APIs, client-side redaction before logging, and server-side validation for every boundary.
+
+## Component Patterns
+
+### Composition Over Inheritance
 
 ```typescript
 // PASS: GOOD: Component composition
@@ -37,7 +54,7 @@ export function CardBody({ children }: { children: React.ReactNode }) {
 </Card>
 ```
 
-### 複合コンポーネント
+### Compound Components
 
 ```typescript
 interface TabsContextValue {
@@ -87,7 +104,7 @@ export function Tab({ id, children }: { id: string, children: React.ReactNode })
 </Tabs>
 ```
 
-### レンダープロップパターン
+### Render Props Pattern
 
 ```typescript
 interface DataLoaderProps<T> {
@@ -121,9 +138,9 @@ export function DataLoader<T>({ url, children }: DataLoaderProps<T>) {
 </DataLoader>
 ```
 
-## カスタムフックパターン
+## Custom Hooks Patterns
 
-### 状態管理フック
+### State Management Hook
 
 ```typescript
 export function useToggle(initialValue = false): [boolean, () => void] {
@@ -140,7 +157,7 @@ export function useToggle(initialValue = false): [boolean, () => void] {
 const [isOpen, toggleOpen] = useToggle()
 ```
 
-### 非同期データ取得フック
+### Async Data Fetching Hook
 
 ```typescript
 interface UseQueryOptions<T> {
@@ -208,7 +225,7 @@ const { data: markets, loading, error, refetch } = useQuery(
 )
 ```
 
-### デバウンスフック
+### Debounce Hook
 
 ```typescript
 export function useDebounce<T>(value: T, delay: number): T {
@@ -236,9 +253,9 @@ useEffect(() => {
 }, [debouncedQuery])
 ```
 
-## 状態管理パターン
+## State Management Patterns
 
-### Context + Reducerパターン
+### Context + Reducer Pattern
 
 ```typescript
 interface State {
@@ -291,9 +308,9 @@ export function useMarkets() {
 }
 ```
 
-## パフォーマンス最適化
+## Performance Optimization
 
-### メモ化
+### Memoization
 
 ```typescript
 // PASS: useMemo for expensive computations
@@ -318,7 +335,7 @@ export const MarketCard = React.memo<MarketCardProps>(({ market }) => {
 })
 ```
 
-### コード分割と遅延読み込み
+### Code Splitting & Lazy Loading
 
 ```typescript
 import { lazy, Suspense } from 'react'
@@ -342,7 +359,7 @@ export function Dashboard() {
 }
 ```
 
-### 長いリストの仮想化
+### Virtualization for Long Lists
 
 ```typescript
 import { useVirtualizer } from '@tanstack/react-virtual'
@@ -386,9 +403,9 @@ export function VirtualMarketList({ markets }: { markets: Market[] }) {
 }
 ```
 
-## フォーム処理パターン
+## Form Handling Patterns
 
-### バリデーション付き制御フォーム
+### Controlled Form with Validation
 
 ```typescript
 interface FormData {
@@ -463,7 +480,7 @@ export function CreateMarketForm() {
 }
 ```
 
-## エラーバウンダリパターン
+## Error Boundary Pattern
 
 ```typescript
 interface ErrorBoundaryState {
@@ -511,9 +528,9 @@ export class ErrorBoundary extends React.Component<
 </ErrorBoundary>
 ```
 
-## アニメーションパターン
+## Animation Patterns
 
-### Framer Motionアニメーション
+### Framer Motion Animations
 
 ```typescript
 import { motion, AnimatePresence } from 'framer-motion'
@@ -565,9 +582,9 @@ export function Modal({ isOpen, onClose, children }: ModalProps) {
 }
 ```
 
-## アクセシビリティパターン
+## Accessibility Patterns
 
-### キーボードナビゲーション
+### Keyboard Navigation
 
 ```typescript
 export function Dropdown({ options, onSelect }: DropdownProps) {
@@ -608,7 +625,7 @@ export function Dropdown({ options, onSelect }: DropdownProps) {
 }
 ```
 
-### フォーカス管理
+### Focus Management
 
 ```typescript
 export function Modal({ isOpen, onClose, children }: ModalProps) {
@@ -642,4 +659,4 @@ export function Modal({ isOpen, onClose, children }: ModalProps) {
 }
 ```
 
-**覚えておいてください**: モダンなフロントエンドパターンにより、保守可能で高性能なユーザーインターフェースを実装できます。プロジェクトの複雑さに適したパターンを選択してください。
+**Remember**: Modern frontend patterns enable maintainable, performant user interfaces. Choose patterns that fit your project complexity.

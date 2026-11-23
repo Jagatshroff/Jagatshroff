@@ -1,0 +1,255 @@
+// @vitest-environment jsdom
+import { describe, expect, it, vi } from 'vitest';
+import { ActionType } from '@reticlehq/core';
+import { executeAction } from './actions.js';
+import { refs } from '@/dom/addressing/refs.js';
+
+/**
+ * The gestures a web app actually receives, and which of them Reticle could not produce.
+ *
+ * Each of these was undriveable rather than merely awkward — a handler bound to the event simply
+ * never ran, so an agent asked to check the behaviour had no honest answer and the absence looked
+ * like a pass.
+ */
+const mount = (html: string): HTMLElement => {
+  document.body.innerHTML = html;
+  const el = document.body.firstElementChild;
+  if (!(el instanceof HTMLElement)) throw new Error('fixture did not mount');
+  return el;
+};
+
+const act = async (el: HTMLElement, action: string, args: Record<string, unknown> = {}) =>
+  executeAction(refs.refFor(el), action, args);
+
+describe('tap is a TOUCH, not a click with another name', () => {
+  it('fires the touch sequence a finger produces, in order', async () => {
+    const el = mount('<button>Save</button>');
+    const seen: string[] = [];
+    for (const type of ['pointerdown', 'touchstart', 'touchend', 'pointerup', 'click']) {
+      el.addEventListener(type, () => seen.push(type));
+    }
+    await act(el, ActionType.TAP);
+    expect(seen).toEqual(['pointerdown', 'touchstart', 'touchend', 'pointerup', 'click']);
+  });
+
+  it('says the pointer was a FINGER, which is the discriminator a touch handler reads', async () => {
+    const el = mount('<button>Save</button>');
+    let pointerType: string | undefined;
+    el.addEventListener('pointerdown', (e) => {
+      pointerType = e.pointerType;
+    });
+    await act(el, ActionType.TAP);
+    expect(pointerType, 'an app that branches on pointerType must see touch').toBe('touch');
+  });
+
+  it('still delivers the trailing click, because a touch device synthesises one', async () => {
+    // An app that only listens for `click` must work under a tap — that IS the thing worth checking.
+    const el = mount('<button>Save</button>');
+    const onClick = vi.fn();
+    el.addEventListener('click', onClick);
+    await act(el, ActionType.TAP);
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
+  it('puts the pointer at the element centre, where the touch lands', async () => {
+    // A handler that hit-tests from clientX/Y (a canvas, a map, a slider) reads the pointer
+    // events to locate the touch. They carried no coordinates, so every one read (0, 0): a
+    // touch in the top-left corner that never happened (#1851). The touch events already
+    // carry the centre; the pointer half of the same tap must agree with them.
+    const el = mount('<button>Save</button>');
+    el.getBoundingClientRect = () => new DOMRect(10, 20, 100, 40);
+    const seen: Array<[string, number, number]> = [];
+    el.addEventListener('pointerdown', (e) => seen.push(['down', e.clientX, e.clientY]));
+    el.addEventListener('pointerup', (e) => seen.push(['up', e.clientX, e.clientY]));
+    await act(el, ActionType.TAP);
+    expect(seen).toEqual([
+      ['down', 60, 40],
+      ['up', 60, 40],
+    ]);
+  });
+
+  it('puts the pointer at the named point when the tap names one, not at the centre', async () => {
+    const el = mount('<button>Save</button>');
+    el.getBoundingClientRect = () => new DOMRect(10, 20, 100, 40);
+    const seen: Array<[string, number, number]> = [];
+    el.addEventListener('pointerdown', (e) => seen.push(['down', e.clientX, e.clientY]));
+    el.addEventListener('pointerup', (e) => seen.push(['up', e.clientX, e.clientY]));
+    await act(el, ActionType.TAP, { at: { x: 0.25, y: 0.75 } });
+    expect(seen).toEqual([
+      ['down', 35, 50],
+      ['up', 35, 50],
+    ]);
+  });
+
+  it('holds for a long press, and reports the hold it ACHIEVED', async () => {
+    const el = mount('<button>Hold me</button>');
+    const result = await act(el, ActionType.TAP, { holdMs: 30 });
+    expect(result.effect?.heldMs ?? 0).toBeGreaterThanOrEqual(25);
+  });
+});
+
+describe('a key can be HELD, as a mouse button already could', () => {
+  it('emits the auto-repeat a browser sends while a key is down', async () => {
+    // The repeats are the point: an app that counts keydowns to drive a press-and-hold progress bar
+    // sees nothing from a bare down/up pair, so a hold with no repeat reports a gesture that
+    // visibly did not happen.
+    const el = mount('<input />');
+    let repeats = 0;
+    el.addEventListener('keydown', (e) => {
+      if (e.repeat) repeats += 1;
+    });
+    await act(el, ActionType.PRESS, { key: 'Backspace', holdMs: 120 });
+    expect(repeats).toBeGreaterThan(0);
+  });
+
+  it('releases the key exactly once, after the hold', async () => {
+    const el = mount('<input />');
+    const ups: number[] = [];
+    el.addEventListener('keyup', () => ups.push(Date.now()));
+    await act(el, ActionType.PRESS, { key: 'a', holdMs: 20 });
+    expect(ups).toHaveLength(1);
+  });
+});
+
+describe('several keys can be held together', () => {
+  it('presses in order and releases in REVERSE, as a keyboard physically does', async () => {
+    const el = mount('<input />');
+    const log: string[] = [];
+    el.addEventListener('keydown', (e) => log.push(`down:${e.key}`));
+    el.addEventListener('keyup', (e) => log.push(`up:${e.key}`));
+    await act(el, ActionType.PRESS, { keys: ['Control', 'k'] });
+    expect(log).toEqual(['down:Control', 'down:k', 'up:k', 'up:Control']);
+  });
+
+  it('keeps modifiers working, since they are a different thing from held keys', async () => {
+    const el = mount('<input />');
+    let meta = false;
+    el.addEventListener('keydown', (e) => {
+      if ('k' === e.key) meta = e.metaKey;
+    });
+    await act(el, ActionType.PRESS, { key: 'k', modifiers: ['Meta'] });
+    expect(meta, 'cmd+k must still be a modifier flag, not a held key').toBe(true);
+  });
+});
+
+describe('scroll goes back, and sideways', () => {
+  const scroller = (): HTMLElement => {
+    // Longhand, not the `overflow` shorthand: jsdom's getComputedStyle does not expand it, so
+    // `overflowY` reads `visible` and the element is not recognised as scrollable at all.
+    const el = mount('<div style="overflow-y:auto;overflow-x:auto">content</div>');
+    Object.defineProperty(el, 'scrollHeight', { value: 2000, configurable: true });
+    Object.defineProperty(el, 'clientHeight', { value: 500, configurable: true });
+    Object.defineProperty(el, 'scrollWidth', { value: 3000, configurable: true });
+    Object.defineProperty(el, 'clientWidth', { value: 500, configurable: true });
+    return el;
+  };
+
+  it('scrolls BACK on a negative dy — the direction that did not exist', async () => {
+    const el = scroller();
+    el.scrollTop = 900;
+    await act(el, ActionType.SCROLL, { dy: -400 });
+    expect(el.scrollTop, 'whatever scrolled past used to be unreachable').toBe(500);
+  });
+
+  it('scrolls sideways on dx, which inspect already reported and nothing could act on', async () => {
+    const el = scroller();
+    el.scrollLeft = 100;
+    await act(el, ActionType.SCROLL, { dx: 250 });
+    expect(el.scrollLeft).toBe(350);
+  });
+
+  it('sends a cancelable wheel event and leaves the movement to the page', async () => {
+    const el = scroller();
+    el.scrollTop = 100;
+    el.scrollLeft = 100;
+    const seen: Array<{ deltaX: number; deltaY: number; cancelable: boolean }> = [];
+    el.addEventListener('wheel', (event) => {
+      seen.push({ deltaX: event.deltaX, deltaY: event.deltaY, cancelable: event.cancelable });
+    });
+
+    await act(el, ActionType.SCROLL, { dx: 250, dy: 600, wheel: true });
+
+    expect(seen).toEqual([{ deltaX: 250, deltaY: 600, cancelable: true }]);
+    expect(el.scrollTop, 'the page moves, not the action').toBe(100);
+    expect(el.scrollLeft, 'the page moves, not the action').toBe(100);
+  });
+
+  it('dispatches on the named element, so a listener under the scroller still sees it', async () => {
+    const el = scroller();
+    const child = document.createElement('span');
+    el.appendChild(child);
+    let seen = 0;
+    child.addEventListener('wheel', () => {
+      seen += 1;
+    });
+
+    await act(child, ActionType.SCROLL, { dy: 600, wheel: true });
+
+    expect(seen).toBe(1);
+  });
+
+  it('refuses wheel with fraction, because a wheel event cannot land on an exact fraction', async () => {
+    const el = scroller();
+    await expect(act(el, ActionType.SCROLL, { fraction: 0.5, wheel: true })).rejects.toThrow(
+      /cannot use fraction/,
+    );
+  });
+});
+
+describe('hover carries where the pointer is', () => {
+  it('puts the enter and move pointer events at the element centre', async () => {
+    // The tap half of #1851. A hover handler that hit-tests from clientX/Y (a canvas, a
+    // map, a tooltip anchor) read (0, 0) from these events, because they carried no
+    // coordinates at all.
+    const el = mount('<button>Save</button>');
+    el.getBoundingClientRect = () => new DOMRect(10, 20, 100, 40);
+    const seen: Array<[string, number, number]> = [];
+    for (const type of ['pointerover', 'pointerenter', 'pointermove']) {
+      el.addEventListener(type, (e) =>
+        seen.push([type, (e as PointerEvent).clientX, (e as PointerEvent).clientY]),
+      );
+    }
+    await act(el, ActionType.HOVER);
+    expect(seen).toEqual([
+      ['pointerover', 60, 40],
+      ['pointerenter', 60, 40],
+      ['pointermove', 60, 40],
+    ]);
+  });
+
+  it('puts the leave events at the centre of the element the pointer leaves', async () => {
+    // The other half of the same path: moving to a second element leaves the first.
+    // The pointer events on the way out carried the first element's centre, but the
+    // mouse events did not, so a hit-testing handler read (0, 0) from mouseout and
+    // mouseleave for a pointer that was never there (#1851).
+    const first = mount('<button>First</button>');
+    const second = document.createElement('button');
+    second.textContent = 'Second';
+    document.body.appendChild(second);
+    first.getBoundingClientRect = () => new DOMRect(10, 20, 100, 40);
+    const seen: Array<[string, number, number]> = [];
+    for (const type of ['pointerout', 'mouseout', 'mouseleave']) {
+      first.addEventListener(type, (e) =>
+        seen.push([type, (e as MouseEvent).clientX, (e as MouseEvent).clientY]),
+      );
+    }
+    await act(first, ActionType.HOVER);
+    await act(second, ActionType.HOVER);
+    expect(seen).toEqual([
+      ['pointerout', 60, 40],
+      ['mouseout', 60, 40],
+      ['mouseleave', 60, 40],
+    ]);
+  });
+});
+
+describe('zoom refuses rather than faking it', () => {
+  it('will not approximate browser zoom with CSS, and says why', async () => {
+    // A CSS zoom looks right in a screenshot and changes nothing a layout bug depends on: the
+    // layout viewport, visualViewport and media queries all stay put. Reporting that as CHECKED is
+    // worse than not supporting zoom — same rule as hover refusing without a native pointer.
+    const el = mount('<div>page</div>');
+    await expect(act(el, ActionType.ZOOM, { level: 2 })).rejects.toThrow(/cannot zoom from inside/);
+    expect(document.documentElement.style.zoom, 'nothing may be faked on the way out').toBe('');
+  });
+});

@@ -1,0 +1,504 @@
+import {
+  DepartedNetField,
+  EventType,
+  NetInitiator,
+  URL_RAW,
+  urlForMatch,
+  type ReticleEvent,
+} from '@reticlehq/core';
+import { asNumber, asString } from '@reticlehq/core';
+import { mergeNetworkDetail } from './network-detail-merge.js';
+
+/**
+ * The friendly bucket names reticle_observe's `filters` param advertises → the real event types.
+ *
+ * The schema promised `dom | net | route | console | animation | signal`, but the handler filtered
+ * with `filters.includes(e.type)` against types like `net.request` and `dom.added` — so every
+ * documented value matched nothing, and an agent passing `filters:['net']` to trim its payload got an
+ * EMPTY timeline instead. Empty reads as "the app did nothing" — a false green produced by using the
+ * feature exactly as documented. Mapping the bucket to its member types makes the documented values
+ * work; raw types are still accepted (see eventMatchesFilters) so neither spelling surprises a caller.
+ */
+export const OBSERVE_FILTER_BUCKETS: Record<string, readonly string[]> = {
+  dom: [EventType.DOM_ADDED, EventType.DOM_REMOVED, EventType.DOM_ATTR, EventType.DOM_TEXT],
+  net: [EventType.NET_REQUEST, EventType.NET_PENDING, EventType.NET_STREAM],
+  route: [EventType.ROUTE_CHANGE],
+  console: [EventType.CONSOLE_ERROR, EventType.ERROR_UNCAUGHT],
+  animation: [EventType.ANIM_START, EventType.ANIM_END],
+  signal: [EventType.SIGNAL],
+  // perf/state/storage are single-type buckets. They resolve through the raw-type fallback anyway,
+  // but naming them keeps the advertised vocabulary and the real one identical — the mismatch between
+  // those two is the bug this map exists to fix, so leaving observable types out of it would reopen it.
+  perf: [EventType.PERF],
+  state: [EventType.STATE_CHANGE],
+  storage: [EventType.STORAGE_CHANGE],
+};
+
+/**
+ * True when an event passes an observe `filters` allowlist. A filter entry matches either as a bucket
+ * name (`net` keeps every net.* type) or as a raw event type (`net.request`). Unknown entries match
+ * nothing rather than throwing — a typo narrows the result, it never crashes the observe.
+ */
+export function eventMatchesFilters(e: ReticleEvent, filters: readonly string[]): boolean {
+  for (const f of filters) {
+    // `Object.hasOwn`, not a bare index: a plain-object map inherits from Object.prototype, so a
+    // filter value like "toString" or "hasOwnProperty" would resolve to the inherited FUNCTION and
+    // then `.includes` would throw — a crash on an odd-but-harmless agent input. Only an OWN key is a
+    // real bucket; anything else falls through to the raw-type comparison.
+    const bucket = Object.hasOwn(OBSERVE_FILTER_BUCKETS, f) ? OBSERVE_FILTER_BUCKETS[f] : undefined;
+    if (bucket !== undefined ? bucket.includes(e.type) : e.type === f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Match a net.request event against optional method/url/status/ok filters (reticle_network).
+ *
+ * `ok` is the filter the tool's own description points at for desktop IPC, whose 200/500 is derived
+ * rather than sent by any server. A still-PENDING call never matches an `ok` filter in either
+ * direction: unresolved is not the same as failed, and answering "yes, it failed" about a request
+ * still in flight is the false green this whole surface exists to prevent.
+ */
+export function matchNet(
+  e: ReticleEvent,
+  method: string | undefined,
+  urlContains: string | undefined,
+  status: number | undefined,
+  ok?: boolean,
+): boolean {
+  const d = e.data;
+  if (method !== undefined && asString(d['method'])?.toUpperCase() !== method.toUpperCase()) {
+    return false;
+  }
+  if (urlContains !== undefined && !urlForMatch(d).includes(urlContains)) {
+    return false;
+  }
+  if (status !== undefined && asNumber(d['status']) !== status) {
+    return false;
+  }
+  if (ok !== undefined && d['ok'] !== ok) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Reconcile network events into completed calls + still-in-flight calls. A NET_PENDING whose
+ * `id` never gets a matching NET_REQUEST is an unresolved/hung request — the case
+ * completion-only logging is blind to. Pending events are annotated `{ status: 'pending',
+ * pending: true }` so a numeric `status` filter excludes them but `urlContains`/`method` match.
+ */
+export function reconcileNet(events: ReticleEvent[]): ReticleEvent[] {
+  // Fold CDP-authoritative detail (driven path) onto the matching in-page request first, so the driven
+  // view carries the full headers/status the page-side wrapper couldn't see (no-op when none present).
+  events = mergeNetworkDetail(events);
+  const completed = events.filter((e) => e.type === EventType.NET_REQUEST);
+  const doneIds = new Set(
+    completed.map((e) => asString(e.data['id'])).filter((id): id is string => id !== undefined),
+  );
+  const unresolved = events
+    .filter((e) => {
+      if (e.type !== EventType.NET_PENDING) {
+        return false;
+      }
+      const id = asString(e.data['id']);
+      return id === undefined || !doneIds.has(id);
+    })
+    .map((e): ReticleEvent => ({ ...e, data: { ...e.data, status: 'pending', pending: true } }));
+  return [...completed, ...unresolved].sort((a, b) => a.t - b.t);
+}
+
+/**
+ * Strip the grader-only raw URL before an event is rendered to the agent.
+ *
+ * `urlRaw` exists so `urlContains` can match a path redaction rewrote. It is a secret-bearing field
+ * by construction (the whole reason `url` was redacted) and must never appear in observe, evidence,
+ * or a network listing.
+ */
+export function withoutUrlRaw(event: unknown): unknown {
+  if (typeof event !== 'object' || null === event) {
+    return event;
+  }
+  const rec = event as Record<string, unknown>;
+  const data = rec['data'];
+  if (typeof data !== 'object' || null === data || !(URL_RAW in data)) {
+    return event;
+  }
+  const { [URL_RAW]: _raw, ...rest } = data as Record<string, unknown>;
+  return { ...rec, data: rest };
+}
+
+/** Compact network-call summary for reticle_network output — drops event plumbing (t, type,
+ * sessionId, ref, id, initiator, ok) the agent never needs, keeping only method/url/status/ms.
+ * This is the bulk of the token cost: raw ReticleEvent objects are ~5x larger than this. */
+interface NetCallView {
+  method: string;
+  url: string;
+  status?: number | string;
+  statusText?: string;
+  contentType?: string;
+  responseSize?: number;
+  requestBody?: string;
+  responseBody?: string;
+  bodyTruncated?: boolean;
+  ms?: number;
+  /** Authoritative response headers merged from the driven (CDP) path — present only when driven. */
+  headers?: Record<string, string>;
+  /**
+   * A fire-and-forget desktop IPC send (`ipcRenderer.send`): dispatched, outcome unknowable.
+   *
+   * Carried into the projection on purpose. Such a record has no `status` and no `ok`, and without
+   * this flag a reader has no way to tell "the outcome is unknown" from "the fields were dropped" —
+   * which is the reading that turns an unverifiable call into an assumed success.
+   */
+  oneWay?: boolean;
+  /**
+   * The document before this one made this request, and the daemon carried it here (#1944). Its
+   * place in the list is when this document connected, not when the request happened.
+   */
+  fromDepartedDocument?: boolean;
+  /** Its page unloaded before the answer arrived: the outcome is unknown, not failed (#1944). */
+  pageUnloaded?: boolean;
+}
+export function projectNetCall(e: ReticleEvent, includeBodies = true): NetCallView {
+  const status = e.data['status'];
+  const ms = asNumber(e.data['durationMs']);
+  const statusText = asString(e.data['statusText']);
+  const contentType = asString(e.data['contentType']);
+  const responseSize = asNumber(e.data['responseSize']);
+  const requestBody = asString(e.data['requestBody']);
+  const responseBody = asString(e.data['responseBody']);
+  const view: NetCallView = {
+    method: asString(e.data['method']) ?? '',
+    url: asString(e.data['url']) ?? '',
+  };
+  if ('number' === typeof status || 'string' === typeof status) {
+    view.status = status;
+  }
+  if (statusText !== undefined) {
+    view.statusText = statusText;
+  }
+  if (contentType !== undefined) {
+    view.contentType = contentType;
+  }
+  if (responseSize !== undefined) {
+    view.responseSize = responseSize;
+  }
+  // Bodies dominate the payload of the most-called read tool, and are only occasionally the part
+  // anyone wanted — `bodies: false` on reticle_network drops them for a body-free listing (#401).
+  if (includeBodies && requestBody !== undefined) {
+    view.requestBody = requestBody;
+  }
+  if (includeBodies && responseBody !== undefined) {
+    view.responseBody = responseBody;
+  }
+  if (
+    includeBodies &&
+    (true === e.data['requestBodyTruncated'] || true === e.data['responseBodyTruncated'])
+  ) {
+    view.bodyTruncated = true;
+  }
+  if (ms !== undefined) {
+    view.ms = ms;
+  }
+  if (true === e.data['oneWay']) {
+    view.oneWay = true;
+  }
+  if (true === e.data[DepartedNetField.FROM_DEPARTED_DOCUMENT]) {
+    view.fromDepartedDocument = true;
+  }
+  if (true === e.data[DepartedNetField.PAGE_UNLOADED]) {
+    view.pageUnloaded = true;
+  }
+  const headers = e.data['headers'];
+  if (headers !== null && 'object' === typeof headers) {
+    view.headers = headers as Record<string, string>;
+  }
+  return view;
+}
+
+/**
+ * How many stack frames reach the agent.
+ *
+ * A raw stack is mostly framework internals, and padding a failure report with them is not free —
+ * the frames that identify the origin are the first few, and everything after is context the agent
+ * has to read past. Four keeps the error line plus the app frames that actually called it.
+ */
+const MAX_STACK_FRAMES = 4;
+
+/** Trim a stack to the frames that locate the fault. */
+function topFrames(stack: string): string {
+  return stack.split('\n').slice(0, MAX_STACK_FRAMES).join('\n');
+}
+
+/**
+ * Compact console-log summary for reticle_console output.
+ *
+ * `stack`/`source` are the only localization signal a console failure carries — there is no element
+ * to map to a component here, so without them "an error was logged" is the whole report and the agent
+ * has to go find the origin itself. The browser already keeps this lean by capturing a stack for
+ * console.error only; the projection used to discard even that.
+ */
+interface ConsoleLogView {
+  level: string;
+  text: string;
+  stack?: string;
+  source?: string;
+}
+export function projectConsoleLog(e: ReticleEvent): ConsoleLogView {
+  const level = e.type === EventType.ERROR_UNCAUGHT ? 'error' : e.type.replace('console.', '');
+  const view: ConsoleLogView = { level, text: asString(e.data['message']) ?? '' };
+  const stack = asString(e.data['stack']);
+  if (stack !== undefined && stack.length > 0) {
+    view.stack = topFrames(stack);
+  }
+  // An uncaught error reports its origin as discrete fields rather than in a stack; render them in
+  // the same file:line form the element descriptors use so the agent reads one shape everywhere.
+  const source = asString(e.data['source']);
+  const line = e.data['line'];
+  if (source !== undefined && source.length > 0) {
+    view.source = 'number' === typeof line ? `${source}:${String(line)}` : source;
+  }
+  return view;
+}
+
+/** True for any console.* / uncaught-error event (the reticle_console universe). */
+export function isConsoleEvent(e: ReticleEvent): boolean {
+  return (
+    e.type === EventType.CONSOLE_LOG ||
+    e.type === EventType.CONSOLE_WARN ||
+    e.type === EventType.CONSOLE_ERROR ||
+    e.type === EventType.CONSOLE_INFO ||
+    e.type === EventType.CONSOLE_DEBUG ||
+    e.type === EventType.ERROR_UNCAUGHT
+  );
+}
+
+/** Match a console/error event against an optional level filter (reticle_console). */
+export function matchConsole(e: ReticleEvent, level: string | undefined): boolean {
+  if (!isConsoleEvent(e)) {
+    return false;
+  }
+  if (level === undefined) {
+    return true;
+  }
+  return (
+    e.type === `console.${level}` || ('error' === level && e.type === EventType.ERROR_UNCAUGHT)
+  );
+}
+
+/** How many present calls/levels a zero-match hint samples before truncating. */
+const HINT_SAMPLE_MAX = 5;
+
+/** One present network call summarized for a zero-match hint. */
+interface NetCallSummary {
+  method: string;
+  url: string;
+  status?: number;
+}
+
+/**
+ * Near-miss for reticle_network: when a filter matched zero calls, describe what DID fire so the
+ * agent self-corrects ("POST /x 200 matched nothing, but these 3 requests happened") instead of
+ * reading a bare []. `allNet` is every net.request in the window (pre-filter).
+ */
+interface NetEmptyHint {
+  totalInWindow: number;
+  /** Up to HINT_SAMPLE_MAX present calls (most-recent first). */
+  present: NetCallSummary[];
+}
+
+export function netEmptyHint(allNet: ReticleEvent[]): NetEmptyHint {
+  const present = allNet
+    .slice(-HINT_SAMPLE_MAX)
+    .reverse()
+    .map((e): NetCallSummary => {
+      const status = asNumber(e.data['status']);
+      const base = { method: asString(e.data['method']) ?? '', url: asString(e.data['url']) ?? '' };
+      return status === undefined ? base : { ...base, status };
+    });
+  return { totalInWindow: allNet.length, present };
+}
+
+/** Per-level console counts in the window — the body of a zero-match console hint. */
+interface ConsoleLevelCounts {
+  log: number;
+  warn: number;
+  error: number;
+}
+
+/**
+ * Near-miss for reticle_console: when a level filter matched zero logs, report what levels ARE
+ * present so the agent knows the page isn't silent ("0 errors, but 3 warns + 5 logs"). `allConsole`
+ * is every console/error event in the window (pre-filter).
+ */
+interface ConsoleEmptyHint {
+  totalInWindow: number;
+  byLevel: ConsoleLevelCounts;
+}
+
+export function consoleEmptyHint(allConsole: ReticleEvent[]): ConsoleEmptyHint {
+  const byLevel: ConsoleLevelCounts = { log: 0, warn: 0, error: 0 };
+  for (const e of allConsole) {
+    if (e.type === EventType.CONSOLE_LOG) {
+      byLevel.log += 1;
+    } else if (e.type === EventType.CONSOLE_WARN) {
+      byLevel.warn += 1;
+    } else if (e.type === EventType.CONSOLE_ERROR || e.type === EventType.ERROR_UNCAUGHT) {
+      byLevel.error += 1;
+    }
+  }
+  return { totalInWindow: allConsole.length, byLevel };
+}
+
+/**
+ * Did the browser leave for a URL this filter names, inside the window (#1936)?
+ *
+ * A click on `<a download>`, or on a link that the server answers as an attachment, is recorded as a
+ * navigation `NET_PENDING`. The response goes to the download manager. The page never sees its
+ * status, and no `NET_REQUEST` can close the record. A miss over this window is unobservable, not a
+ * failure: the file can be on disk while the net channel shows only the pending record.
+ *
+ * An ordinary link records the same navigation `NET_PENDING`, and there the page DID leave, so a
+ * miss stays a real `no`. A record counts only when it is a download (`download: true`), or when no
+ * later event comes from a different document. A later event with another `documentId` proves that
+ * a new document loaded, so the old page's request did not go to a download.
+ */
+export function departedInWindow(
+  events: readonly ReticleEvent[],
+  since: number,
+  method: string | undefined,
+  urlContains: string | undefined,
+): boolean {
+  return events.some(
+    (e) =>
+      e.type === EventType.NET_PENDING &&
+      e.t >= since &&
+      e.data['initiator'] === NetInitiator.NAVIGATION &&
+      (method === undefined ||
+        asString(e.data['method'])?.toUpperCase() === method.toUpperCase()) &&
+      (urlContains === undefined || urlForMatch(e.data).includes(urlContains)) &&
+      (true === e.data['download'] || !newDocumentAfter(events, e)),
+  );
+}
+
+/**
+ * Did a request to this URL leave through a `fetch` that Reticle did not patch, in the window?
+ *
+ * The SDK reports such a call as `net.unpatched`: the browser recorded it in resource timing, and no
+ * patched transport saw it. It has no method, so only the URL filter can match it.
+ */
+export function unpatchedInWindow(
+  events: readonly ReticleEvent[],
+  since: number,
+  urlContains: string | undefined,
+): boolean {
+  return events.some(
+    (e) =>
+      e.type === EventType.NET_UNPATCHED &&
+      e.t >= since &&
+      (urlContains === undefined || urlForMatch(e.data).includes(urlContains)),
+  );
+}
+
+/**
+ * Did the page send a request this filter names, inside the window, and unload before its answer
+ * arrived (#1944)? The daemon marks such a carried `NET_PENDING` `pageUnloaded`. Its outcome is
+ * unknown, so a miss over it is unobservable, not a failure.
+ */
+export function unloadedInWindow(
+  events: readonly ReticleEvent[],
+  since: number,
+  method: string | undefined,
+  urlContains: string | undefined,
+): boolean {
+  return events.some(
+    (e) =>
+      e.type === EventType.NET_PENDING &&
+      e.t >= since &&
+      true === e.data[DepartedNetField.PAGE_UNLOADED] &&
+      (method === undefined ||
+        asString(e.data['method'])?.toUpperCase() === method.toUpperCase()) &&
+      (urlContains === undefined || urlForMatch(e.data).includes(urlContains)),
+  );
+}
+
+/** Is there an event after `record` from a document other than the one that emitted it? */
+function newDocumentAfter(events: readonly ReticleEvent[], record: ReticleEvent): boolean {
+  const from = record.documentId;
+  if (from === undefined) {
+    return false;
+  }
+  return events.some((e) => e.t >= record.t && e.documentId !== undefined && e.documentId !== from);
+}
+
+/**
+ * Initiator types a media element load carries on its resource timing record.
+ *
+ * A `<video>`, `<audio>` or `<track>` load goes through neither `fetch` nor `XMLHttpRequest`, so
+ * the record the resource timing observer emits is the only one it ever leaves.
+ */
+const MEDIA_INITIATORS: ReadonlySet<string> = new Set(['video', 'audio', 'track']);
+
+/**
+ * The media entry that matches this filter and was recorded BEFORE the window opened, if any.
+ *
+ * The browser observer reports only the first resource timing entry for a URL: its seen-set
+ * (`reportedNetUrls` in adapters/realm/browser/src/observers/network.ts) drops every later entry
+ * for a URL it has already reported. For a media element load that first entry is also the only
+ * kind of record there is, so once it lands before `since`, a repeat load inside the window
+ * leaves no record at all and the window reads empty. The empty window is then not evidence the
+ * file did not load in it — a missing entry is not evidence there (#2069).
+ *
+ * A `fetch` or XHR record before the window impeaches nothing and is not returned here: the
+ * patched transports report every call, so a repeat would have been seen. Only the clauses that
+ * identify the request are read — `urlContains` and `method`. A status clause is not read: the
+ * entry's status is the unreadable thing this blind spot is about. Resource timing carries no
+ * method; the observer stamps `GET` for exactly that reason, so a record with no method counts
+ * as the `GET` a media element only ever issues.
+ */
+export function mediaEntryBeforeWindow(
+  events: readonly ReticleEvent[],
+  since: number,
+  method: string | undefined,
+  urlContains: string | undefined,
+): ReticleEvent | undefined {
+  return events.find(
+    (e) =>
+      e.type === EventType.NET_REQUEST &&
+      e.t < since &&
+      MEDIA_INITIATORS.has(asString(e.data['initiator']) ?? '') &&
+      (method === undefined ||
+        (asString(e.data['method']) ?? 'GET').toUpperCase() === method.toUpperCase()) &&
+      (urlContains === undefined || urlForMatch(e.data).includes(urlContains)),
+  );
+}
+
+/** A `confirm` or `prompt` that Reticle answered for the app, as the window recorded it. */
+export interface DeclinedDialog {
+  readonly kind: string;
+  readonly message?: string;
+}
+
+/**
+ * The first dialog in the window that Reticle answered on the app's behalf, or undefined.
+ *
+ * Only a dialog that carries `answered` counts. An `alert` has no answer, so it cannot change which
+ * path the app took. The SDK and the leased-tab pool both record the answer in this one event.
+ */
+export function declinedDialogIn(events: readonly ReticleEvent[]): DeclinedDialog | undefined {
+  const dialog = events.find(
+    (e) => e.type === EventType.DIALOG_OPENED && Object.hasOwn(e.data, 'answered'),
+  );
+  if (dialog === undefined) {
+    return undefined;
+  }
+  const message = asString(dialog.data['message']);
+  return {
+    // The schema requires `kind`, so this is never empty on a valid event.
+    kind: String(dialog.data['kind']),
+    ...(message === undefined ? {} : { message }),
+  };
+}

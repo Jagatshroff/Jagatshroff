@@ -1,0 +1,437 @@
+import { z } from 'zod';
+import {
+  AppRuntime,
+  ReticleCommand,
+  VISUAL_NO_PROVIDER_RECOMMENDATION,
+  VisualReason,
+  realmOf,
+} from '@reticlehq/core';
+import { ReticleTool } from '@reticlehq/core';
+import { sessionIdShape } from '@/surface/tools/tool-kit.js';
+import { ratioSchema } from '@/surface/tools/args/numeric-bounds.js';
+import { VISUAL_PIXEL_THRESHOLD, asNumber, asRecord, asString } from '@reticlehq/core';
+import { diffPng, type VisualRect } from './visual-diff.js';
+import { VisualStore } from './visual-store.js';
+
+/**
+ * The `.reticle` a capture belongs beside: the driven session's own, stamped when it connected.
+ *
+ * Falls back to the daemon's root only when there is no session to ask — the same fallback the
+ * journal and the run artifact use, and for the same reason: a picture of somebody's app has no
+ * business in a directory that has nothing to do with it.
+ */
+function captureRoot(deps: ToolDeps, sessionId: string | undefined): string {
+  try {
+    return deps.sessions.resolve(sessionId).artifactRoot ?? deps.reticleRoot;
+  } catch {
+    return deps.reticleRoot;
+  }
+}
+import { desktopCapture } from './desktop-capture.js';
+import type { ElementBox, RealInputProvider, ScreenshotOpts } from '@/portal/input/real-input.js';
+import type { ToolDef, ToolDeps } from '@/surface/tools/tool-kit.js';
+
+const rectShape = z.object({
+  x: z.number(),
+  y: z.number(),
+  width: z.number(),
+  height: z.number(),
+});
+
+/** A provider that can screenshot — narrows the optional capability so callers branch once. */
+type ScreenshotCapable = RealInputProvider & {
+  screenshot(sessionUrl: string, opts: ScreenshotOpts): Promise<Uint8Array | undefined>;
+};
+
+function screenshotProvider(deps: ToolDeps): ScreenshotCapable | undefined {
+  const p = deps.realInput;
+  return p !== undefined && 'function' === typeof p.screenshot
+    ? (p as ScreenshotCapable)
+    : undefined;
+}
+
+/**
+ * Whether this call can photograph the session: a lease of this caller, a desktop shell, or a page
+ * that the driven browser has.
+ *
+ * A desktop shell counts before its capture is known to work. Only a CAPTURE command can tell, and
+ * a person who connected a desktop app most likely wants that window, not a lease beside it.
+ */
+async function canCapture(
+  deps: ToolDeps,
+  session: { readonly id: string; readonly url: string; readonly runtime: string | undefined },
+): Promise<boolean> {
+  // A lease of this caller. Another agent's lease is never this caller's to photograph (#1226).
+  if (true === deps.pool?.heldBy(session.id, deps.attachId)) {
+    return true;
+  }
+  if (realmOf(session.runtime).isDesktopShell) {
+    return true;
+  }
+  // A driven browser photographs only a page it has. Having a driven browser is not enough.
+  const driven = screenshotProvider(deps);
+  if (driven === undefined) {
+    return false;
+  }
+  return driven.isAvailableFor(session.url);
+}
+
+/**
+ * The one session this call photographs, chosen once (#1959).
+ *
+ * capture() and captureRoot() each resolve the id again. With no id, each could choose another
+ * session, and capture() never tried a lease at all. After this, they all get the same, named id.
+ */
+async function captureTarget(deps: ToolDeps, args: Record<string, unknown>): Promise<string> {
+  const session = await deps.sessions.resolveServing(asString(args['sessionId']), (s) =>
+    canCapture(deps, s),
+  );
+  return session.id;
+}
+
+/** The "you need a driven browser" envelope, shared by both visual tools. */
+const noProvider = {
+  ok: false as const,
+  reason: VisualReason.NO_PROVIDER,
+  recommendation: VISUAL_NO_PROVIDER_RECOMMENDATION,
+};
+
+/** The answer when no pixels came back: the shell's own recommendation over the web one. */
+function unavailable(
+  reason: string | undefined,
+  recommendation: string | undefined,
+): { ok: false; reason?: string | undefined; recommendation?: string } {
+  if (recommendation !== undefined) {
+    return { ok: false, reason, recommendation };
+  }
+  return reason === VisualReason.NO_PROVIDER ? noProvider : { ok: false, reason };
+}
+
+function asBox(value: unknown): ElementBox | undefined {
+  const b = asRecord(asRecord(value)['box']);
+  const x = asNumber(b['x']);
+  const y = asNumber(b['y']);
+  const w = asNumber(b['width']);
+  const h = asNumber(b['height']);
+  if (x === undefined || y === undefined || w === undefined || h === undefined) {
+    return undefined;
+  }
+  if (w <= 0 || h <= 0) {
+    return undefined;
+  }
+  return { x, y, width: w, height: h };
+}
+
+/** Build capture options from args: explicit clip > ref (resolved via INSPECT) > fullPage. */
+async function buildOpts(
+  deps: ToolDeps,
+  sessionId: string | undefined,
+  args: Record<string, unknown>,
+): Promise<ScreenshotOpts> {
+  const clipArg = args['clip'];
+  if (clipArg !== undefined) {
+    const c = asRecord(clipArg);
+    const box = asBox({ box: c });
+    if (box !== undefined) {
+      return { clip: box };
+    }
+  }
+  const ref = asString(args['ref']);
+  if (ref !== undefined) {
+    const session = deps.sessions.resolve(sessionId);
+    const res = await session.command(ReticleCommand.INSPECT, { ref });
+    const box = res.ok ? asBox(res.result) : undefined;
+    if (box !== undefined) {
+      return { clip: box };
+    }
+  }
+  return true === args['fullPage'] ? { fullPage: true } : {};
+}
+
+/**
+ * One picture of the tab a chat-requested drive is driving, or undefined when there is none to take.
+ *
+ * The leased browser first, when this daemon launched the tab; then the desktop window's own capture,
+ * the same route `reticle_screenshot` takes. Without the second, a drive of a desktop app sent its
+ * steps to the chat and never a picture. Never throws: a frame is a courtesy, and a tab that has
+ * gone mid-drive must not break the drive.
+ */
+export async function driveFrame(
+  deps: ToolDeps,
+  sessionId: string,
+  jpegQuality: number,
+): Promise<Uint8Array | undefined> {
+  try {
+    const leased = await deps.pool?.screenshotLease(sessionId, { jpegQuality });
+    if (leased !== undefined) {
+      return leased;
+    }
+    // The window `reticle drive` opened: neither a lease nor a desktop shell, but its page is ours.
+    const url = deps.sessions.resolve(sessionId).url;
+    if (true === (await deps.realInput?.isAvailableFor(url))) {
+      const shot = await deps.realInput?.screenshot?.(url, { jpegQuality });
+      if (shot !== undefined) {
+        return shot;
+      }
+    }
+    return (await desktopCapture(deps, sessionId, false)).png;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Which runtime this session is, for scoping a visual artifact.
+ *
+ * Undefined when the session cannot be resolved or its SDK never reported one — and undefined means
+ * the flat legacy path, so a baseline captured before any of this keeps matching.
+ */
+function runtimeOf(deps: ToolDeps, sessionId: string | undefined): string | undefined {
+  try {
+    return deps.sessions.resolve(sessionId).runtime;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Get pixels for a session, by whichever route exists.
+ *
+ * A driven/attached browser is captured through CDP — exact, and the only route that can do
+ * `fullPage`. A desktop app has no CDP endpoint, so its own shell is asked instead. CDP is tried
+ * FIRST and the desktop path is a genuine fallback, not an either/or: with a CDP endpoint attached
+ * to one app and the screenshot aimed at a different (desktop) session, CDP fails and the shell
+ * capture is still correct.
+ *
+ * CDP and leased pages honor `clip`/`ref`. The desktop shell photographs the whole window,
+ * so scoped desktop captures are refused instead of saved or compared as full-window images.
+ *
+ * `fullPage` is different, because it cannot be emulated by cropping: only WebKitGTK (Tauri on Linux)
+ * can render a full document offscreen. Where the shell cannot, it REFUSES and this reports
+ * `full-page-unsupported` — a viewport image returned as though it were the whole scroll height is a
+ * baseline that says nothing about the content below the fold, and a later diff would call it green.
+ */
+async function capture(
+  deps: ToolDeps,
+  sessionId: string | undefined,
+  args: Record<string, unknown>,
+): Promise<{
+  png?: Uint8Array;
+  reason?: string;
+  recommendation?: string;
+  runtime?: string | undefined;
+}> {
+  /*
+   * Only a provider driving THIS session's page. A launched provider photographs the one page it
+   * owns whatever url it is handed, so asking it about another session saved the driven tab's pixels
+   * under that session's name and answered `saved: true` (#1407). Real input asks the same question
+   * before every gesture.
+   */
+  const candidate = screenshotProvider(deps);
+  const session = candidate === undefined ? undefined : deps.sessions.resolve(sessionId);
+  const provider =
+    candidate !== undefined &&
+    session !== undefined &&
+    (await candidate.isAvailableFor(session.url))
+      ? candidate
+      : undefined;
+  if (provider !== undefined && session !== undefined) {
+    const png = await provider.screenshot(session.url, await buildOpts(deps, sessionId, args));
+    // A driven browser renders the session's URL in a BROWSER — so the pixels are web even when the
+    // session named is a desktop window. Scoping those under the desktop runtime would corrupt that
+    // runtime's baseline with a picture of a different renderer.
+    if (png !== undefined) {
+      return { png, runtime: AppRuntime.WEB };
+    }
+  }
+  // The window's own backing store, via the Electron/Tauri adapter — the only route whose pixels
+  // really are the desktop app.
+  const desktop = await desktopCapture(deps, sessionId, true === args['fullPage']);
+  if (desktop.png !== undefined) {
+    // Check the route that supplied the pixels, not the session runtime: a desktop session can
+    // use CDP, and a page without desktop capture can still fall back to a leased browser.
+    if (args['clip'] !== undefined || args['ref'] !== undefined) {
+      return { reason: VisualReason.CROP_UNSUPPORTED };
+    }
+    return { png: desktop.png, runtime: runtimeOf(deps, sessionId) };
+  }
+  if (desktop.reason !== undefined) {
+    return desktop;
+  }
+
+  /*
+   * A LEASED page is a real browser page, so the pixels were always there — the visual tools simply
+   * had no route to them. Without this, `reticle_screenshot` answered "no provider" for every context
+   * an agent can actually acquire, which made visual regression impossible on exactly the isolated
+   * contexts the pool exists to hand out. Tried last: a CDP provider, when there is one, is driving
+   * the page the caller means, and a lease is the fallback rather than a competitor.
+   */
+  const leased =
+    sessionId === undefined
+      ? undefined
+      : // The same scope as the provider route: `clip` and `ref` were dropped here, so a scoped
+        // shot of a lease saved the whole viewport and answered `saved: true`.
+        await deps.pool?.screenshotLease(sessionId, await buildOpts(deps, sessionId, args));
+  // A leased page is a real browser page, whatever the session is.
+  if (leased !== undefined) {
+    return { png: leased, runtime: AppRuntime.WEB };
+  }
+  return {
+    reason: provider === undefined ? VisualReason.NO_PROVIDER : VisualReason.CAPTURE_FAILED,
+  };
+}
+
+function rectsFrom(value: unknown): VisualRect[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const rects: VisualRect[] = [];
+  for (const r of value as unknown[]) {
+    const box = asBox({ box: r });
+    if (box !== undefined) {
+      rects.push(box);
+    }
+  }
+  return rects.length > 0 ? rects : undefined;
+}
+
+/**
+ * The opt-in pixel layer. Both tools require a DRIVEN browser (reticle drive /
+ * RETICLE_CDP_URL) — the always-on SDK ships no screenshotter — and return a structured NO_PROVIDER
+ * envelope (with a recommendation) instead of throwing when none is attached. Behavioral checks
+ * stay the default; this is the complementary "does it look right" surface, never bundled in.
+ */
+export const VISUAL_TOOLS: ToolDef[] = [
+  {
+    name: ReticleTool.SCREENSHOT,
+    example: { name: 'home' },
+    description:
+      'Capture a pixel screenshot of the DRIVEN page (needs `reticle drive`/RETICLE_CDP_URL — the SDK has no screenshotter) and save it as a visual baseline at .reticle/visual/<name>.png. { fullPage } for the whole scroll height, { ref } or { clip:{x,y,width,height} } for one element/region. Returns { saved:true, name, path, bytes } or { ok:false, reason } when no driven browser is attached.',
+    inputSchema: {
+      name: z
+        .string()
+        .describe(
+          'Baseline name — saved as .reticle/visual/<name>.png. Use the same name in reticle_visual_diff to compare.',
+        ),
+      fullPage: z
+        .boolean()
+        .optional()
+        .describe('Capture the full scroll height. Default: viewport only.'),
+      ref: z
+        .string()
+        .optional()
+        .describe(
+          'Element ref to screenshot (scopes to element bounding box). Omit for full page.',
+        ),
+      clip: rectShape
+        .optional()
+        .describe('Explicit { x, y, width, height } clip rectangle in page coordinates.'),
+      ...sessionIdShape,
+    },
+    outputSchema: {
+      ok: z.boolean(),
+      saved: z.boolean().optional(),
+      name: z.string().optional(),
+      path: z.string().optional(),
+      bytes: z.number().optional(),
+      reason: z.string().optional(),
+      recommendation: z.string().optional(),
+    },
+    handler: async (deps: ToolDeps, args) => {
+      const sessionId = await captureTarget(deps, args);
+      const { png, reason, recommendation, runtime } = await capture(deps, sessionId, args);
+      if (png === undefined) {
+        return unavailable(reason, recommendation);
+      }
+      const name = asString(args['name']) ?? 'default';
+      // Beside the app that was captured. The tool RETURNS this path to the agent, so a wrong root
+      // is not only a stray PNG — it is a path the agent is told to look at in a tree that has
+      // nothing to do with the screenshot.
+      //
+      // Taken from the SESSION's own stamp rather than re-resolved, which is what `attach-journal`
+      // and the run artifact already do: the capture came from that session, so the answer is
+      // already in hand, and a second resolution is a second chance to disagree. It also keeps this
+      // directory from reaching into `project` for an address it was deliberately freed from
+      // needing — see `directory-reach`.
+      const store = new VisualStore(deps.fs, captureRoot(deps, sessionId));
+      // Scoped to the runtime that produced it: an Electron window, a Tauri webview and a browser
+      // tab do not render the same url the same way, and one shared baseline makes every
+      // cross-runtime diff wrong. See visualDir.
+      const path = await store.saveBaseline(name, png, runtime);
+      return { ok: true, saved: true, name, path, bytes: png.length };
+    },
+  },
+  {
+    name: ReticleTool.VISUAL_DIFF,
+    example: { baseline: 'home' },
+    description:
+      'Perceptually diff the DRIVEN page against a saved visual baseline (see reticle_screenshot). { masks:[{x,y,width,height}] } neutralizes volatile regions; { maxRatio } sets the pass tolerance (default 0). Returns { matched, changedPixels, totalPixels, ratio, region?, diffPath, dimensionMismatch } — the overlay diff is written to .reticle/visual/<baseline>.diff.png — or { ok:false, reason } (no-provider / baseline-missing).',
+    inputSchema: {
+      baseline: z
+        .string()
+        .describe(
+          'Baseline screenshot name (from reticle_screenshot). Used to compare with the current screenshot.',
+        ),
+      fullPage: z.boolean().optional(),
+      ref: z.string().optional(),
+      clip: rectShape.optional(),
+      masks: z.array(rectShape).optional(),
+      maxRatio: ratioSchema.optional(),
+      threshold: ratioSchema
+        .optional()
+        .describe(`Pixel difference threshold (0–1). Default: ${String(VISUAL_PIXEL_THRESHOLD)}.`),
+      ...sessionIdShape,
+    },
+    outputSchema: {
+      ok: z.boolean(),
+      matched: z.boolean().optional(),
+      changedPixels: z.number().optional(),
+      totalPixels: z.number().optional(),
+      ratio: z.number().optional(),
+      region: rectShape.optional(),
+      dimensionMismatch: z.boolean().optional(),
+      diffPath: z.string().optional(),
+      reason: z.string().optional(),
+    },
+    handler: async (deps: ToolDeps, args) => {
+      const baseline = asString(args['baseline']) ?? '';
+      const sessionId = await captureTarget(deps, args);
+      const store = new VisualStore(deps.fs, captureRoot(deps, sessionId));
+
+      // Capture FIRST, then fetch the baseline for the runtime that produced these pixels. Reading it
+      // by the session's runtime looked equivalent and is not: the route decides the renderer, so a
+      // desktop session captured through a driven browser must be compared against the WEB baseline,
+      // not the desktop one. Comparing across renderers is a confident wrong diff in one direction
+      // and a silently overwritten baseline in the other.
+      const captured = await capture(deps, sessionId, args);
+      const { png: current, runtime } = captured;
+      if (current === undefined) {
+        return unavailable(captured.reason, captured.recommendation);
+      }
+
+      // A baseline from another runtime is not missing by accident — it is a different rendering, and
+      // "no baseline for this one" is the honest answer.
+      const baselineBytes = await store.readBaseline(baseline, runtime);
+      if (baselineBytes === undefined) {
+        return { ok: false, reason: VisualReason.BASELINE_MISSING };
+      }
+
+      const masks = rectsFrom(args['masks']);
+      const threshold = asNumber(args['threshold']);
+      const maxRatio = asNumber(args['maxRatio']);
+      const result = await diffPng(baselineBytes, current, {
+        ...(threshold !== undefined ? { threshold } : {}),
+        ...(maxRatio !== undefined ? { maxRatio } : {}),
+        ...(masks !== undefined ? { masks } : {}),
+      });
+
+      // Omit the raw diff bytes from the JSON result; persist them and return the path instead.
+      const { diffPng: diffBytes, ...verdict } = result;
+      if (diffBytes === undefined) {
+        return { ok: false, ...verdict, reason: VisualReason.DIMENSION_MISMATCH };
+      }
+      const diffPath = await store.saveDiff(baseline, diffBytes, runtime);
+      return { ok: true, ...verdict, diffPath };
+    },
+  },
+];

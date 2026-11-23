@@ -1,0 +1,273 @@
+/**
+ * Who is holding the bridge port.
+ *
+ * `doctor` is what a user runs when the agent cannot reach the bridge, and the commonest real cause
+ * is that something else is on 4400. It already stopped saying "nothing is listening" for that case,
+ * but it did not say WHICH process — so the reader's next move was a shell command they had to know.
+ *
+ * Naming the holder is also the safe answer to a trap this project has hit for real: the obvious
+ * lookup, `lsof -ti tcp:4400 | xargs kill -9`, ALSO kills the agent's own `reticle mcp` proxy,
+ * because that proxy holds a client connection to the same port and `-ti` does not filter to
+ * listeners. Every invocation here is `-sTCP:LISTEN`, and the message never suggests `-ti`.
+ *
+ * The parser is pure and the lookup takes an injected exec, so the rule is tested on every platform
+ * while the shelling out stays at the call site.
+ */
+
+import { spawnSync } from 'node:child_process';
+
+export interface PortHolder {
+  pid: number;
+  command: string;
+  /** Its command line is a Reticle daemon's. Set only by `identifyPortHolder`. */
+  reticleDaemon?: boolean;
+}
+
+/** Bound on the holder lookup. A hung `lsof` must not hang the commands that diagnose hangs. */
+const LOOKUP_TIMEOUT_MS = 2_000;
+
+/**
+ * Run a lookup and return its stdout, or null if it could not run.
+ *
+ * Null on ANY failure — no lsof (every Windows user, a slim container), a non-zero exit, a throw.
+ * This is a diagnostic nicety inside the commands people run when things are already broken; it must
+ * never be the reason one of them fails. Every caller handles the null by saying it could not
+ * identify the holder, rather than asserting the holder is not ours — a claim it has no evidence
+ * for, and one that was wrong for every Windows user.
+ */
+export function captureLookup(
+  command: string,
+  args: readonly string[],
+  timeoutMs: number = LOOKUP_TIMEOUT_MS,
+): string | null {
+  try {
+    // The daemon has no console: without windowsHide, each lookup opens a visible window on Windows.
+    const result = spawnSync(command, [...args], {
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      windowsHide: true,
+    });
+    return 0 === result.status && 'string' === typeof result.stdout ? result.stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `lsof -F pc` emits one field per line, prefixed by its selector: `p<pid>`, `c<command>`. */
+const PID_FIELD = 'p';
+const COMMAND_FIELD = 'c';
+
+/**
+ * The FIRST listener in `lsof -nP -iTCP:<port> -sTCP:LISTEN -F pc` output, or null.
+ *
+ * First, not "the only one": a dual-stack listener (IPv4 + IPv6) is reported twice, and on a port
+ * conflict the answer the reader needs is "something is there, here is what" rather than an
+ * exhaustive list. A second `p` record ends the first.
+ *
+ * Null on anything incomplete. Half an answer — a pid with no command — prints worse than the
+ * un-named message it would replace, which is the same mistake as the port lie this command fixed.
+ */
+export function parsePortHolder(stdout: string): PortHolder | null {
+  let pid: number | undefined;
+  let command: string | undefined;
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trim();
+    if (0 === line.length) {
+      continue;
+    }
+    const value = line.slice(1);
+    if (line.startsWith(PID_FIELD)) {
+      // A second record: the first one is the answer.
+      if (pid !== undefined) {
+        break;
+      }
+      const parsed = Number(value);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        return null;
+      }
+      pid = parsed;
+      continue;
+    }
+    if (line.startsWith(COMMAND_FIELD) && command === undefined) {
+      command = value;
+    }
+  }
+  return pid === undefined || command === undefined ? null : { pid, command };
+}
+
+/** What `doctor` prints for a port held by something that is not a Reticle daemon. */
+export function describeForeignHolder(
+  port: number,
+  holder: PortHolder | null,
+  /**
+   * The pid we recorded for this port, from the daemon pid file.
+   *
+   * When it matches the process actually holding the port, the port is held by OUR daemon — one
+   * that accepts TCP and never answers `/status`, i.e. wedged. That classifies as FOREIGN, which is
+   * right for "can anything bind this?" and wrong to say out loud: the reader goes hunting a
+   * stranger, and the fix that works (`reticle stop`, it respawns on the next call) is never named.
+   */
+  ourPid?: number | null,
+): string {
+  // Naming the command matters more than naming the process. "Stop that process" describes an
+  // outcome and leaves the reader to invent a route to it, and the route they invent is the `-ti`
+  // pipeline that takes their agent's proxy down with the holder.
+  const tail =
+    'a daemon cannot bind it. Free it with `reticle serve --restart --force` (it signals the listener only, ' +
+    "never the agent's mcp proxy), or run Reticle on a different port (`--port`), then retry.";
+  if (null === holder) {
+    /**
+     * We could not identify the holder — no `lsof` (every Windows user, a large share of the
+     * installed base; also a slim container), or the lookup timed out.
+     *
+     * This used to assert the port was held by "another process that is not a Reticle daemon",
+     * which is a claim the null case has NO evidence for. It is also the likeliest thing to be
+     * wrong: reaching here at all means presence is FOREIGN — the port accepts TCP and never
+     * answers `/status` — and the commonest cause of that is OUR OWN daemon, wedged. So on the one
+     * platform where the lookup cannot run, `doctor` sent the reader hunting a stranger and never
+     * named `reticle stop`, the fix that actually works.
+     *
+     * Say what is known, and name the recorded pid when there is one.
+     */
+    const ours =
+      ourPid !== null && ourPid !== undefined
+        ? ` Reticle's own records show pid ${String(ourPid)} for this port — if that process is ` +
+          'still around it is a Reticle daemon that did not answer in time. It may be busy. If it ' +
+          'stays silent, `reticle stop` clears it.'
+        : '';
+    return `port ${String(port)} is held by a process Reticle could not identify — ${tail}${ours}`;
+  }
+  if (true === holder.reticleDaemon && ourPid !== holder.pid) {
+    // Not the pid we recorded, so `reticle stop` cannot find it. `serve --restart` finds the listener.
+    // It did not answer a short probe. A busy daemon does that too, and other agents can use it.
+    return (
+      `port ${String(port)} is held by a Reticle daemon (pid ${String(holder.pid)}) that did not ` +
+      'answer in time. It may be busy. Run `reticle status` again in a few seconds. If it stays ' +
+      'silent, run `reticle serve --restart`: it stops that process and starts a new daemon on this port.'
+    );
+  }
+  if (ourPid !== null && ourPid !== undefined && ourPid === holder.pid) {
+    return (
+      `port ${String(port)} is held by YOUR Reticle daemon (pid ${String(holder.pid)}), and it is ` +
+      'not responding: it did not answer in time. It may be busy. Run `reticle status` again in a ' +
+      'few seconds. If it stays silent, run `reticle stop`; the next tool call starts a fresh one.'
+    );
+  }
+  return (
+    `port ${String(port)} is held by pid ${String(holder.pid)} ("${holder.command}"), which is not ` +
+    `a Reticle daemon — ${tail}`
+  );
+}
+
+/** The lookup itself. `exec` is injected so the shelling out never runs in a unit test. */
+export function findPortHolder(
+  port: number,
+  exec: (command: string, args: readonly string[]) => string | null,
+): PortHolder | null {
+  // -n/-P skip DNS and service-name lookups (slow, and irrelevant here). -sTCP:LISTEN is the part
+  // that matters: without it this also reports the agent's own MCP proxy, which is a client of the
+  // port, not its owner.
+  const out = exec('lsof', ['-nP', `-iTCP:${String(port)}`, '-sTCP:LISTEN', '-F', 'pc']);
+  return null === out ? null : parsePortHolder(out);
+}
+
+/** `lsof -Fn` emits the file name on its own line, prefixed `n`. */
+const NAME_FIELD = 'n';
+
+/** The path in `lsof -a -p <pid> -d cwd -Fn` output, or null when it printed none. */
+export function parseProcessCwd(stdout: string): string | null {
+  for (const raw of stdout.split('\n')) {
+    if (raw.startsWith(NAME_FIELD) && raw.length > NAME_FIELD.length) {
+      return raw.slice(1);
+    }
+  }
+  return null;
+}
+
+/** Each port in `lsof -nP -iTCP -sTCP:LISTEN -Fn` output, once. A dual-stack bind prints two lines. */
+export function parseListeningPorts(stdout: string): number[] {
+  const ports = new Set<number>();
+  for (const line of stdout.split('\n')) {
+    const port = line.startsWith(NAME_FIELD) ? /:(\d+)$/.exec(line)?.[1] : undefined;
+    if (port !== undefined) {
+      ports.add(Number(port));
+    }
+  }
+  return [...ports];
+}
+
+/**
+ * Every TCP port on this machine with a listener, or nothing when the lookup cannot run.
+ *
+ * Off on Windows. A process there shows no working directory, so `findListenerCwd` starts PowerShell
+ * for each port, and the daemon blocks for each start.
+ */
+export function findListeningPorts(
+  exec: (command: string, args: readonly string[]) => string | null,
+  platform: NodeJS.Platform = process.platform,
+): number[] {
+  if ('win32' === platform) {
+    return [];
+  }
+  const out = exec('lsof', ['-nP', '-iTCP', '-sTCP:LISTEN', '-Fn']);
+  return null === out ? [] : parseListeningPorts(out);
+}
+
+/** A Windows PowerShell cold start alone can take more than the lsof bound. */
+const WINDOWS_LOOKUP_TIMEOUT_MS = 8_000;
+
+/** The listener's command line: Windows does not show another process's working directory. */
+const windowsListenerScript = (port: number): string =>
+  `$c = Get-NetTCPConnection -State Listen -LocalPort ${String(port)} -ErrorAction Stop | ` +
+  'Select-Object -First 1; ' +
+  '(Get-CimInstance Win32_Process -Filter "ProcessId=$($c.OwningProcess)").CommandLine';
+
+const NODE_MODULES = /[\\/]node_modules[\\/]/i;
+const DRIVE_START = /[A-Za-z]:[\\/]/g;
+
+/**
+ * The folder that holds the `node_modules` a command line runs from, or null.
+ *
+ * A dev server started from a project runs a script under that project's `node_modules`, so the
+ * folder before it is the project. The path starts at the last drive letter before it, because an
+ * unquoted node path can come first. No `node_modules` is no evidence, and the answer is null.
+ * ponytail: compares as written; a drive letter in another case does not match.
+ */
+export function parseCommandLineRoot(commandLine: string): string | null {
+  const end = commandLine.search(NODE_MODULES);
+  if (end < 0) {
+    return null;
+  }
+  const head = commandLine.slice(0, end);
+  const starts = [...head.matchAll(DRIVE_START)];
+  const start = starts[starts.length - 1]?.index;
+  return start === undefined ? null : head.slice(start);
+}
+
+/**
+ * The working directory of whatever LISTENS on `port`, or null.
+ *
+ * How the daemon tells which checkout served a page when every git worktree declares the same
+ * projectId: the dev server runs inside exactly one of them. Null wherever the lookup cannot answer
+ * — a slim container with no `lsof` — and the caller then keeps the answer it had without this.
+ *
+ * Windows has no `lsof`, and no command shows another process's working directory. There the
+ * answer is the project folder in the listener's command line, from PowerShell.
+ */
+export function findListenerCwd(
+  port: number,
+  exec: (command: string, args: readonly string[], timeoutMs?: number) => string | null,
+  platform: NodeJS.Platform = process.platform,
+): string | null {
+  if ('win32' === platform) {
+    const args = ['-NoProfile', '-NonInteractive', '-Command', windowsListenerScript(port)];
+    const line = exec('powershell', args, WINDOWS_LOOKUP_TIMEOUT_MS);
+    return null === line ? null : parseCommandLineRoot(line.trim());
+  }
+  const holder = findPortHolder(port, exec);
+  if (null === holder) {
+    return null;
+  }
+  const out = exec('lsof', ['-a', '-p', String(holder.pid), '-d', 'cwd', '-Fn']);
+  return null === out ? null : parseProcessCwd(out);
+}

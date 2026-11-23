@@ -1,0 +1,80 @@
+---
+title: reticle drive
+description: Run Reticle in the foreground against a URL, with the browser visible, for debugging.
+icon: gauge-high
+---
+
+`reticle drive` runs the engine in the foreground and launches a browser at the URL you give it. It exists for debugging: you watch the run happen.
+
+```bash
+npx @reticlehq/server drive <url> [--headless] [--headed]
+```
+
+## Arguments and flags
+
+| Argument | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `url` | string, positional, **required** | none | The page to drive |
+| `--headed` | boolean | on by default outside CI | Show the browser |
+| `--headless` | boolean | on when `CI` or `RETICLE_HEADLESS` is set, or on Linux with no display | Hide it |
+
+`serve` and `mcp` show their browser by default too, so you can watch your agent's run; `--headless` hides it. `restart` always starts its daemon headless.
+
+## What it prints
+
+`reticle_started` with the port on success, `reticle_start_failed` with the error otherwise. When a daemon already owns the port it prints `reticle_drive_attached` with the session it opened instead. See [When a daemon already has the port](#when-a-daemon-already-has-the-port).
+
+Omitting the URL is a usage error. Real capture, with the usage block that follows it trimmed:
+
+```
+{"t":"2026-08-15T18:43:06.977Z","event":"reticle_usage_error","message":"drive needs a url"}
+drive needs a url
+
+usage:  reticle <command>   (or npx @reticlehq/server <command>)
+  ...
+```
+
+<Note>
+  `drive` takes **no `--port` flag**. Any flag other than `--headed` or `--headless` is rejected as
+  `unknown argument '--port'`. To drive on a different port, set `RETICLE_PORT` or put the port in
+  `.reticle.json`.
+</Note>
+
+## Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | Running in the foreground, or attached with a connected session |
+| `1` | No URL, an unknown flag, the engine failed to start, attach failed, or the attached tab never connected |
+
+## When a daemon already has the port
+
+A daemon on `:4400` is the normal state the moment any agent connects, and `drive` does not fight it for the port: it **asks that daemon** for a browser instead. The daemon opens a fresh isolated, never-throttled context, the same one `reticle_lease` hands an agent, and `drive` prints the session id and exits.
+
+```bash
+$ npx @reticlehq/server drive http://localhost:5173
+{"event":"reticle_drive_attached","port":4400,"url":"http://localhost:5173","sessionId":"lease-9f2b…","ready":true,"projectId":"web","title":"Web"}
+```
+
+A plain-text line follows it naming the same session, the app it belongs to (the `projectId` and title the page reported), how long it survives untouched (any tool call against it resets that), and, if the page never dialled the bridge, why.
+
+In a monorepo the port you meant for one app can be held by another. When the current directory's `.reticle.json` names a different project from the one the page reported, the line ends with a warning saying so, and the JSON carries both as `projectId` and `expectedProjectId`. Real capture, with app `admin` on the port, `drive` run from app `web`, and the sentence break shown as `...`:
+
+```
+attached to the Reticle daemon on :4497 ... it is driving http://localhost:5177/?__reticle_project=admin (project "admin", "Admin console") as session lease-74bf5522-8eee-4ea2-b66d-4c056c7dad3a, which every Reticle tool can address. It is released after 300s untouched; any tool call against it resets that. Warning: this directory's .reticle.json is project "web", but the page at http://localhost:5177/?__reticle_project=admin is project "admin", so another app is probably serving that port. Check which dev server is on it before trusting anything this session reports.
+```
+
+That session lives in the daemon, so the tools your agent already has open can address it by id. You do **not** need `reticle stop` first, and should not use it: the MCP proxy respawns a daemon as soon as the next tool call arrives, which is a race a manual `stop` loses.
+
+Attaching means the browser is the daemon's pooled one, shown or hidden as that daemon was started, so `--headed` cannot apply. To watch a browser instead, drive on a port no daemon owns (`RETICLE_PORT=4460`).
+
+<Note>
+  If the port is held by something that is **not** a Reticle daemon, `drive` refuses and names the
+  holder. It can neither bind nor attach. [`reticle verify`](/cli/verify) still binds its own port.
+</Note>
+
+## Worked example
+
+```bash
+npx @reticlehq/server drive http://localhost:5173
+```

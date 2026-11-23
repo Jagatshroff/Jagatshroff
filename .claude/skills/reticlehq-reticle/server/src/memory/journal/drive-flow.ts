@@ -1,0 +1,291 @@
+import {
+  ActionType,
+  FlowPredicateSchema,
+  QueryBy,
+  REPLAY_PROGRAM_VERSION,
+  asFlowName,
+  asRecord,
+  isCredentialFieldName,
+} from '@reticlehq/core';
+import { journeySentence } from '@reticlehq/core';
+import type { FlowFile, FlowName, Predicate } from '@reticlehq/core';
+
+/**
+ * What this module needs a recorded step to BE, named structurally rather than imported.
+ *
+ * The recorder's own `RecordedStep` lives two directories away, under
+ * `language/flows/recording/tape/`. Importing it made TEARDOWN reach into the recorder's internals
+ * for three field names, and the reach guard's advice is the right one: the question is not whether
+ * the dependency is allowed, it is whether the thing reached for is in the right place. A tape is
+ * data, and this module only reads it.
+ */
+export interface TapeStep {
+  tool: string;
+  args: Record<string, unknown>;
+  stable: boolean;
+  expect?: Predicate;
+  /** Recorder-internal, and the field journeys are cut on. Never written to the saved flow. */
+  route?: string;
+  page?: string;
+  endPage?: string;
+  /** The intent the agent declared on this action. The first one names the journey. */
+  intent?: string;
+  /** Recorder-internal: network mocks were active when it ran (#1459). Never written to disk. */
+  mocked?: true;
+}
+
+/** The compiled shape a flow store accepts. Structural, for the same reason as `TapeStep`. */
+export interface DriveProgram {
+  name: string;
+  version: number;
+  steps: TapeStep[];
+  startPath?: string;
+  author?: FlowFile['author'];
+  /** Built from the steps' expects when no step declared an intent. Never a declared goal. */
+  intent?: string;
+  intentDerived?: true;
+}
+
+/**
+ * What a session drove, saved as a replayable flow — without anybody asking for it.
+ *
+ * The agent-facing route to this is `record{start}` then `flow_save`, and it is a route agents do
+ * not take. The corpus says so: **3 of 33 flows are mutation-testable and 6 of 112 steps declare a
+ * consequence.** The engine catches 84 of the 86 bugs it structurally can, so the ceiling on this
+ * product is not detection, it is how many flows exist that could go red — and every drive that is
+ * never saved is a regression test that was paid for and thrown away.
+ *
+ * So it is not a tool and not a rule. It runs at teardown, in code, on every session.
+ */
+
+/**
+ * The claims one tape step carries: its own `expect`, and the `expect` of each of its sub-steps.
+ *
+ * A `reticle_act { steps }` journey is one tape step, and each claim is on its sub-step. When only
+ * the step's own `expect` was read, a journey with four held claims was "unproven" and was not saved.
+ */
+export function claimsOf(step: TapeStep): Predicate[] {
+  const subs = Array.isArray(step.args['steps']) ? step.args['steps'] : [];
+  const subClaims = subs.flatMap((sub) => {
+    const parsed = FlowPredicateSchema.safeParse(asRecord(sub)['expect']);
+    return parsed.success ? [parsed.data] : [];
+  });
+  return step.expect === undefined ? subClaims : [step.expect, ...subClaims];
+}
+
+/** The one condition on saving, and the reason the whole thing is safe. */
+export function carriesAnAssertion(steps: readonly TapeStep[]): boolean {
+  return steps.some((step) => 0 < claimsOf(step).length);
+}
+
+/** Squeeze any string into one safe, lower-case filename segment. */
+const segment = (value: string, max: number): string =>
+  value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, max)
+    .replace(/-$/, '');
+
+/**
+ * What a journey proved, in one sentence, when no step declared why it was driven. An auto-saved
+ * drive was named by its request path and a hash ("drive-get-v1-runs-issues-c69f82") and its file
+ * said nothing about what it was for.
+ */
+function provedSentence(steps: readonly TapeStep[]): string | undefined {
+  return journeySentence(steps.flatMap(claimsOf));
+}
+
+/** Every auto-saved flow's name starts here, which is what lets a merge tell them from hand-named ones. */
+export const DRIVE_FLOW_PREFIX = 'drive-';
+
+/** The most characters one segment of core's FLOW_NAME_PATTERN holds. */
+const FLOW_NAME_MAX_LENGTH = 64;
+
+/**
+ * A readable name for a journey, led by WHY it was driven.
+ *
+ * The agent's own `intent` on the action is the best name there is — it is the sentence a person
+ * would use — so it leads when one was declared. Without one, what the journey proved names it (the
+ * strongest claim first), and the route follows so two journeys stay apart.
+ *
+ * No session id. It used to trail every name so two sessions never overwrote each other, which also
+ * made every session's drive of the same journey its own file. Two DIFFERENT journeys that land on
+ * one name are now told apart at save by their shape, and two copies of the SAME journey merge —
+ * see FlowStore.saveJourney.
+ */
+export function driveFlowName(route?: string, steps: readonly TapeStep[] = []): FlowName {
+  const intent = steps.find((step) => step.intent !== undefined)?.intent;
+  const leg = segment(route ?? '', 24);
+  const why = intent === undefined ? '' : segment(intent, 48);
+  const lead = '' !== why ? why : segment(provedSentence(steps) ?? '', 48);
+  // Minted here: every character has just been forced through `segment`, so this IS the validated
+  // boundary the brand is meant to be created at.
+  const parts = [lead, ...('' !== why || 0 === leg.length ? [] : [leg])].filter((p) => '' !== p);
+  // Cut to the flow-name limit: a sentence and a route together went over it, the save refused
+  // the name, and session end dropped the flow with nothing said.
+  const body = segment(parts.join('-'), FLOW_NAME_MAX_LENGTH - DRIVE_FLOW_PREFIX.length);
+  return asFlowName(`${DRIVE_FLOW_PREFIX}${'' === body ? 'journey' : body}`);
+}
+
+/** Why session end saved no flow, as reported on the `flow_recorded` step. */
+export const DriveFlowSkipReason = {
+  /** The drive declared no consequence, so a saved flow could never go red. */
+  NO_DECLARED_CONSEQUENCE: 'no_declared_consequence',
+  /** What it proved rested on network mocks the flow would not carry (#1459). */
+  DRIVEN_UNDER_NETWORK_MOCKS: 'driven_under_network_mocks',
+} as const;
+
+export interface DriveFlowOutcome {
+  /** The flows that were written — one per journey the session contained. */
+  readonly saved?: readonly string[];
+  /**
+   * Steps that were driven and NOT saved because none of them declared a consequence.
+   *
+   * Reported rather than silently dropped. A tape with no `expect` replays green forever whatever
+   * the app does, so auto-saving one manufactures a permanent pass — which is the exact failure this
+   * product exists to prevent, and it would do it at a rate of one per session. Counting them is how
+   * "the agent drove and proved nothing" stays visible instead of looking like nothing happened.
+   */
+  readonly unprovenSteps?: number;
+  /**
+   * Steps of journeys that proved something and were NOT saved because they ran while network
+   * mocks were active (#1459). Such a journey replays against the real backend, so it either fails
+   * for a reason unrelated to the change or passes on data the original check never saw, and the
+   * flow file holds no trace of the precondition. Counted, so "not saved" has a reason.
+   */
+  readonly mockedSteps?: number;
+}
+
+/**
+ * Turn this session's ambient tape into a flow, when it is worth one.
+ *
+ * Pure over the tape: the caller supplies it and writes the result, so the decision — save, or
+ * count as unproven — is testable without a store, a session or a disk.
+ */
+/**
+ * Cut a session's tape into journeys at ROUTE boundaries.
+ *
+ * A deliberate recording is one journey because somebody said where it started and where it ended.
+ * An ambient tape is a whole session: sign in, go somewhere, do a thing, go somewhere else. Saved
+ * whole it is one flow that begins at the login screen, and a SUITE of those fails from the second
+ * one on — the app is already authenticated, so the login steps no longer apply. That hazard is
+ * already written down in `bench/harness/suite-rre.mjs`, which works around it by recording its
+ * flows post-login by hand; this is the same fix, done by the recorder instead of by a person.
+ *
+ * MEASURED before the fix: 24 of 24 auto-captured flows embedded a login step, and none carried a
+ * `startPath` at all.
+ *
+ * The route is the boundary because it is the one the FLOW FORMAT already uses: replay navigates to
+ * `startPath` before step 1, so a segment that declares its route is independent of wherever the
+ * previous flow happened to leave the tab.
+ */
+function segmentsByRoute(steps: readonly TapeStep[]): { route?: string; steps: TapeStep[] }[] {
+  const out: { route?: string; steps: TapeStep[] }[] = [];
+  let signedIn = false;
+  for (const step of steps) {
+    const last = out.at(-1);
+    const previous = last?.steps.at(-1);
+    // The same journey when the route is unchanged, or when the previous ACTION moved the app here
+    // — cart → shipping → payment is one flow, and cutting it left three fragments that each
+    // proved a page and none proved the journey. Not after a sign-in: that is the cut this exists
+    // for, and a login that navigates onward must still not open the next flow.
+    const caused =
+      previous !== undefined && step.route !== undefined && previous.endPage === step.route;
+    if (last !== undefined && (last.route === step.route || (caused && !signedIn))) {
+      last.steps.push(step);
+      signedIn ||= typesASecret(step);
+      continue;
+    }
+    signedIn = typesASecret(step);
+    out.push({ ...(step.route === undefined ? {} : { route: step.route }), steps: [step] });
+  }
+  return out;
+}
+
+/**
+ * A fill into a field whose name says it holds a credential — the sign-in a journey must not carry.
+ * Read off the recorder's anchor args: a testid names the field by `value`, a role by `name`.
+ */
+function typesASecret(step: TapeStep): boolean {
+  // A sign-in sent as one reticle_act sequence carries its fills as sub-steps.
+  const subs = step.args['steps'];
+  if (Array.isArray(subs)) {
+    return subs.some((sub) => fillsASecret(asRecord(sub)));
+  }
+  return fillsASecret(step.args);
+}
+
+function fillsASecret(args: Record<string, unknown>): boolean {
+  const action = args['action'];
+  if (ActionType.FILL !== action && ActionType.TYPE !== action) {
+    return false;
+  }
+  const by = args['by'];
+  const field = QueryBy.TESTID === by ? args['value'] : args['name'];
+  return 'string' === typeof field && isCredentialFieldName(field);
+}
+
+/**
+ * The tape without the attempts an agent made again. An action that declared nothing, followed at
+ * once by the same action on the same control that did, is a retry: saved, the flow clicked sign-in
+ * twice, the second click found no form, and every replay of it failed. A step repeated with the
+ * same declaration both times (a double submit on purpose) is two steps, and stays two.
+ */
+function withoutRetries(steps: readonly TapeStep[]): TapeStep[] {
+  return steps.filter((step, i) => {
+    const next = steps[i + 1];
+    if (next === undefined || step.expect !== undefined || next.expect === undefined) {
+      return true;
+    }
+    // Tried again where it was tried: a page later it is a step of the journey, not a retry.
+    if (step.route !== next.route || step.page !== next.page || step.mocked !== next.mocked) {
+      return true;
+    }
+    const { expect: _declared, ...again } = next.args;
+    const { expect: _none, ...first } = step.args;
+    return step.tool !== next.tool || JSON.stringify(first) !== JSON.stringify(again);
+  });
+}
+
+/** A flow per journey, so two journeys in one session are two regression tests rather than one. */
+export function driveFlowsFrom(
+  tape: { steps: readonly TapeStep[]; startPath?: string } | undefined,
+): { programs: DriveProgram[]; outcome: DriveFlowOutcome } {
+  if (tape === undefined || 0 === tape.steps.length) {
+    return { programs: [], outcome: {} };
+  }
+  const programs: DriveProgram[] = [];
+  let unproven = 0;
+  let mocked = 0;
+  for (const segment of segmentsByRoute(withoutRetries(tape.steps))) {
+    if (!carriesAnAssertion(segment.steps)) {
+      unproven += segment.steps.length;
+      continue;
+    }
+    if (segment.steps.some((step) => true === step.mocked)) {
+      mocked += segment.steps.length;
+      continue;
+    }
+    const startPath = segment.route ?? tape.startPath;
+    const declared = segment.steps.some((step) => step.intent !== undefined);
+    const built = declared ? undefined : provedSentence(segment.steps);
+    programs.push({
+      ...(built === undefined ? {} : { intent: built, intentDerived: true as const }),
+      name: driveFlowName(startPath, segment.steps),
+      version: REPLAY_PROGRAM_VERSION,
+      // The route is recorder-internal and has no business on disk — `startPath` is where the
+      // on-disk flow says the same thing, in the field replay actually reads.
+      steps: segment.steps.map(({ route: _route, mocked: _mocked, ...step }) => step),
+      ...(startPath === undefined ? {} : { startPath }),
+    });
+  }
+  return {
+    programs,
+    outcome: {
+      ...(0 === programs.length ? {} : { saved: programs.map((p) => p.name) }),
+      ...(0 === unproven ? {} : { unprovenSteps: unproven }),
+      ...(0 === mocked ? {} : { mockedSteps: mocked }),
+    },
+  };
+}

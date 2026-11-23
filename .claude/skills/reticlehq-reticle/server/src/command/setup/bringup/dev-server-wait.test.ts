@@ -1,0 +1,237 @@
+import { describe, expect, it } from 'vitest';
+import {
+  devServerDiedMessage,
+  announcedUrl,
+  judgeWait,
+  portBusyMessage,
+  QUIET_MEANS_HUNG_MS,
+  urlToWatch,
+  WAIT_CEILING_MS,
+  WaitVerdict,
+  type WaitFacts,
+} from './dev-server-wait.js';
+
+const facts = (p: Partial<WaitFacts> = {}): WaitFacts => ({
+  output: '',
+  launcherExited: false,
+  serving: false,
+  quietForMs: 0,
+  elapsedMs: 0,
+  ...p,
+});
+
+describe('is the dev server up', () => {
+  it('is ready as soon as the url answers', () => {
+    expect(judgeWait(facts({ serving: true }))).toBe(WaitVerdict.READY);
+  });
+
+  // `astro dev` forks the real server, prints the url and returns. Reading that exit as death
+  // failed Astro on every single run.
+  it('treats a launcher that exited while the port serves as alive, not dead', () => {
+    expect(judgeWait(facts({ serving: true, launcherExited: true }))).toBe(WaitVerdict.READY);
+  });
+
+  it('is dead when the launcher exited and nothing answers', () => {
+    expect(judgeWait(facts({ launcherExited: true }))).toBe(WaitVerdict.DEAD);
+  });
+
+  // The heaviest real monorepo builds two shared packages before serving and took twenty minutes,
+  // while a wedged server writes nothing and would get exactly the same fixed budget.
+  it('keeps waiting on a server that is still talking', () => {
+    expect(judgeWait(facts({ quietForMs: 5_000, elapsedMs: 10 * 60_000 }))).toBe(
+      WaitVerdict.WAITING,
+    );
+  });
+
+  it('calls it hung once it goes silent without serving', () => {
+    expect(judgeWait(facts({ quietForMs: QUIET_MEANS_HUNG_MS }))).toBe(WaitVerdict.HUNG);
+  });
+
+  it('stops even a talkative server at the ceiling', () => {
+    expect(judgeWait(facts({ quietForMs: 0, elapsedMs: WAIT_CEILING_MS }))).toBe(WaitVerdict.HUNG);
+  });
+});
+
+describe('which url to watch', () => {
+  it('reads the url the tool announced rather than composing one', () => {
+    expect(announcedUrl('  ➜  Local:   http://localhost:5173/')).toBe('http://localhost:5173');
+  });
+
+  it('finds an announcement among noise', () => {
+    expect(urlToWatch('warn: something\n- Local: http://127.0.0.1:3000\nready', [])).toBe(
+      'http://127.0.0.1:3000',
+    );
+  });
+
+  // react-scripts prints nothing parseable outside a tty. The app compiled and served happily while
+  // setup timed out insisting no url appeared, so an OBSERVED port is evidence, not a guess.
+  it('falls back to a port our own process group was seen binding', () => {
+    expect(urlToWatch('Compiled successfully.', [3200])).toBe('http://localhost:3200');
+  });
+
+  it('prefers what the tool said over what we observed', () => {
+    expect(urlToWatch('- Local: http://localhost:5173', [3200])).toBe('http://localhost:5173');
+  });
+
+  it('has no url when the tool said nothing and nothing was bound', () => {
+    expect(urlToWatch('starting...', [])).toBeUndefined();
+  });
+});
+
+/**
+ * Reported from the field: `init` in a pnpm workspace ran the root `dev` script, which starts the
+ * Vite app AND a Fastify API. The API announced its url first, init probed it, said "the SDK is NOT
+ * in the page" and exited 1, while the app served on 5173. When the output announces several urls,
+ * the app's own is chosen: by the port the app is expected to take, else by the line that names it.
+ */
+describe('which url is the app, when the root script starts several servers', () => {
+  const BOTH =
+    'backend dev: Server listening at http://127.0.0.1:4000\n' +
+    'frontend dev:   ➜  Local:   http://localhost:5173/\n';
+
+  it('takes the url on the port the app is expected to take', () => {
+    expect(urlToWatch(BOTH, [], { port: 5173 })).toBe('http://localhost:5173');
+  });
+
+  it("takes the url on the line that names the app's folder or package", () => {
+    expect(urlToWatch(BOTH, [], { names: ['frontend', '@acme/web'] })).toBe(
+      'http://localhost:5173',
+    );
+    const turbo =
+      '@acme/api:dev: Server listening at http://127.0.0.1:4000\n' +
+      '@acme/web:dev:   ➜  Local:   http://localhost:5173/\n';
+    expect(urlToWatch(turbo, [], { names: ['web', '@acme/web'] })).toBe('http://localhost:5173');
+  });
+
+  it('keeps the first url when nothing says which one is the app', () => {
+    expect(urlToWatch(BOTH, [])).toBe('http://127.0.0.1:4000');
+    expect(urlToWatch(BOTH, [], { port: 3000, names: ['docs'] })).toBe('http://127.0.0.1:4000');
+  });
+});
+
+describe('a taken port is named, not reported as a silent exit (#802)', () => {
+  it('reads CRA\'s "already running on port" prompt', () => {
+    expect(
+      portBusyMessage(
+        'Something is already running on port 3000.\nWould you like to run the app on another port instead?',
+      ),
+    ).toMatch(/port 3000 is already in use/);
+  });
+
+  it('reads a Vite in-use line', () => {
+    expect(portBusyMessage('Port 5173 is in use, trying another one...')).toMatch(/port 5173/);
+  });
+
+  // Node prints the full address after the phrase. The port sits after the LAST colon of that
+  // address, so reading the first digit names the host instead of the port (#1846).
+  it('reads the port after the address in a Node EADDRINUSE line', () => {
+    expect(
+      portBusyMessage('Error: listen EADDRINUSE: address already in use 0.0.0.0:3000'),
+    ).toMatch(/port 3000 is already in use/);
+  });
+
+  it('reads the port of an IPv6 wildcard address', () => {
+    expect(portBusyMessage('Error: listen EADDRINUSE: address already in use :::3000')).toMatch(
+      /port 3000 is already in use/,
+    );
+  });
+
+  // The loopback digits sit INSIDE the address, so reading the first digit named port 1. The
+  // wildcard shape above has no such digit and passed before the fix — these two prove it.
+  it('reads the port of an IPv6 loopback address written bare', () => {
+    expect(portBusyMessage('Error: listen EADDRINUSE: address already in use ::1:4400')).toMatch(
+      /port 4400 is already in use/,
+    );
+  });
+
+  it('reads the port of an IPv6 loopback address written bracketed', () => {
+    expect(portBusyMessage('Error: listen EADDRINUSE: address already in use [::1]:4400')).toMatch(
+      /port 4400 is already in use/,
+    );
+  });
+
+  // The stack frame under the error carries digits of its own (`node:net:1817:16`); scanning past
+  // the line end named frame numbers as the port. The port lives on the error line or nowhere.
+  it('stays quiet when only the stack trace below the error line carries digits', () => {
+    expect(
+      portBusyMessage(
+        'Error: listen EADDRINUSE: address already in use\n    at Server (node:net:1817:16)',
+      ),
+    ).toBeUndefined();
+  });
+
+  it('reads the port of a loopback address', () => {
+    expect(
+      portBusyMessage('Error: listen EADDRINUSE: address already in use 127.0.0.1:5173'),
+    ).toMatch(/port 5173 is already in use/);
+  });
+
+  it('reads the port after a host name', () => {
+    expect(
+      portBusyMessage('Error: listen EADDRINUSE: address already in use myhost.local:3000'),
+    ).toMatch(/port 3000 is already in use/);
+  });
+
+  it('still reads a bare port when the line names no address', () => {
+    expect(portBusyMessage('Error: listen EADDRINUSE 3000')).toMatch(/port 3000 is already in use/);
+  });
+
+  it('stays quiet when the output does not name a busy port', () => {
+    expect(portBusyMessage('Compiled successfully.')).toBeUndefined();
+  });
+});
+
+/**
+ * How long silence is allowed to mean "still starting" is a property of the MACHINE, not the code.
+ *
+ * 45s of quiet is generous on a developer's laptop and tight on a cold Windows CI runner, where a
+ * first `npm run dev` optimises dependencies before Vite prints anything. Measured on the install
+ * gate: the Vue scaffold was declared hung, `init` exited 1, and the gate then started the same app
+ * and connected to it immediately. The app was fine; the patience was not.
+ *
+ * The budget is passed IN rather than read from the platform here, so this stays a pure decision and
+ * the caller owns the one platform check.
+ */
+describe('the quiet budget is the callers to set', () => {
+  const facts = (over: Partial<Parameters<typeof judgeWait>[0]> = {}) => ({
+    output: 'vite v5 starting...',
+    launcherExited: false,
+    serving: false,
+    quietForMs: 50_000,
+    elapsedMs: 60_000,
+    ...over,
+  });
+
+  it('still calls a long silence hung on the default budget', () => {
+    expect(judgeWait(facts())).toBe(WaitVerdict.HUNG);
+  });
+
+  it('keeps waiting when the caller allows a longer silence', () => {
+    expect(judgeWait(facts({ quietMeansHungMs: 180_000 }))).toBe(WaitVerdict.WAITING);
+  });
+
+  // The other verdicts must not soften: a launcher that exited is dead however patient we are.
+  it('does not let a longer budget hide a dead launcher', () => {
+    expect(judgeWait(facts({ quietMeansHungMs: 180_000, launcherExited: true }))).toBe(
+      WaitVerdict.DEAD,
+    );
+  });
+
+  it('does not let a longer budget outlast the ceiling', () => {
+    expect(judgeWait(facts({ quietMeansHungMs: 180_000, elapsedMs: WAIT_CEILING_MS }))).toBe(
+      WaitVerdict.HUNG,
+    );
+  });
+});
+
+describe('a dev server that died before serving', () => {
+  it('quotes the end of what it printed, so the cause is on screen', () => {
+    const said = devServerDiedMessage('> app@1.0.0 dev\n> vite\n\nsh: vite: command not found\n');
+    expect(said).toContain('sh: vite: command not found');
+    expect(said).toContain('exited without serving anything');
+  });
+
+  it('says it printed nothing when it printed nothing', () => {
+    expect(devServerDiedMessage('')).toContain('printed nothing');
+  });
+});

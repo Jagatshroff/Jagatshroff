@@ -1,0 +1,278 @@
+import { type HelloEnv, type HelloScope, type RedactionConfig } from '@reticlehq/core';
+import { HelloInstrumentation, HudVisibility, RETICLE_URL_PARAM } from '@reticlehq/core/page';
+
+/**
+ * What `reticle.connect()` accepts.
+ *
+ * A pure description of the SDK's public entry contract has no reason to live inside the class that
+ * consumes it, and keeping them apart leaves the surface every integrating app reads reviewable on
+ * its own.
+ */
+export interface ReticleConnectOptions {
+  /** WS endpoint of the local bridge. Defaults to ws://localhost:<port><path>. */
+  url?: string;
+  /** Human-friendly session label so the agent can target the right tab. */
+  session?: string;
+  /**
+   * Stable project identity, normally stamped by the build plugin (e.g. "acme-web-9f3c1d"). Lets the
+   * agent scope to the right app even when its dev server boots on an unexpected port. Optional.
+   */
+  projectId?: string;
+  /**
+   * Browser/bridge pairing token. Required whenever the daemon has one, which is the ordinary case:
+   * it auto-provisions `~/.reticle/pairing-token` on first start and then refuses a hello without it,
+   * including on localhost. Non-localhost additionally needs `allowNonLocalhost`.
+   */
+  token?: string;
+  /** Explicitly allow Reticle on a non-localhost page or bridge. Requires token. */
+  allowNonLocalhost?: boolean;
+  /**
+   * Escape hatch for the production backstop. Reticle is dev-only and refuses to connect when the
+   * build reports NODE_ENV=production (an SSR healthcheck or a prod bundle opened locally would
+   * otherwise activate). The real fix is to gate the import behind `import.meta.env.DEV` so it's
+   * tree-shaken out; this flag only exists for the rare intentional prod diagnostic.
+   */
+  allowInProduction?: boolean;
+  /**
+   * Where this page runs, sent in the HELLO. `production` is accepted only with a session nonce as
+   * `token`, and the daemon then applies its production action policy. Absent: development.
+   */
+  env?: HelloEnv;
+  /** What a drive may do here: `observe` or `act`. Required with `env: "production"`. */
+  scope?: HelloScope;
+  /**
+   * Set by a hosted verifier that put this SDK into a page from outside (an init script), never by
+   * an app. The HELLO then says `instrumentation: "injected"`, so nothing reads this session as an
+   * app that has the SDK installed.
+   */
+  injected?: boolean;
+  /**
+   * Set by a daemon-driven lease, never by an app. A lease call with a different `token` replaces
+   * the token, and dials again when the bridge refused the old one. A page that ships its own SDK
+   * with a stale token then still connects.
+   */
+  lease?: boolean;
+  /**
+   * The attribute this app marks controls with, when it is not `data-testid` — `data-test-subj`
+   * (Elastic UI), `data-cy` (Cypress), `data-test`. Read by the `testid` locator, by the testids the
+   * page advertises, and by the anchors a recording writes. Supplied by the Vite plugin only, from
+   * `testIdAttribute` in `.reticle.json`; Next.js, Remix and manual setups pass it here. Absent or not a plain attribute name: `data-testid`.
+   */
+  testIdAttribute?: string;
+  /** Show a small in-page status chip (connection + event count). */
+  overlay?: boolean;
+  /**
+   * Capture request/response bodies on net.request events (dev-only; text-like content only,
+   * sensitive keys redacted, per-body capped). Off by default - bodies cost tokens and can carry PII.
+   */
+  captureNetworkBodies?: boolean;
+  /**
+   * Per-body character cap for captured request/response bodies. Default 8192; clamped to
+   * [256, 262144]. Only meaningful with `captureNetworkBodies`.
+   *
+   * Raise it to make a NEGATIVE `bodyContains` assertion decidable. A negation has to be checked
+   * over the whole payload, so on any list endpoint whose response exceeds the cap it is
+   * permanently undecidable -- and that is the class that proves safety invariants ("this dangerous
+   * field is absent from every row"). A positive assertion degrades gracefully by comparison, since
+   * the match is usually early in the body (#799).
+   *
+   * The cost is the shared ring buffer: bodies ride the same timeline as DOM, route and console
+   * events, so a large cap spends behavioural history on one response. Raise it for the run that
+   * needs it rather than leaving it high.
+   */
+  networkBodyMaxChars?: number;
+  /**
+   * Whether this build stamps `data-reticle-source`. Supplied by the build plugin, which is the only
+   * thing that knows: the page cannot tell "no plugin" from "plugin with the stamp turned off", and
+   * a verdict that cannot name a line prescribes opposite fixes for the two. Absent means unknown.
+   */
+  sourceMapping?: boolean;
+  /**
+   * Retain the response body of a FAILED request (HTTP >= 400) even with `captureNetworkBodies`
+   * off. **Default true.** Set `false` for a workspace that wants nothing retained at all.
+   *
+   * The two flags answer different questions. `captureNetworkBodies` is a volume-and-privacy
+   * decision about every 200 the app makes. This is about the handful of bytes that say why
+   * something broke: a confirmed `POST /auth/v1/signup -> 500, responseSize: 74` says signup is
+   * broken, and the 74 bytes say the mail provider refuses this domain -- only the second is
+   * actionable (#800).
+   *
+   * Bounded and narrow by design: failures only, a 4 KB cap, and the same redaction every other
+   * captured body goes through, applied before retention.
+   */
+  captureErrorBodies?: boolean;
+  /**
+   * Make Reticle's OWN presenter visible to snapshots and queries. CONTRIBUTORS ONLY.
+   *
+   * The presenter is hidden from every tool by design, for a good reason: an agent that can drive
+   * Reticle's own interface can fabricate its own impact report, and Reticle chrome in a snapshot is
+   * noise in every other app on earth.
+   *
+   * The cost of that rule is that a HUD change is the only kind of change Reticle cannot be used to
+   * check — the panel rendering it is invisible to everything that could look at it. This hatch
+   * exists for exactly that case: the app under test IS Reticle. It reports itself in the app's
+   * capabilities, so a verdict drawn with it open can never be mistaken for an ordinary one.
+   */
+  exposePresenter?: boolean;
+  /**
+   * The project root, so source paths report repo-relative instead of absolute.
+   *
+   * React's `_debugSource.fileName` is absolute; the babel stamp is repo-relative. Build plugins that
+   * can `define` a global set it themselves; frameworks that cannot (Next passes it through env,
+   * Astro through its own config) hand it here instead. Taking it as a connect OPTION is what keeps
+   * the generated app-side code plain JavaScript - the previous shape made the caller assign a global,
+   * and the TypeScript cast that needed shipped into a `.jsx` file and broke the build.
+   */
+  root?: string;
+  /**
+   * The SDK's own package version, so a version-skewed pair against the daemon can name itself
+   * rather than surfacing as a bare `-32000`. Build plugins supply it automatically; pass it here
+   * only for a hand-wired connect that has no plugin.
+   */
+  sdkVersion?: string;
+  /** Presenter mode: glow border, animated cursor, click/hover effects, narration HUD. */
+  present?: boolean;
+  /** Per-action pacing (ms) in presenter mode so a human can follow. Default 450. */
+  pace?: number;
+  /** Min ms each narration line stays visible before the next replaces it (presenter). Default 3000. */
+  narrationDwellMs?: number;
+  /**
+   * Border behavior in presenter mode: 'session' (default) persists the border for the whole
+   * session; 'busy' restores the fade-after-idle behavior.
+   */
+  border?: 'session' | 'busy';
+  /** Max accumulated activity-log rows before the oldest are pruned (presenter). Default 50. */
+  logMax?: number;
+  /**
+   * Mount the floating human-recorder toolbar (Record/Stop/Annotate).
+   * Default off - purely additive, dev-only.
+   */
+  recorder?: boolean;
+  /**
+   * Mount the page annotator: expanding the HUD enters click-to-annotate mode, and Reticle emits
+   * a HUMAN_MARK the agent drains via reticle_review. Defaults to ON with the presenter; pass
+   * `annotate: false` to suppress.
+   */
+  annotate?: boolean;
+  /** Live-control: overridable ended-border fade delay (native timer). Default 4000. */
+  endedFadeMs?: number;
+  /** Session auto-end after this much agent idle (presenter). Default 5min; agent-tunable via reticle_session. */
+  idleEndMs?: number;
+  /**
+   * Extend the redaction rules with your app's own vocabulary.
+   *
+   * ```ts
+   * reticle.connect({
+   *   redact: {
+   *     keys: ['deviceSecretRef', /^partner[-_]?code$/i],  // also redact these
+   *     allow: ['designToken'],                            // stop redacting this false positive
+   *   },
+   * });
+   * ```
+   *
+   * Additive only - there is no way to replace the built-in rule, because a config that could would
+   * eventually ship an app that leaks. `keys` strings match a key name exactly (case-insensitively);
+   * a RegExp is tested against it. `allow` exempts a key from the DEFAULT rule and loses to `keys`.
+   *
+   * Literal `keys` strings also cross the bridge, so the daemon redacts them on the driven path,
+   * where request bodies are captured raw from the network stack and never pass through this SDK.
+   * RegExp entries and `allow` do NOT cross - see docs/usage.md ("Extending the redaction rules") for why, and what that means.
+   */
+  redact?: RedactionConfig;
+}
+
+/**
+ * The env, scope and instrumentation connect() named, for the HELLO. Absent stays absent: an older
+ * daemon reads it, and an absent `instrumentation` means installed.
+ */
+export function helloMode(options: Pick<ReticleConnectOptions, 'env' | 'scope' | 'injected'>): {
+  env?: HelloEnv;
+  scope?: HelloScope;
+  instrumentation?: HelloInstrumentation;
+} {
+  return {
+    ...(options.env === undefined ? {} : { env: options.env }),
+    ...(options.scope === undefined ? {} : { scope: options.scope }),
+    ...(true === options.injected ? { instrumentation: HelloInstrumentation.INJECTED } : {}),
+  };
+}
+
+/**
+ * Runtime backstop for the dev-only SDK: block connecting when the build reports production, unless
+ * explicitly overridden. Pure so it's testable; connect reads NODE_ENV safely (process may be absent
+ * in a raw browser). This is defense-in-depth - the primary guard is the consumer gating the import
+ * behind `import.meta.env.DEV` so the SDK is dead-code-eliminated from prod bundles entirely.
+ */
+export function shouldBlockProduction(
+  nodeEnv: string | undefined,
+  allowInProduction: boolean,
+): boolean {
+  return 'production' === nodeEnv && !allowInProduction;
+}
+
+/**
+ * The token a lease call brings, or undefined when it changes nothing.
+ *
+ * A lease that reaches a page whose own SDK started with a stale token: the bridge refused that
+ * token, and the lease's `connect()` used to do nothing. Only a lease-marked call replaces the
+ * token. An app's own second `connect()` must not change who the page says it is.
+ */
+export function leaseToken(
+  options: ReticleConnectOptions,
+  current: string | undefined,
+): string | undefined {
+  const token = options.token;
+  if (true !== options.lease || token === undefined || 0 === token.length || token === current) {
+    return undefined;
+  }
+  return token;
+}
+
+/** `raw` when it is one of `values`, else undefined. */
+export function oneOf<T extends Record<string, string>>(
+  values: T,
+  raw: unknown,
+): T[keyof T] | undefined {
+  return (Object.values(values) as unknown[]).includes(raw) ? (raw as T[keyof T]) : undefined;
+}
+
+/**
+ * Extract Reticle identity overrides from a `location.search` string. Pure (takes the string, not the
+ * window) so it's testable without a DOM. Explicit connect options still win over these.
+ */
+export function reticleParamsFromSearch(search: string): {
+  session?: string;
+  projectId?: string;
+  hud?: HudVisibility;
+} {
+  const params = new URLSearchParams(search);
+  const out: { session?: string; projectId?: string; hud?: HudVisibility } = {};
+  const session = params.get(RETICLE_URL_PARAM.SESSION);
+  const projectId = params.get(RETICLE_URL_PARAM.PROJECT);
+  const hud = oneOf(HudVisibility, params.get(RETICLE_URL_PARAM.HUD));
+  if (session !== null && session.length > 0) {
+    out.session = session;
+  }
+  if (projectId !== null && projectId.length > 0) {
+    out.projectId = projectId;
+  }
+  if (hud !== undefined) {
+    out.hud = hud;
+  }
+  return out;
+}
+
+/**
+ * A HUD asked for while no panel is mounted. Hidden and removed already hold, so they are answered
+ * as placed; shown is not true until the panel mounts. Each is remembered and applied on mount, so a
+ * request that arrives first is not lost (a drive's daemon asks as soon as the page connects).
+ */
+export function hudWithoutPanel(hud: HudVisibility | undefined): {
+  remember?: HudVisibility;
+  placed: HudVisibility[];
+} {
+  if (hud === undefined) {
+    return { placed: [] };
+  }
+  return { remember: hud, placed: HudVisibility.SHOWN === hud ? [] : [hud] };
+}

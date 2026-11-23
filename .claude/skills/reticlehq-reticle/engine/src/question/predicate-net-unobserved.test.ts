@@ -1,0 +1,352 @@
+import { describe, it, expect } from 'vitest';
+import { EventType } from '@reticlehq/core';
+import type { ReticleEvent } from '@reticlehq/core';
+import { evalNet } from './predicate/predicate-eval.js';
+import { PredicateKind } from './predicate/predicate.js';
+
+/**
+ * A request Reticle cannot see must not be graded as a request that did not happen.
+ *
+ * The observer patches `fetch` and `XMLHttpRequest` only, so anything the DOCUMENT initiates —
+ * `<link rel=icon>`, `<link rel=manifest>`, a stylesheet, a font, `<img src>` — is never recorded.
+ * Reported from the field (#447): after a hard reload of an app whose `index.html` declares all
+ * three, an `allOf` over `/favicon.ico`, `/site.webmanifest` and `/apple-touch-icon.png` returned
+ * `verified:"no"`, `verifiedReason:"assertion_failed"`, while curl against the same server at the
+ * same moment answered 200 for every one of them.
+ *
+ * That is a false RED from the layer whose whole job is not to produce one, and a false negative is
+ * worse than an unknown here: an agent that trusts it goes and "fixes" working code. `inconclusive`
+ * is the existing seam for exactly this — `decideVerified` handles it ahead of the failure clause,
+ * so the verdict lands on `unknown` instead of blaming the app.
+ */
+function netEvent(t: number, data: Record<string, unknown>): ReticleEvent {
+  return { type: EventType.NET_REQUEST, t, data } as ReticleEvent;
+}
+
+const API_CALL = netEvent(10, {
+  method: 'GET',
+  url: '/api/auth/get-session',
+  status: 500,
+  ok: false,
+});
+
+describe('evalNet — requests the document initiates', () => {
+  it.each([
+    '/favicon.ico',
+    '/site.webmanifest',
+    '/apple-touch-icon.png',
+    '/assets/app.css',
+    '/fonts/inter.woff2',
+  ])('reports %s as inconclusive rather than failed', (urlContains) => {
+    const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains, status: 200 });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeDefined();
+    expect(r.inconclusive).toContain('fetch and XMLHttpRequest');
+  });
+
+  it('ignores a query string and a fragment, since favicon.ico?v=2 is the same asset', () => {
+    const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains: '/favicon.ico?v=2' });
+
+    expect(r.inconclusive).toBeDefined();
+  });
+
+  it('still fails an ordinary XHR target that genuinely never fired', () => {
+    // The behaviour this must not weaken: a missing API call is a real finding.
+    const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains: '/api/save' });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('does not downgrade .js or .json, which are routinely fetched', () => {
+    for (const urlContains of ['/assets/index.js', '/api/config.json']) {
+      expect(
+        evalNet([API_CALL], { kind: PredicateKind.NET, urlContains }).inconclusive,
+      ).toBeUndefined();
+    }
+  });
+
+  it('does not downgrade a filter that merely contains a suffix mid-pattern', () => {
+    // `.css` here is part of a query, not the target: still an ordinary XHR.
+    const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains: '/api/assets.css/list' });
+
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('leaves a matching subresource call passing when one WAS observed', () => {
+    // An XHR to a .png is observable, and an observed match must still pass untouched.
+    const icon = netEvent(20, {
+      method: 'GET',
+      url: '/apple-touch-icon.png',
+      status: 200,
+      ok: true,
+    });
+
+    expect(
+      evalNet([icon], { kind: PredicateKind.NET, urlContains: '/apple-touch-icon.png' }).pass,
+    ).toBe(true);
+  });
+
+  it('downgrades a zero-match count assertion over the same class', () => {
+    const r = evalNet([API_CALL], {
+      kind: PredicateKind.NET,
+      urlContains: '/favicon.ico',
+      count: 1,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeDefined();
+  });
+
+  it('still fails a count assertion that saw the wrong number of OBSERVED calls', () => {
+    const icon = netEvent(20, {
+      method: 'GET',
+      url: '/apple-touch-icon.png',
+      status: 200,
+      ok: true,
+    });
+
+    const r = evalNet([icon, icon], {
+      kind: PredicateKind.NET,
+      urlContains: '/apple-touch-icon.png',
+      count: 1,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeUndefined();
+  });
+});
+
+describe('evalNet — the unobserved-channel downgrade is gated on observer liveness', () => {
+  /**
+   * Once the browser SDK observes document-initiated loads (resource timing), a miss over these
+   * suffixes stops being unknowable: a live observer would have seen the favicon load, so seeing
+   * none is real evidence. The downgrade must therefore fire ONLY when nothing proves the observer
+   * ran at all. Liveness is read off the same events being judged: any NET_REQUEST whose initiator
+   * names a document channel (link/css/img/script/manifest/other) proves the channel works.
+   */
+  // A stylesheet load as the resource-timing observer reports it: proof of liveness.
+  const STYLESHEET = netEvent(5, {
+    method: 'GET',
+    url: '/assets/app.css',
+    initiator: 'link',
+    status: 200,
+    ok: true,
+  });
+
+  it('a missing favicon where the observer IS running grades no, not unknown', () => {
+    const r = evalNet([STYLESHEET], {
+      kind: PredicateKind.NET,
+      urlContains: '/favicon.ico',
+      status: 200,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeUndefined();
+    expect(r.failureReason).toBeDefined();
+  });
+
+  it('a zero-match count assertion over the same class grades no too', () => {
+    const r = evalNet([STYLESHEET], {
+      kind: PredicateKind.NET,
+      urlContains: '/site.webmanifest',
+      count: 1,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('a page with no document-initiated record keeps the honest unknown', () => {
+    // Only an XHR in the stream: nothing proves the PerformanceObserver exists here.
+    const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains: '/favicon.ico' });
+
+    expect(r.inconclusive).toBeDefined();
+  });
+
+  it('an observed subresource still passes untouched under the gate', () => {
+    const icon = netEvent(20, {
+      method: 'GET',
+      url: '/apple-touch-icon.png',
+      initiator: 'link',
+      status: 200,
+      ok: true,
+    });
+
+    expect(
+      evalNet([STYLESHEET, icon], { kind: PredicateKind.NET, urlContains: '/apple-touch-icon.png' })
+        .pass,
+    ).toBe(true);
+  });
+});
+
+/**
+ * A native download or document navigation never goes through fetch/XHR, so "0 network calls"
+ * is the same shape as a 404 and is a lie either way (#805).
+ *
+ * Distinct from the favicon/stylesheet class above: those ARE subresources, and once resource
+ * timing is live a miss is real evidence. A click on `<a href="/export.pdf">` is a navigation
+ * (or a Content-Disposition attachment). Resource timing of stylesheets does not make it
+ * visible, so the honest unknown must fire even when the observer is running.
+ */
+describe('evalNet — a native download is not a missing fetch', () => {
+  const STYLESHEET = netEvent(5, {
+    method: 'GET',
+    url: '/assets/app.css',
+    initiator: 'link',
+    status: 200,
+    ok: true,
+  });
+
+  it.each(['/api/invoices/export.pdf', '/reports/q3.csv', '/backup.zip', '/ledger.xlsx'])(
+    'reports %s as inconclusive rather than 0 calls',
+    (urlContains) => {
+      const r = evalNet([API_CALL], { kind: PredicateKind.NET, urlContains });
+
+      expect(r.pass).toBe(false);
+      expect(r.inconclusive).toBeDefined();
+      expect(r.inconclusive).toMatch(/download|navigation/i);
+      expect(r.inconclusive).not.toMatch(/saw 0|0 network call/i);
+      expect(r.assertion).toBe('net.native-download');
+    },
+  );
+
+  it('stays inconclusive when resource timing IS live — a download is not a subresource', () => {
+    const r = evalNet([STYLESHEET], {
+      kind: PredicateKind.NET,
+      urlContains: '/api/invoices/export.pdf',
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeDefined();
+    expect(r.assertion).toBe('net.native-download');
+  });
+
+  it('still passes when the PDF WAS fetched (an XHR of a file is observable)', () => {
+    const pdf = netEvent(20, {
+      method: 'GET',
+      url: '/api/invoices/export.pdf',
+      status: 200,
+      ok: true,
+    });
+
+    expect(evalNet([pdf], { kind: PredicateKind.NET, urlContains: '/export.pdf' }).pass).toBe(true);
+  });
+
+  it('does not downgrade an API path that merely contains .pdf mid-pattern', () => {
+    const r = evalNet([API_CALL], {
+      kind: PredicateKind.NET,
+      urlContains: '/api/export.pdf/status',
+    });
+
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('downgrades a zero-match count assertion the same way', () => {
+    const r = evalNet([STYLESHEET], {
+      kind: PredicateKind.NET,
+      urlContains: '/q3.csv',
+      count: 1,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeDefined();
+    expect(r.assertion).toBe('net.native-download');
+  });
+});
+
+/**
+ * A click that leaves a navigation record, with a filter that names no file suffix (#1936).
+ *
+ * `<a href="/api/export" download>`, or an `<a href>` that the server answers with
+ * `Content-Disposition: attachment`, is recorded as a `NET_PENDING` with the navigation initiator.
+ * The response goes to the download manager, so no `NET_REQUEST` can close it. A `status: 200`
+ * check graded the miss `no` ("no matching call") while the browser saved a real file.
+ */
+describe('evalNet — a navigation record the page cannot see the answer to', () => {
+  function departure(t: number, extra: Record<string, unknown> = {}): ReticleEvent {
+    const data: Record<string, unknown> = {
+      id: 'nav-1',
+      method: 'GET',
+      url: 'https://app.test/api/export',
+      initiator: 'navigation',
+      ...extra,
+    };
+    return { type: EventType.NET_PENDING, t, data } as ReticleEvent;
+  }
+
+  it('grades a status check over a download departure as inconclusive, not no', () => {
+    const r = evalNet([departure(20, { download: true })], {
+      kind: PredicateKind.NET,
+      status: 200,
+      since: 10,
+    });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toMatch(/download|navigation/i);
+    expect(r.assertion).toBe('net.native-download');
+  });
+
+  it('does the same for a filter that names the endpoint without a file suffix', () => {
+    const r = evalNet([departure(20)], {
+      kind: PredicateKind.NET,
+      urlContains: '/api/export',
+      status: 200,
+    });
+
+    expect(r.inconclusive).toBeDefined();
+    expect(r.assertion).toBe('net.native-download');
+  });
+
+  it('still fails when the navigation record is for another URL', () => {
+    const r = evalNet([departure(20)], { kind: PredicateKind.NET, urlContains: '/api/orders' });
+
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('still fails when the navigation record is before the window', () => {
+    const r = evalNet([departure(5)], { kind: PredicateKind.NET, status: 200, since: 10 });
+
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('still fails when the method differs from the navigation GET', () => {
+    const r = evalNet([departure(20)], { kind: PredicateKind.NET, method: 'POST' });
+
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  // A later event from a different document proves that the page left: a plain link navigated.
+  const routeData: Record<string, unknown> = { to: '/orders' };
+  const newDocument = {
+    type: EventType.ROUTE_CHANGE,
+    t: 40,
+    documentId: 'doc-b',
+    data: routeData,
+  } as ReticleEvent;
+
+  it('still fails a plain navigation when a later event comes from a new document', () => {
+    const left = { ...departure(20), documentId: 'doc-a' } as ReticleEvent;
+    const r = evalNet([left, newDocument], { kind: PredicateKind.NET, status: 200, since: 10 });
+
+    expect(r.pass).toBe(false);
+    expect(r.inconclusive).toBeUndefined();
+  });
+
+  it('keeps a download departure inconclusive even when a new document follows', () => {
+    const left = { ...departure(20, { download: true }), documentId: 'doc-a' } as ReticleEvent;
+    const r = evalNet([left, newDocument], { kind: PredicateKind.NET, status: 200, since: 10 });
+
+    expect(r.inconclusive).toBeDefined();
+    expect(r.assertion).toBe('net.native-download');
+  });
+
+  it('keeps a plain navigation inconclusive while every later event is from the same document', () => {
+    const stayed = { ...departure(20), documentId: 'doc-a' } as ReticleEvent;
+    const sameDocument = { ...newDocument, documentId: 'doc-a' } as ReticleEvent;
+    const r = evalNet([stayed, sameDocument], { kind: PredicateKind.NET, status: 200 });
+
+    expect(r.inconclusive).toBeDefined();
+  });
+});

@@ -1,0 +1,255 @@
+import { removeTempDir } from '@/machine/temp-dir.js';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { mkdir, mkdtemp, readdir, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  asRunId,
+  RunFlowStatus,
+  RunReadError,
+  type ReticleVerificationRun,
+  type RunFlowResult,
+} from '@reticlehq/core';
+import { buildVerificationRun, type VerificationRunInput } from './build-verification-run.js';
+import { RunStore } from './run-store.js';
+import { passingFlowNames } from '@/language/flows/change/gate.js';
+import { createNodeFileSystem, type FileSystemPort } from '@/memory/project/fs/fs-port.js';
+import { RunAgentKind, RunFramework, RunProfile, RunTrigger } from '@reticlehq/core';
+
+const baseInput = (runId: string): VerificationRunInput => ({
+  runId,
+  durationMs: 100,
+  profile: RunProfile.DEV,
+  project: { name: 'demo', framework: RunFramework.REACT },
+  agent: { id: 'a', kind: RunAgentKind.CODING_AGENT },
+  trigger: { kind: RunTrigger.EDIT },
+  changedFiles: [],
+  flows: [],
+  checks: [],
+  risks: [],
+  evidence: { consoleErrors: [], networkAnomalies: [], stateAssertions: [], timeline: [] },
+});
+
+const make = (runId: string, at: number): ReticleVerificationRun =>
+  buildVerificationRun(baseInput(runId), () => at);
+
+const withFlows = (runId: string, at: number, flows: RunFlowResult[]): ReticleVerificationRun =>
+  buildVerificationRun({ ...baseInput(runId), flows }, () => at);
+
+const flowResult = (name: string, status: RunFlowStatus): RunFlowResult => ({
+  name,
+  status,
+  steps: 1,
+  durationMs: 1,
+});
+
+/**
+ * A BOUND, not a measurement. The retention test writes five runs sequentially through the real
+ * filesystem, and each write is an atomic publish — a temp file plus a rename — so the cost is two
+ * syscalls per iteration rather than the five the loop counts.
+ */
+const RUN_WRITE_TIMEOUT_MS = 30_000;
+
+describe('RunStore — temp-dir filesystem, never touches the repo', () => {
+  let root: string;
+  let fs: FileSystemPort;
+  let store: RunStore;
+
+  beforeEach(async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'reticle-runs-'));
+    root = join(dir, '.reticle');
+    fs = createNodeFileSystem();
+    store = new RunStore(fs, root);
+  });
+
+  afterEach(async () => {
+    await removeTempDir(join(root, '..'));
+  });
+
+  /**
+   * Several agents drive one project at once, each in its own git worktree. A replay run and a CLI
+   * verify run had no branch, so the dashboard could not tell the worktrees' runs apart. Every run is
+   * written here, so the branch is stamped here.
+   */
+  it('stamps the git branch of the checkout that holds the runs', async () => {
+    await mkdir(join(root, '..', '.git'), { recursive: true });
+    await writeFile(join(root, '..', '.git', 'HEAD'), 'ref: refs/heads/feat/refunds\n');
+    await store.write(make('on-branch', 1));
+    const read = await store.read(asRunId('on-branch'));
+    expect(read.ok && read.run.project.branch).toBe('feat/refunds');
+  });
+
+  /**
+   * A run that matched no project is kept in `~/.reticle/unmatched/<id>`. When the home folder is a
+   * git repository (dotfiles), the walk up found it, and the run named the dotfiles branch.
+   */
+  it('takes no branch from a folder inside Reticle’s own storage', async () => {
+    const home = join(root, '..');
+    await mkdir(join(home, '.git'), { recursive: true });
+    await writeFile(join(home, '.git', 'HEAD'), 'ref: refs/heads/dotfiles\n');
+    const unmatched = new RunStore(fs, join(home, '.reticle', 'unmatched', 'app-1a2b'));
+    await unmatched.write(make('unmatched', 1));
+    const read = await unmatched.read(asRunId('unmatched'));
+    expect(read.ok && read.run.project).not.toHaveProperty('branch');
+  });
+
+  it('writes no branch outside git', async () => {
+    await store.write(make('no-git', 1));
+    const read = await store.read(asRunId('no-git'));
+    expect(read.ok && read.run.project).not.toHaveProperty('branch');
+  });
+
+  /**
+   * The write is the thing people wait on; the notification must never be able to break it.
+   */
+  it('notifies AFTER the run is readable, so a listener never races the rename', async () => {
+    let onDiskWhenNotified: boolean | undefined;
+    const notified = new RunStore(fs, root, {
+      // Checked SYNCHRONOUSLY inside the callback: the whole claim is that a listener woken here can
+      // already read the run, and asserting after the write returns would prove nothing about order.
+      onWrote: () => {
+        onDiskWhenNotified = existsSync(join(root, 'runs', 'run-notify.json'));
+      },
+    });
+    await notified.write(make('run-notify', 1000));
+    expect(onDiskWhenNotified).toBe(true);
+    const read = await notified.read(asRunId('run-notify'));
+    expect(read.ok).toBe(true);
+  });
+
+  it('a listener that throws does not fail the durable write', async () => {
+    const notified = new RunStore(fs, root, {
+      onWrote: () => {
+        throw new Error('sync is offline');
+      },
+    });
+    await expect(notified.write(make('run-throwing', 1000))).resolves.toBeUndefined();
+    const read = await notified.read(asRunId('run-throwing'));
+    expect(read.ok).toBe(true);
+  });
+
+  it('writes then reads a run round-trip', async () => {
+    const run = make('run-1', 1000);
+    await store.write(run);
+    const read = await store.read(asRunId('run-1'));
+    expect(read.ok).toBe(true);
+    if (read.ok) expect(read.run.runId).toBe('run-1');
+  });
+
+  it('a missing run reads as MISSING (never throws)', async () => {
+    const read = await store.read(asRunId('nope'));
+    expect(read).toEqual({ ok: false, reason: RunReadError.MISSING });
+  });
+
+  it('a path-traversal runId is refused as MISSING', async () => {
+    const read = await store.read(asRunId('../escape'));
+    expect(read).toEqual({ ok: false, reason: RunReadError.MISSING });
+  });
+
+  it('lists run ids and picks the latest by createdAt', async () => {
+    await store.write(make('run-a', 1000));
+    await store.write(make('run-b', 3000));
+    await store.write(make('run-c', 2000));
+    const ids = await store.list();
+    expect(ids.sort()).toEqual(['run-a', 'run-b', 'run-c']);
+    const latest = await store.latest();
+    expect(latest?.runId).toBe('run-b');
+  });
+
+  it('latest is undefined when no runs exist', async () => {
+    expect(await store.latest()).toBeUndefined();
+  });
+
+  it('latestTwo returns [previous, current] oldest-first, undefined with fewer than two', async () => {
+    expect(await store.latestTwo()).toBeUndefined();
+    await store.write(make('run-a', 1000));
+    expect(await store.latestTwo()).toBeUndefined();
+    await store.write(make('run-b', 3000));
+    await store.write(make('run-c', 2000));
+    const pair = await store.latestTwo();
+    expect(pair?.map((r) => r.runId)).toEqual(['run-c', 'run-b']); // 2000 then 3000
+  });
+
+  it('latestPerFlow keeps the newest result per flow and skips runs that carry no flows', async () => {
+    await store.write(
+      withFlows('old', 1000, [
+        flowResult('a', RunFlowStatus.PASS),
+        flowResult('b', RunFlowStatus.PASS),
+      ]),
+    );
+    await store.write(withFlows('new', 2000, [flowResult('a', RunFlowStatus.FAIL)]));
+    await store.write(withFlows('drive', 3000, []));
+    const latest = await store.latestPerFlow();
+    expect(latest.get('a')?.result.status).toBe(RunFlowStatus.FAIL);
+    expect(latest.get('b')?.result.status).toBe(RunFlowStatus.PASS);
+    expect(latest.get('b')?.createdAt).toBe(1000);
+  });
+
+  it('latestPerFlow breaks a tie between runs of equal time on the run id, whatever the write order', async () => {
+    await store.write(withFlows('run-b', 2000, [flowResult('a', RunFlowStatus.PASS)]));
+    await store.write(withFlows('run-a', 2000, [flowResult('a', RunFlowStatus.FAIL)]));
+    expect((await store.latestPerFlow()).get('a')?.result.status).toBe(RunFlowStatus.PASS);
+  });
+
+  it('passingFlowTimes counts pass and heal from each flow newest result, with its time', async () => {
+    await store.write(
+      withFlows('old', 1000, [
+        flowResult('a', RunFlowStatus.PASS),
+        flowResult('b', RunFlowStatus.FAIL),
+        flowResult('c', RunFlowStatus.PASS),
+      ]),
+    );
+    await store.write(
+      withFlows('new', 2000, [
+        flowResult('b', RunFlowStatus.HEALED),
+        flowResult('c', RunFlowStatus.FAIL),
+      ]),
+    );
+    await store.write(withFlows('drive', 3000, []));
+    expect([...(await store.passingFlowTimes(passingFlowNames))].sort()).toEqual([
+      ['a', 1000],
+      ['b', 2000],
+    ]);
+  });
+
+  it('passingFlowTimes credits a template from a copy that proved a consequence (#1321)', async () => {
+    const copy = (name: string, consequence?: string): RunFlowResult => ({
+      ...flowResult(name, RunFlowStatus.PASS),
+      template: 'checkout',
+      stepResults: [
+        { step: 0, anchor: 'Pay', ok: true, ...(consequence === undefined ? {} : { consequence }) },
+      ],
+    });
+    await store.write(withFlows('old', 1000, [copy('checkout--fixture-1', 'net POST')]));
+    await store.write(withFlows('new', 2000, [copy('checkout--fixture-2')]));
+    expect([...(await store.passingFlowTimes(passingFlowNames))].sort()).toEqual([
+      ['checkout', 1000],
+      ['checkout--fixture-1', 1000],
+      ['checkout--fixture-2', 2000],
+    ]);
+  });
+
+  it('refuses to write a run whose runId is a path-traversal value', async () => {
+    const evil = make('../../etc/evil', 1000);
+    await expect(store.write(evil)).rejects.toThrow(/unsafe runId/);
+  });
+
+  it(
+    'prunes oldest runs beyond the retention cap, keeping the newest',
+    async () => {
+      const capped = new RunStore(fs, root, { retention: 3, slack: 1 });
+      for (let i = 1; i <= 5; i += 1) await capped.write(make(`run-${i}`, i * 1000));
+      const ids = (await capped.list()).sort();
+      expect(ids).toEqual(['run-3', 'run-4', 'run-5']); // oldest two pruned
+    },
+    RUN_WRITE_TIMEOUT_MS,
+  );
+
+  it('leaves no .tmp file after a write (atomic publish)', async () => {
+    await store.write(make('run-x', 1));
+    const entries = await readdir(join(root, 'runs'));
+    expect(entries.some((e) => e.endsWith('.tmp'))).toBe(false);
+    expect(entries).toContain('run-x.json');
+  });
+});

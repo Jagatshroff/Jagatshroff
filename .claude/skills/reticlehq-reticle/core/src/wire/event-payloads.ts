@@ -1,0 +1,365 @@
+import * as z from 'zod';
+import { CanvasTrigger, EventType, MediaEvent, PerfMetric } from './constants/constants.js';
+import {
+  FieldChangeField,
+  FieldChangeKind,
+  LivePoliteness,
+  RouteChangeHow,
+  ROUTE_CHANGE_HOW_FIELD,
+  ScrollDirection,
+  StorageArea,
+  StreamDirection,
+  StreamTransport,
+} from './constants/event-types.js';
+import { ResponseBodyReason } from './constants/response-body-reason.js';
+import { BlindSpotKind } from '@/verdict/verified-constants.js';
+import { BrowserBrand } from '@/browser-brand.js';
+import { HudUseDataSchema, HumanControlDataSchema, HumanMarkDataSchema } from './messages.js';
+import { DepartedNetField, NEXT_ACTION_FIELD, REQUEST_SHAPE_FIELD } from './net.js';
+
+/**
+ * Per-event-type payload schemas — the typed replacement for the envelope's open `data` record.
+ * The envelope (`ReticleEventSchema.data`) stays open on the wire so a richer SDK is never rejected
+ * mid-upgrade; narrowing happens here, at the server's inbound boundary and wherever the journal reads
+ * an event's fields. `parseEventPayload` is that boundary.
+ *
+ * Two fidelity tiers by design:
+ * - **Precise + closed** for stable observers (dom/route/perf/anim/scroll/signal/health/...).
+ * - **Precise on the load-bearing fields + `.passthrough`** for observers / will enrich
+ * (network, console, error, state, storage) — today's fields are validated, tomorrow's added
+ * fields (stack, TTFB, initiator, path diffs) pass through instead of failing closed. Each closes
+ * fully as its observer is rewritten.
+ */
+
+/**
+ * A single cookie to seed before initial navigation.
+ */
+export const SeedCookieSchema = z.object({
+  name: z.string().describe('Cookie name.'),
+  value: z.string().describe('Cookie value.'),
+  domain: z.string().optional().describe('Cookie domain. Defaults to the navigation URL domain.'),
+  path: z.string().optional().describe('Cookie path. Defaults to "/".'),
+  url: z.string().optional().describe('Cookie URL. Defaults to the navigation URL.'),
+  httpOnly: z.boolean().optional().describe('Whether the cookie is httpOnly.'),
+  secure: z.boolean().optional().describe('Whether the cookie is secure.'),
+  sameSite: z.enum(['Strict', 'Lax', 'None']).optional().describe('SameSite policy.'),
+  expires: z.number().optional().describe('Unix timestamp in seconds for cookie expiration.'),
+});
+export type SeedCookie = z.infer<typeof SeedCookieSchema>;
+
+export const SeedCookiesSchema = z.union([
+  z.record(z.string(), z.string()),
+  z.array(SeedCookieSchema),
+]);
+export type SeedCookies = z.infer<typeof SeedCookiesSchema>;
+
+/**
+ * Client storage and session state to seed into an isolated context before the first navigation.
+ * Matches the three storage areas Reticle already observes (localStorage, sessionStorage, cookies).
+ */
+export const SeedStorageSchema = z
+  .object({
+    local: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe('Key-value pairs to seed into window.localStorage before first navigation.'),
+    session: z
+      .record(z.string(), z.string())
+      .optional()
+      .describe('Key-value pairs to seed into window.sessionStorage before first navigation.'),
+    cookies: SeedCookiesSchema.optional().describe(
+      'Cookies to seed before first navigation: a name-value record scoped to the lease URL or an array of cookie objects.',
+    ),
+  })
+  // Unknown keys (e.g. a typo'd `localStorage`, or a Playwright `storageState` shape) must be
+  // rejected, not silently dropped, or the caller believes seeding happened when nothing was seeded.
+  .strict();
+export type SeedStorage = z.infer<typeof SeedStorageSchema>;
+
+const elementLabel = z.object({ role: z.string().optional(), name: z.string().optional() });
+
+/**
+ * A file the app produced. `preview`/`lines` are present only when body capture is on, for the same
+ * reason request bodies are gated: an export is exactly where a customer list lives.
+ */
+const downloadSchema = z
+  .object({
+    mimeType: z.string(),
+    bytes: z.number(),
+    filename: z.string().optional(),
+    lines: z.number().optional(),
+    preview: z.string().optional(),
+    previewTruncated: z.boolean().optional(),
+  })
+  .passthrough();
+
+const netStreamSchema = z
+  .object({
+    transport: z.nativeEnum(StreamTransport),
+    direction: z.nativeEnum(StreamDirection),
+    url: z.string(),
+    // The match haystack, exactly as NET_PENDING carries it. A stream record whose URL was redacted
+    // is classified by the same `urlForMatch` every other consumer uses; without the raw copy here
+    // the stream half of one request and the pending half disagree about whose traffic it is, and a
+    // declared `background` endpoint comes back into the settle count through the one field the
+    // classifier could not see.
+    urlRaw: z.string().optional(),
+  })
+  .passthrough();
+
+const netRequestSchema = z
+  .object({
+    id: z.string(),
+    method: z.string(),
+    url: z.string(),
+    status: z.number(),
+    ok: z.boolean(),
+    durationMs: z.number(),
+    initiator: z.string(),
+    urlRaw: z.string().optional(),
+    [NEXT_ACTION_FIELD]: z.string().optional(),
+    [REQUEST_SHAPE_FIELD]: z.string().optional(),
+    [DepartedNetField.FROM_DEPARTED_DOCUMENT]: z.boolean().optional(),
+  })
+  .passthrough();
+
+const consoleSchema = z.object({ message: z.string() }).passthrough();
+
+/**
+ * The registry. `satisfies Record<EventType,...>` makes a missing event type a *compile* error —
+ * the wire can never carry a type without a payload contract.
+ */
+export const EVENT_PAYLOAD_SCHEMAS = {
+  [EventType.DOM_ADDED]: elementLabel,
+  [EventType.DOM_REMOVED]: elementLabel,
+  [EventType.DOM_ATTR]: z
+    .object({ attr: z.string(), value: z.string().optional(), old: z.string().optional() })
+    .passthrough(),
+  [EventType.DOM_TEXT]: z.object({
+    text: z.string(),
+    old: z.string().optional(),
+    /**
+     * The `data-testid` of the element or its nearest ancestor, so a text change can be named and a
+     * stale one (a store field changed, the text that shows it did not) can be found.
+     */
+    testid: z.string().optional(),
+    /** The text an element ARRIVED with, not a change: the baseline a later change is read against. */
+    initial: z.boolean().optional(),
+    /**
+     * Set when the text changed inside a live region that already exists: how urgently the region
+     * announces it. An app that writes its error text into an existing alert region tells the user
+     * about a failure, and a mount event does not record that write.
+     */
+    live: z.nativeEnum(LivePoliteness).optional(),
+  }),
+  [EventType.NET_REQUEST]: netRequestSchema,
+  [EventType.NET_PENDING]: z.object({
+    id: z.string(),
+    method: z.string(),
+    url: z.string(),
+    initiator: z.string(),
+    urlRaw: z.string().optional(),
+    [DepartedNetField.FROM_DEPARTED_DOCUMENT]: z.boolean().optional(),
+    [DepartedNetField.PAGE_UNLOADED]: z.boolean().optional(),
+  }),
+  [EventType.NET_UNPATCHED]: z
+    .object({
+      url: z.string(),
+      urlRaw: z.string().optional(),
+      initiator: z.string(),
+      status: z.number().optional(),
+    })
+    .passthrough(),
+  [EventType.NET_STREAM]: netStreamSchema,
+  [EventType.DOWNLOAD]: downloadSchema,
+  [EventType.PERF]: z.object({
+    metric: z.nativeEnum(PerfMetric),
+    value: z.number(),
+    at: z.number(),
+    // CLS only: this entry's own shift; `value` is the running total since load (#1784).
+    shift: z.number().optional(),
+    // CLS only: the element the shift moved most, so the value has somewhere to point (#1266).
+    shifted: z.object({ ref: z.string(), selector: z.string() }).optional(),
+  }),
+  [EventType.ROUTE_CHANGE]: z.object({
+    from: z.string(),
+    to: z.string(),
+    pathname: z.string(),
+    search: z.string(),
+    hash: z.string(),
+    [ROUTE_CHANGE_HOW_FIELD]: z.nativeEnum(RouteChangeHow),
+    /** The app's own route pattern for the screen reached (`/personas/:personaId`), when known. */
+    pattern: z.string().optional(),
+  }),
+  [EventType.CONSOLE_LOG]: consoleSchema,
+  [EventType.CONSOLE_WARN]: consoleSchema,
+  [EventType.CONSOLE_ERROR]: consoleSchema,
+  [EventType.CONSOLE_INFO]: consoleSchema,
+  [EventType.CONSOLE_DEBUG]: consoleSchema,
+  [EventType.ERROR_UNCAUGHT]: z
+    .object({
+      message: z.string(),
+      source: z.string().optional(),
+      line: z.number().optional(),
+      kind: z.string().optional(),
+    })
+    .passthrough(),
+  [EventType.VISIBLE_SHOWN]: elementLabel,
+  [EventType.ANIM_START]: z.object({ name: z.string() }),
+  [EventType.ANIM_END]: z.object({ name: z.string() }),
+  [EventType.SCROLL_POSITION]: z.object({
+    x: z.number(),
+    y: z.number(),
+    percent: z.number(),
+    direction: z.nativeEnum(ScrollDirection),
+  }),
+  [EventType.REVEAL_SHOWN]: elementLabel.passthrough(),
+  [EventType.SIGNAL]: z.object({ name: z.string(), data: z.unknown().optional() }),
+  [EventType.STATE_CHANGE]: z
+    .object({ name: z.string(), value: z.unknown().optional() })
+    .passthrough(),
+  [EventType.STORAGE_CHANGE]: z.object({
+    area: z.nativeEnum(StorageArea),
+    key: z.string(),
+    old: z.string().optional(),
+    new: z.string().optional(),
+  }),
+  [EventType.PAGE_HEALTH]: z
+    .object({
+      hidden: z.boolean(),
+      focused: z.boolean(),
+      reason: z.string().optional(),
+      /**
+       * Which browser the page is, normalised in the SDK to a closed list before it is sent — never
+       * a UA string and never a raw `userAgentData` brand. Optional: an older SDK does not report
+       * one, and a desktop webview has no brand to report.
+       */
+      brand: z.nativeEnum(BrowserBrand).optional(),
+      /**
+       * Which shell the page is running in: `web`, `electron`, `tauri`, or something newer.
+       *
+       * The SDK has always sent this and the server has always read it, but until now the field was
+       * not declared here, so it travelled through `.passthrough()` and appeared in NONE of the
+       * generated `dist/schema/*.json` files. Anyone implementing this contract from the published
+       * schemas -- which is what a third-party realm does -- could not see that the field exists, let
+       * alone that the server depends on it.
+       *
+       * A plain string on purpose, NOT a closed list of the three shells that ship today. A realm
+       * that does not exist yet has to be able to name itself, and an enum here would mean one
+       * unknown value fails the whole health report, taking visibility, focus and the heartbeat down
+       * with it. The wire says the field exists and is a string; which values mean something stays
+       * with the reader, where it already is.
+       */
+      runtime: z.string().optional(),
+      /** The rendering engine, coarse on purpose (blink / gecko / webkit). Same reasoning as `runtime`. */
+      engine: z.string().optional(),
+      /** The desktop shell's own name for this window (Tauri's label: `main`, `setup`). */
+      windowLabel: z.string().optional(),
+      /** The HTTP status the document was served with, when the page could read it. */
+      documentStatus: z.number().int().optional(),
+    })
+    .passthrough(),
+  // The page called window.open — the clicked consequence may continue in a context the SDK cannot
+  // enter (#508). `href` is what the page asked to open, omitted for the blank-tab form.
+  [EventType.CONTEXT_OPENED]: z.object({ href: z.string().optional() }).passthrough(),
+  [EventType.DIALOG_OPENED]: z
+    .object({
+      /** Which of the three, so a caller can tell a blocking question from a blocking notice. */
+      kind: z.enum(['alert', 'confirm', 'prompt']),
+      /** What the app asked. The whole point: a cancelled action is only legible with the question. */
+      message: z.string().optional(),
+      /** What Reticle answered on the app's behalf. `false`/`null` are the non-destructive replies. */
+      answered: z.union([z.boolean(), z.null()]).optional(),
+    })
+    .passthrough(),
+  [EventType.RENDER_COMMIT]: z.object({ commits: z.number() }),
+  [EventType.FOCUS_CHANGE]: z.object({
+    to: z.string().optional(),
+    from: z.string().optional(),
+    toBody: z.boolean(),
+  }),
+  // Keys are FieldChangeField so the wire names exist once. `kind` is FieldChangeKind:
+  // input/change are the user's event; settled is the post-handler read. `length` is the REAL
+  // value's length, never the clipped one, and present even when redacted — a cap must never read
+  // as a wipe. `value` is omitted for a password, a sensitive name, or a payment autocomplete hint.
+  // `checked` is the checkbox/radio property (`value` there does not move). `previous` /
+  // `previousChecked` ride on a settled read so a restore is distinguishable from a render.
+  [EventType.FIELD_CHANGE]: z.object({
+    [FieldChangeField.FIELD]: z.string(),
+    [FieldChangeField.KIND]: z.nativeEnum(FieldChangeKind),
+    [FieldChangeField.LENGTH]: z.number().int().nonnegative(),
+    [FieldChangeField.VALUE]: z.string().optional(),
+    [FieldChangeField.REDACTED]: z.literal(true).optional(),
+    [FieldChangeField.CHECKED]: z.boolean().optional(),
+    [FieldChangeField.PREVIOUS]: z.string().optional(),
+    [FieldChangeField.PREVIOUS_CHECKED]: z.boolean().optional(),
+  }),
+  [EventType.FLOW_RECORDED]: z.object({ name: z.string(), flow: z.unknown().optional() }),
+  [EventType.TRANSPORT_OVERFLOW]: z.object({ dropped: z.number() }),
+  [EventType.TRUNCATED]: z.object({ channel: z.string(), dropped: z.number() }),
+  [EventType.BLIND_SPOT]: z.object({ kind: z.nativeEnum(BlindSpotKind), count: z.number() }),
+  [EventType.SDK_FAILED]: z.object({
+    /** WHERE in the SDK — a fixed vocabulary of our own module names, never a user path. */
+    site: z.string().max(64),
+    /** The error message. Stripped of variables server-side before it is ever reported onward. */
+    message: z.string().max(500),
+    errorType: z.string().max(64).optional(),
+  }),
+  [EventType.NET_DETAIL]: z
+    .object({
+      url: z.string(),
+      method: z.string().optional(),
+      status: z.number(),
+      headers: z.record(z.string(), z.string()),
+      resourceType: z.string().optional(),
+    })
+    .passthrough(),
+  [EventType.NET_RESPONSE_BODY]: z
+    .object({
+      id: z.string(),
+      method: z.string(),
+      url: z.string(),
+      urlRaw: z.string().optional(),
+      responseBody: z.string(),
+      responseBodyTruncated: z.boolean().optional(),
+      responseBodyReason: z.nativeEnum(ResponseBodyReason).optional(),
+    })
+    .passthrough(),
+  [EventType.HUMAN_CONTROL]: HumanControlDataSchema,
+  [EventType.HUMAN_MARK]: HumanMarkDataSchema,
+  [EventType.HUD_USED]: HudUseDataSchema,
+  [EventType.MEDIA_STATE]: z.object({
+    event: z.nativeEnum(MediaEvent),
+    tag: z.enum(['video', 'audio']),
+    /** Seconds into the media, as the element reports it. */
+    currentTime: z.number(),
+    /** Absent while unknown (NaN) or endless (a live stream). */
+    duration: z.number().optional(),
+    /** HTMLMediaElement.readyState, 0–4. */
+    readyState: z.number().int().min(0).max(4),
+    paused: z.boolean(),
+  }),
+  [EventType.CANVAS_DIGEST]: z.object({
+    /** A hash of a 16x16 sample of the canvas pixels: changes when what it shows changes. */
+    digest: z.string(),
+    width: z.number().int().nonnegative(),
+    height: z.number().int().nonnegative(),
+    /** The sample's mean colour, `[r, g, b]` 0–255: a coarse "what colour is it" a reader can check. */
+    mean: z.tuple([z.number(), z.number(), z.number()]),
+    /**
+     * `act` when an act's end took it, inside the act's window and sent even if nothing changed;
+     * `poll` when the timer did. Absent from an SDK older than the field.
+     */
+    trigger: z.nativeEnum(CanvasTrigger).optional(),
+    /**
+     * Whether the canvas had a size and was inside the viewport when it was sampled. A hidden canvas
+     * cannot carry a render the user sees. Absent from an SDK older than the field.
+     */
+    visible: z.boolean().optional(),
+  }),
+} satisfies Record<EventType, z.ZodTypeAny>;
+
+/** Narrow an event's `data` against its type's payload schema. Unknown in, typed-or-error out. */
+export function parseEventPayload(type: EventType, data: unknown): z.ZodSafeParseResult<unknown> {
+  return EVENT_PAYLOAD_SCHEMAS[type].safeParse(data);
+}

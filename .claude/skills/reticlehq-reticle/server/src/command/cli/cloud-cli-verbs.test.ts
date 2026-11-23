@@ -1,0 +1,1086 @@
+/**
+ * Verb-level contracts for the ten cloud commands (#555). The existing `cloud-cli.test.ts` covers the
+ * `api()` JSON guard; nothing exercised a VERB. One test per verb pins the wire shape (method, URL,
+ * auth header, body) against a stubbed `fetch`, or the local-state contract for the verbs that never
+ * dial. `$HOME` and cwd are pointed at temp dirs (`mkdtemp` + env stubs, per repo convention) so a
+ * developer's real `~/.reticle` session can never leak into a run.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { join, dirname } from 'node:path';
+import {
+  PredicateKind,
+  RUN_FILE_VERSION,
+  RunAgentKind,
+  RunFramework,
+  RunProfile,
+  RunTrigger,
+  Verified,
+} from '@reticlehq/core';
+import { buildVerificationRun } from '@/judgement/runs/artifact/build-verification-run.js';
+import { connectInstalls, runCloudCommand } from './cloud-cli.js';
+import { EMAIL_SIGN_IN_REMOVED, cmdLogin } from './cloud-login.js';
+import { cmdLink } from './cloud-link.js';
+
+/**
+ * The sign-in half of `reticle connect`, with the catch the cloud dispatcher puts around it: a
+ * failure prints its sentence and exits 1. `login` is no longer a command of its own.
+ */
+const login = (argv: readonly string[]): Promise<number> =>
+  cmdLogin(argv, cmdLink).catch((e: unknown) => {
+    process.stderr.write(`${e instanceof Error ? e.message : String(e)}\n`);
+    return 1;
+  });
+
+// The device flow opens a browser; a test must never.
+vi.mock('./auth/device-flow.js', async (original) => ({
+  ...(await original<typeof import('./auth/device-flow.js')>()),
+  openBrowser: () => undefined,
+}));
+
+interface RecordedRequest {
+  url: string;
+  method: string;
+  authorization: string | null;
+  body: unknown;
+}
+
+interface StubResponse {
+  /** HTTP status; default 200. */
+  status?: number;
+  /** Parsed-to-JSON response body. */
+  body?: unknown;
+}
+
+const RETICLE_DIR = '.reticle';
+const SESSION_FILE = 'session.json';
+const CREDENTIALS_FILE = 'credentials.json';
+const CLOUD_LINK_FILE = 'cloud.json';
+const TEST_URL = 'http://localhost:9999';
+const TEST_KEY = 'rk_live_test';
+
+describe('cloud-cli verb contracts (#555)', () => {
+  let home: string;
+  let cwd: string;
+  let origCwd: string;
+  let origHomeEnv: string | undefined;
+  let origUserProfileEnv: string | undefined;
+  let origUrlEnv: string | undefined;
+  let origKeyEnv: string | undefined;
+  const origStdout = process.stdout.write.bind(process.stdout);
+  const origStderr = process.stderr.write.bind(process.stderr);
+  const origFetch = globalThis.fetch;
+  let stdoutBuf = '';
+  let stderrBuf = '';
+  let requests: RecordedRequest[] = [];
+  let responder: (url: string) => StubResponse;
+
+  const lastJsonOutput = (): unknown => {
+    const chunks = stdoutBuf.trim().split('\n\n');
+    return JSON.parse(chunks[chunks.length - 1] ?? '{}');
+  };
+
+  const writeRepoFile = async (rel: string[], content: string): Promise<void> => {
+    const dir = join(cwd, RETICLE_DIR);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, ...rel), content);
+  };
+
+  const writeHomeFile = async (rel: string[], content: string): Promise<void> => {
+    const target = join(home, RETICLE_DIR, ...rel);
+    // dirname, not the .reticle root: sessions live one level down, in `sessions/<host>.json`.
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, content);
+  };
+
+  beforeEach(async () => {
+    stdoutBuf = '';
+    stderrBuf = '';
+    requests = [];
+    responder = () => ({});
+    process.stdout.write = (chunk: unknown) => {
+      stdoutBuf += String(chunk);
+      return true;
+    };
+    process.stderr.write = (chunk: unknown) => {
+      stderrBuf += String(chunk);
+      return true;
+    };
+    origHomeEnv = process.env['HOME'];
+    origUserProfileEnv = process.env['USERPROFILE'];
+    origUrlEnv = process.env['RETICLE_CLOUD_URL'];
+    origKeyEnv = process.env['RETICLE_CLOUD_KEY'];
+    delete process.env['RETICLE_CLOUD_URL'];
+    delete process.env['RETICLE_CLOUD_KEY'];
+    home = await mkdtemp(join(tmpdir(), 'reticle-cloudhome-'));
+    cwd = await mkdtemp(join(tmpdir(), 'reticle-cloudcwd-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    origCwd = process.cwd();
+    process.chdir(cwd);
+    globalThis.fetch = ((input: string | URL | Request, init?: RequestInit): Promise<unknown> => {
+      const url = 'string' === typeof input ? input : input instanceof URL ? input.href : input.url;
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      const rawBody = init?.body;
+      let body: unknown;
+      if ('string' === typeof rawBody) {
+        try {
+          body = JSON.parse(rawBody);
+        } catch {
+          body = rawBody;
+        }
+      }
+      requests.push({
+        url,
+        method: init?.method ?? 'GET',
+        authorization: headers['authorization'] ?? null,
+        body,
+      });
+      const res = responder(url);
+      const status = res.status ?? 200;
+      return Promise.resolve({
+        ok: status >= 200 && status <= 299,
+        status,
+        statusText: '',
+        // A real response always has headers; the sync reads its ETag.
+        headers: new Headers(),
+        text: () => Promise.resolve(JSON.stringify(res.body ?? {})),
+      });
+    }) as unknown as typeof fetch;
+  });
+
+  afterEach(async () => {
+    globalThis.fetch = origFetch;
+    process.stdout.write = origStdout;
+    process.stderr.write = origStderr;
+    process.chdir(origCwd);
+    if (origHomeEnv === undefined) delete process.env['HOME'];
+    else process.env['HOME'] = origHomeEnv;
+    if (origUserProfileEnv === undefined) delete process.env['USERPROFILE'];
+    else process.env['USERPROFILE'] = origUserProfileEnv;
+    if (origUrlEnv === undefined) delete process.env['RETICLE_CLOUD_URL'];
+    else process.env['RETICLE_CLOUD_URL'] = origUrlEnv;
+    if (origKeyEnv === undefined) delete process.env['RETICLE_CLOUD_KEY'];
+    else process.env['RETICLE_CLOUD_KEY'] = origKeyEnv;
+    vi.unstubAllEnvs();
+    await rm(home, { recursive: true, force: true });
+    await rm(cwd, { recursive: true, force: true });
+  });
+
+  /**
+   * A `.reticle/` directory is not proof the app is instrumented.
+   *
+   * `.reticle.json` is what `init` writes and what puts a projectId in the app's BUNDLE, which is
+   * the only thing letting the daemon attribute a session's runs to this repo. Auto-linking on the
+   * mere existence of `.reticle/` produced a repo that was linked to a cloud project and could not
+   * report to it — runs pooled into the daemon's own ledger, and `sync` here answered "nothing to
+   * send" immediately after two verdicts were recorded. Measured on this repo's own bench app.
+   */
+  describe('auto-link after login only fires for a repo that can actually report', () => {
+    const loginResponder = (url: string): { body: unknown } =>
+      url.endsWith('/v1/auth/device/start')
+        ? {
+            body: {
+              deviceCode: 'd',
+              userCode: 'U',
+              verificationUri: 'https://app.test/device',
+              verificationUriComplete: 'https://app.test/device?code=U',
+              interval: 0,
+              expiresAt: Date.now() + 60_000,
+            },
+          }
+        : { body: { status: 'approved', token: 'tok_1', org: { name: 'Acme', id: 'org_acme' } } };
+
+    it('does not link a directory that has a .reticle/ but no .reticle.json', async () => {
+      process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+      responder = loginResponder;
+      // The artifacts directory alone — the shape bench-app was in.
+      await writeRepoFile(['impact.json'], '{}');
+
+      const code = await login([]);
+
+      expect(code).toBe(0);
+      // Signed in, but nothing was minted or bound: no key request went out.
+      expect(requests.filter((r) => r.url.endsWith('/v1/keys'))).toEqual([]);
+      expect(stderrBuf).toContain('reticle init');
+    });
+
+    it('links when .reticle.json is present, which is what init writes', async () => {
+      process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+      responder = (url) => {
+        if (url.includes('/v1/auth/device/')) return loginResponder(url);
+        if (url.endsWith('/v1/keys'))
+          return { body: { projectId: 'p1', projectName: 'P1', key: 'rk_live_minted0000' } };
+        // The responder cannot see the METHOD, and /v1/projects is both listed and created against.
+        // A superset body satisfies whichever schema the CLI parses it with.
+        return { body: { projects: [], projectId: 'p1', name: 'P1' } };
+      };
+      await writeFile(join(cwd, '.reticle.json'), JSON.stringify({ projectId: 'p1' }));
+
+      const code = await login([]);
+
+      expect(code).toBe(0);
+      expect(requests.filter((r) => r.url.endsWith('/v1/keys')).length).toBe(1);
+    });
+  });
+
+  // The platform answers every email sign-in route with 410 email_sign_in_removed. A CLI that still
+  // asked for a code printed "check your inbox" for a code that never came.
+  it.each([
+    [['login', '--email', 'dev@example.com', '--org', 'Acme']],
+    [['login', '--email', 'dev@example.com', '--code', '654321']],
+    [['login', 'dev@example.com']],
+  ])('%j stops with the sentence and sends nothing', async (argv) => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    expect(await login(argv.slice(1))).toBe(2);
+    expect(stderrBuf).toContain(EMAIL_SIGN_IN_REMOVED);
+    expect(requests).toEqual([]);
+  });
+
+  it('a 410 from the platform prints its own sentence, never a stack trace', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    const said = 'Email sign-in is gone. Sign in with Google or GitHub.';
+    responder = () => ({
+      status: 410,
+      body: { error: { code: 'email_sign_in_removed', message: said } },
+    });
+    expect(await login([])).toBe(1);
+    expect(stderrBuf).toContain(said);
+    expect(stderrBuf).not.toContain('    at ');
+  });
+
+  // `reticle connect --no-install` was refused as a usage error by the cloud half, after its init
+  // half had already run the install the flag asked it not to.
+  it('connect takes --no-install, which belongs to the init it runs first', async () => {
+    const said: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      said.push(String(chunk));
+      return true;
+    });
+    const code = await runCloudCommand(['connect', '--no-install', '--url', TEST_URL]);
+    spy.mockRestore();
+    // Not wired here, so it stops on that, not on the flag.
+    expect(code).toBe(2);
+    expect(said.join('')).not.toContain('usage:');
+    expect(connectInstalls(['connect', '--no-install'])).toBe(false);
+    expect(connectInstalls(['connect', '--url', TEST_URL])).toBe(true);
+  });
+
+  /*
+   * Two re-drive personas: an invited contributor's `connect --project <new>` was refused 403 because
+   * creating a project needs a maintainer, and the CLI said "your sign-in expired… run reticle
+   * login". It prints the platform's words and the step that works: link a project that exists.
+   */
+  it("connect as a contributor names the platform's refusal and the projects it can link", async () => {
+    await writeFile(join(cwd, '.reticle.json'), JSON.stringify({ projectId: 'local-1' }));
+    await writeHomeFile(
+      [SESSION_FILE],
+      JSON.stringify({ token: 'person-token', orgName: 'Acme', orgId: 'org_acme', url: TEST_URL }),
+    );
+    const said =
+      'Only a maintainer, an admin or the owner of this workspace can create a project. Ask one to create it on the dashboard (or run reticle connect), then connect to it.';
+    let projectCalls = 0;
+    responder = (url) => {
+      if (url.endsWith('/v1/projects')) {
+        projectCalls += 1;
+        return 1 === projectCalls
+          ? { body: { projects: [{ projectId: 'shop-1', name: 'shop' }] } }
+          : { status: 403, body: { error: { code: 'forbidden', message: said } } };
+      }
+      return { body: { orgs: [], workspaces: [] } };
+    };
+    const code = await runCloudCommand(['connect', '--url', TEST_URL, '--project', 'brand-new']);
+    expect(code).not.toBe(0);
+    expect(stderrBuf).toContain(said);
+    expect(stderrBuf).not.toContain('reticle login');
+    expect(stderrBuf).toContain('reticle connect --project shop');
+  });
+
+  it('connect reuses a valid sign-in, links the named project, and syncs local history', async () => {
+    await writeFile(join(cwd, '.reticle.json'), JSON.stringify({ projectId: 'local-1' }));
+    await writeHomeFile(
+      [SESSION_FILE],
+      JSON.stringify({ token: 'person-token', orgName: 'Acme', orgId: 'org_acme', url: TEST_URL }),
+    );
+    responder = (url) => {
+      if (url.endsWith('/v1/projects'))
+        return { body: { projects: [], projectId: 'proj_1', name: 'My App' } };
+      if (url.endsWith('/v1/keys'))
+        return { body: { projectId: 'proj_1', projectName: 'My App', key: TEST_KEY } };
+      if (url.endsWith('/v1/cloud/whoami'))
+        return { body: { projectId: 'proj_1', projectName: 'My App', orgId: 'org_acme' } };
+      return { body: { knownRunIds: [], stateHashes: {}, triage: [], cursor: '0:' } };
+    };
+
+    const code = await runCloudCommand(['connect', '--url', TEST_URL, '--project', 'My App']);
+
+    expect(code).toBe(0);
+    expect(requests.some((r) => r.url.endsWith('/v1/auth/device/start'))).toBe(false);
+    expect(requests.find((r) => r.url.endsWith('/v1/me'))?.authorization).toBe(
+      'Bearer person-token',
+    );
+    expect(requests.some((r) => r.url.endsWith('/v1/keys'))).toBe(true);
+    expect(requests.some((r) => r.url.endsWith('/v1/sync/status'))).toBe(true);
+    expect(requests.some((r) => r.url.endsWith('/v1/sync/pull'))).toBe(true);
+    const link = JSON.parse(
+      await readFile(join(cwd, RETICLE_DIR, CLOUD_LINK_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(link['projectId']).toBe('proj_1');
+    expect(link['url']).toBe(TEST_URL);
+  });
+
+  /*
+   * Persona drive: Noah joined his team's workspace in the console, ran `reticle connect` as the
+   * dashboard said, and the CLI reused his personal workspace's sign-in, printed "Connected", and
+   * nothing moved. `connect --workspace <name>` switches; without it, a person in several hears it.
+   */
+  describe('connect when the person belongs to more than one workspace', () => {
+    const team = { orgId: 'org_team', name: 'Acme QA', role: 'contributor', connected: false };
+    const own = { orgId: 'org_noah', name: "Noah's workspace", role: 'owner', connected: true };
+    const stub = (activated: string[]) => (url: string) => {
+      if (url.endsWith('/v1/me/workspaces'))
+        return { body: { active: 'org_noah', memberships: [own, team], invites: [] } };
+      if (url.endsWith('/v1/me/workspaces/org_team/activate')) {
+        activated.push('org_team');
+        return { body: { token: 'team-token', org: { id: 'org_team', name: 'Acme QA' } } };
+      }
+      if (url.endsWith('/v1/projects'))
+        return { body: { projects: [], projectId: 'proj_1', name: 'noah-notes' } };
+      if (url.endsWith('/v1/keys'))
+        return { body: { projectId: 'proj_1', projectName: 'noah-notes', key: TEST_KEY } };
+      if (url.endsWith('/v1/cloud/whoami'))
+        return { body: { projectId: 'proj_1', projectName: 'noah-notes', orgId: 'org_team' } };
+      return { body: { knownRunIds: [], stateHashes: {}, triage: [], cursor: '0:' } };
+    };
+    const signedIn = async (): Promise<void> => {
+      await writeFile(join(cwd, '.reticle.json'), JSON.stringify({ projectId: 'noah-notes' }));
+      await writeHomeFile(
+        [SESSION_FILE],
+        JSON.stringify({
+          token: 'noah-token',
+          orgName: "Noah's workspace",
+          orgId: 'org_noah',
+          url: TEST_URL,
+        }),
+      );
+    };
+
+    it('switches to the workspace named, and links there', async () => {
+      await signedIn();
+      const activated: string[] = [];
+      responder = stub(activated);
+      const code = await runCloudCommand(['connect', '--url', TEST_URL, '--workspace', 'Acme QA']);
+      expect(code).toBe(0);
+      expect(activated).toEqual(['org_team']);
+      expect(requests.find((r) => r.url.endsWith('/v1/keys'))?.authorization).toBe(
+        'Bearer team-token',
+      );
+      expect(stderrBuf).toContain('in workspace "Acme QA"');
+    });
+
+    it('says which workspace it links in, and how to choose another', async () => {
+      await signedIn();
+      responder = stub([]);
+      await runCloudCommand(['connect', '--url', TEST_URL]);
+      expect(stderrBuf).toContain('Acme QA');
+      expect(stderrBuf).toContain('--workspace');
+    });
+  });
+
+  it('connect refuses to claim a cloud connection before init has marked the app', async () => {
+    const code = await runCloudCommand(['connect', '--url', TEST_URL]);
+
+    expect(code).toBe(2);
+    expect(stderrBuf).toContain('reticle init');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('login without RETICLE_CLOUD_URL dials the hosted service, not the developer machine', async () => {
+    responder = () => ({ status: 500, body: { error: { message: 'down' } } });
+
+    const code = await login([]);
+
+    expect(code).toBe(1);
+    expect(requests).toHaveLength(1);
+    // The whole point: somebody who installed the package and typed `reticle login` reaches the
+    // product. A localhost default sent every real user at a port on their own machine that
+    // nothing is serving, and that failure reads as "the cloud is down" rather than "wrong host".
+    expect(requests[0]?.url).toBe('https://app.reticle.sh/v1/auth/device/start');
+    // ...and it does NOT nag about RETICLE_CLOUD_URL. Dialling the hosted service is now the
+    // CORRECT default, and warning about correct behaviour trains people to ignore the one
+    // channel that carries real problems. The variable stays in `reticle --help`.
+    expect(stderrBuf).not.toContain('RETICLE_CLOUD_URL');
+    // The device flow never reached its browser-open step, so nothing spawned.
+    expect(stderrBuf).not.toContain('Opening');
+  });
+
+  it('login --url dials the host given on the command line, over env and over the default', async () => {
+    // A flag beats an environment variable for a one-off: it is visible in shell history, it cannot
+    // leak into a sibling process, and it is the spelling somebody reaches for without reading docs.
+    process.env['RETICLE_CLOUD_URL'] = 'https://staging.reticle.sh';
+    responder = () => ({ status: 500, body: { error: { message: 'down' } } });
+
+    const code = await login(['--url', 'https://other.reticle.sh']);
+
+    expect(code).toBe(1);
+    expect(requests[0]?.url).toBe('https://other.reticle.sh/v1/auth/device/start');
+  });
+
+  it('logout signs out of one host and leaves the other logged in', async () => {
+    await writeHomeFile(
+      ['sessions', 'app.reticle.sh.json'],
+      '{"token":"prod-token","orgName":"Prod","url":"https://app.reticle.sh"}',
+    );
+    await writeHomeFile(
+      ['sessions', 'staging.reticle.sh.json'],
+      '{"token":"staging-token","orgName":"Staging","url":"https://staging.reticle.sh"}',
+    );
+    process.env['RETICLE_CLOUD_URL'] = 'https://staging.reticle.sh';
+
+    const code = await runCloudCommand(['logout']);
+
+    expect(code).toBe(0);
+    // Signing out of staging must not sign you out of production. A logout that quietly cleared
+    // every environment would be discovered at the worst moment, mid-incident, on the other one.
+    await expect(
+      readFile(join(home, RETICLE_DIR, 'sessions', 'staging.reticle.sh.json'), 'utf8'),
+    ).rejects.toThrow();
+    expect(
+      await readFile(join(home, RETICLE_DIR, 'sessions', 'app.reticle.sh.json'), 'utf8'),
+    ).toContain('prod-token');
+  });
+
+  it('logout clears the cached session file without touching the network', async () => {
+    await writeHomeFile([SESSION_FILE], '{"token":"tok","orgName":"Acme","url":"http://c"}');
+
+    const code = await runCloudCommand(['logout']);
+
+    expect(code).toBe(0);
+    expect(await readFile(join(home, RETICLE_DIR, SESSION_FILE), 'utf8')).toBe('');
+    expect(lastJsonOutput()).toEqual({ loggedOut: true, url: 'http://c' });
+    expect(requests).toHaveLength(0);
+  });
+
+  // Persona drive: `reticle connect` wrote the dashboard's address to cloud.json and never said it.
+  it('prints the dashboard address it wrote', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({
+      body: { projectId: 'proj_1', projectName: 'Proj', dashboardUrl: 'https://app.test/p/proj_1' },
+    });
+    expect(await cmdLink([])).toBe(0);
+    expect(stderrBuf).toContain('https://app.test/p/proj_1');
+  });
+
+  it('link with an explicit key resolves whoami and writes the binding + credential', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { projectId: 'proj_1', projectName: 'Proj' } });
+
+    const code = await cmdLink([]);
+
+    expect(code).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe('GET');
+    expect(requests[0]?.url).toBe(`${TEST_URL}/v1/cloud/whoami`);
+    expect(requests[0]?.authorization).toBe(`Bearer ${TEST_KEY}`);
+    const cloudJson = JSON.parse(
+      await readFile(join(cwd, RETICLE_DIR, CLOUD_LINK_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(cloudJson['projectId']).toBe('proj_1');
+    expect(cloudJson['projectName']).toBe('Proj');
+    expect(cloudJson['url']).toBe(TEST_URL);
+    expect(cloudJson['verify']).toBe('local');
+    const creds = JSON.parse(
+      await readFile(join(home, RETICLE_DIR, CREDENTIALS_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    // Stamped with the cloud that minted it, so a project called `default` on two different clouds
+    // cannot share one slot — the collision that sent a production key to a localhost server.
+    expect(creds['proj_1']).toEqual({ key: TEST_KEY, url: TEST_URL });
+  });
+
+  it('link --project creates the project when it does not exist yet, and says so', async () => {
+    // Before this, `link --project storefront` refused with "create it with `reticle project
+    // create`" — a second command to satisfy a bookkeeping step the tool can do itself, and the
+    // only reason the magic path (bare `link`) existed was to avoid it. Naming a project you have
+    // not created yet is the COMMON case for a first repo, not an error.
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    // The stub sees only the URL, and the list and the create share one path — so distinguish by
+    // order: the list is asked first, the create second.
+    let projectCalls = 0;
+    responder = (url) => {
+      if (url.endsWith('/v1/projects')) {
+        projectCalls += 1;
+        return 1 === projectCalls
+          ? { body: { projects: [] } }
+          : { body: { projectId: 'proj_new', name: 'Storefront' } };
+      }
+      return {
+        body: { projectId: 'proj_new', projectName: 'Storefront', key: 'rk_live_abcd1234ef' },
+      };
+    };
+
+    const code = await cmdLink(['--project', 'Storefront']);
+
+    expect(code).toBe(0);
+    const created = requests.find((r) => 'POST' === r.method && r.url.endsWith('/v1/projects'));
+    expect(created, 'it creates the project instead of refusing').toBeDefined();
+    expect(created?.body).toEqual({ name: 'Storefront' });
+    // ...and SAYS it created one, because silently creating is its own surprise.
+    expect(stderrBuf).toContain('created');
+  });
+
+  // Group D persona drive: `connect --project X` while signed in to a personal workspace created X
+  // there without a word about which workspace. It says so, on creation and on the binding.
+  it('says which workspace it created the project in and bound the repo to', async () => {
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    let projectCalls = 0;
+    responder = (url) => {
+      if (url.endsWith('/v1/projects')) {
+        projectCalls += 1;
+        return 1 === projectCalls
+          ? { body: { projects: [] } }
+          : { body: { projectId: 'proj_new', name: 'Storefront' } };
+      }
+      return {
+        body: { projectId: 'proj_new', projectName: 'Storefront', key: 'rk_live_abcd1234ef' },
+      };
+    };
+    await cmdLink(['--project', 'Storefront']);
+    expect(stderrBuf).toContain('in workspace "Acme"');
+    expect(stderrBuf).toContain('bound this repo to project "Storefront" in workspace "Acme"');
+  });
+
+  /*
+   * Two different apps whose package is `web` shared one dashboard project: link reused a project
+   * by name alone. The link now carries which repository (and folder in it) it is, and a project of
+   * the same name made for another repository is not reused.
+   */
+  it('does not reuse a same-named project made for another repository', async () => {
+    execFileSync('git', ['init', '-q'], { cwd });
+    execFileSync('git', ['remote', 'add', 'origin', 'git@github.com:acme/storefront.git'], { cwd });
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    let projectCalls = 0;
+    responder = (url) => {
+      if (url.endsWith('/v1/projects')) {
+        projectCalls += 1;
+        return 1 === projectCalls
+          ? { body: { projects: [{ projectId: 'proj_web', name: 'web', repo: 'another-repo' }] } }
+          : { body: { projectId: 'web-2', name: 'web' } };
+      }
+      return { body: { projectId: 'web-2', projectName: 'web', key: 'rk_live_abcd1234ef' } };
+    };
+    await cmdLink(['--project', 'web']);
+    const created = requests.find((r) => 'POST' === r.method && r.url.endsWith('/v1/projects'));
+    expect(created?.body).toMatchObject({ name: 'web', repo: expect.any(String) as unknown });
+    const link = JSON.parse(await readFile(join(cwd, RETICLE_DIR, CLOUD_LINK_FILE), 'utf8')) as {
+      repo?: string;
+    };
+    expect(link.repo).toBe((created?.body as { repo?: string }).repo);
+  });
+
+  it('link --project does NOT create a duplicate when the project already exists', async () => {
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      return {
+        body: { projectId: 'proj_1', projectName: 'Storefront', key: 'rk_live_abcd1234ef' },
+      };
+    };
+
+    await cmdLink(['--project', 'storefront']);
+
+    expect(requests.filter((r) => 'POST' === r.method && r.url.endsWith('/v1/projects'))).toEqual(
+      [],
+    );
+  });
+
+  it('link says what it just did, in the words a human needs to not repeat it by hand', async () => {
+    // The reported failure this exists for: somebody pasted a masked placeholder key into a .env
+    // because their mental model said "I must make a key and put it somewhere". A key had already
+    // been minted and stored OUTSIDE the repo. They did not need another step — they needed to be
+    // told the step had happened.
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      return {
+        body: { projectId: 'proj_1', projectName: 'Storefront', key: 'rk_live_abcd1234ef' },
+      };
+    };
+
+    await cmdLink(['--project', 'storefront']);
+
+    // Which project it bound to.
+    expect(stderrBuf).toContain('Storefront');
+    // That a key was minted, identified the way the dashboard identifies it — never in full.
+    expect(stderrBuf).toContain('rk_live_abcd1234');
+    expect(stderrBuf, 'the secret itself must never be printed').not.toContain(
+      'rk_live_abcd1234ef',
+    );
+    // And that it lives outside the repo, which is the fact that stops the .env paste.
+    expect(stderrBuf).toContain('credentials.json');
+    expect(stderrBuf).toContain('not in your repo');
+  });
+
+  /**
+   * The stored key is VALID but belongs to somebody else.
+   *
+   * `link` names every project "default", so two accounts on one cloud shared the slot
+   * `<url>::default`. Validation could never catch it: the other tenant's key works perfectly, it
+   * just is not ours. Measured end to end against a real API — a brand-new workspace signed in and
+   * was handed a stranger's key, and every run it pushed would have landed in their dashboard.
+   */
+  it('refuses to reuse a key that belongs to a DIFFERENT organisation', async () => {
+    await writeHomeFile(
+      [SESSION_FILE],
+      `{"token":"tok","orgName":"Acme","orgId":"org_mine","url":"${TEST_URL}"}`,
+    );
+    await writeHomeFile([CREDENTIALS_FILE], JSON.stringify({ proj_1: 'rk_live_theirs000' }));
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      if (true === url.endsWith('/v1/keys'))
+        return {
+          body: { projectId: 'proj_1', projectName: 'Storefront', key: 'rk_live_mine00000' },
+        };
+      return { body: { projectId: 'proj_1', projectName: 'Storefront', orgId: 'org_theirs' } };
+    };
+
+    const code = await cmdLink(['--project', 'storefront']);
+
+    expect(code).toBe(0);
+    expect(
+      requests.filter((r) => 'POST' === r.method && r.url.endsWith('/v1/keys')).length,
+      "a key of our own is minted rather than borrowing the other tenant's",
+    ).toBe(1);
+    const creds = JSON.parse(
+      await readFile(join(home, RETICLE_DIR, CREDENTIALS_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    // Ours is filed under the org slot...
+    expect(creds[`${TEST_URL}::org::org_mine::proj_1`]).toBe('rk_live_mine00000');
+    // ...and THEIR entry is left exactly as it was. Overwriting it would be the same disclosure
+    // pointing the other way: their repo would start pushing with our key.
+    expect(creds['proj_1']).toBe('rk_live_theirs000');
+    expect(creds[`${TEST_URL}::proj_1`]).toBeUndefined();
+  });
+
+  it('mints rather than guessing when the cloud cannot name the tenant', async () => {
+    // An older cloud answers whoami without an orgId, so a stored key cannot be proved ours. Minting
+    // a second key is untidy; pushing to the wrong tenant is a disclosure. Only one of those is a
+    // safe default, and this pins which one we chose.
+    await writeHomeFile(
+      [SESSION_FILE],
+      `{"token":"tok","orgName":"Acme","orgId":"org_mine","url":"${TEST_URL}"}`,
+    );
+    await writeHomeFile([CREDENTIALS_FILE], JSON.stringify({ proj_1: 'rk_live_unknown00' }));
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      if (true === url.endsWith('/v1/keys'))
+        return {
+          body: { projectId: 'proj_1', projectName: 'Storefront', key: 'rk_live_mine00000' },
+        };
+      return { body: { projectId: 'proj_1', projectName: 'Storefront' } };
+    };
+
+    const code = await cmdLink(['--project', 'storefront']);
+
+    expect(code).toBe(0);
+    expect(requests.filter((r) => 'POST' === r.method && r.url.endsWith('/v1/keys')).length).toBe(
+      1,
+    );
+  });
+
+  it('re-linking reuses the stored key instead of minting a second one', async () => {
+    // Credential hygiene. `link` is idempotent about the BINDING and was not about the KEY: two runs
+    // against one project left two live `reticle-cli` keys on the account, each valid, neither
+    // identifiable to a repo. An agent retries — that is what agents do — so this accumulates
+    // silently until somebody has a key list they cannot reason about and revokes the wrong one.
+    await writeHomeFile(
+      [SESSION_FILE],
+      `{"token":"tok","orgName":"Acme","orgId":"org_acme","url":"${TEST_URL}"}`,
+    );
+    await writeHomeFile([CREDENTIALS_FILE], JSON.stringify({ proj_1: 'rk_live_existing00' }));
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      // whoami names the tenant, which is what lets a stored key be recognised as OURS. Reuse now
+      // requires that proof — see the foreign-org test below for why.
+      return { body: { projectId: 'proj_1', projectName: 'Storefront', orgId: 'org_acme' } };
+    };
+
+    const code = await cmdLink(['--project', 'storefront']);
+
+    expect(code).toBe(0);
+    expect(
+      requests.filter((r) => 'POST' === r.method && r.url.endsWith('/v1/keys')),
+      'no second key is minted for a project already linked on this machine',
+    ).toEqual([]);
+    // It says REUSING, not "minted" — the report has to stay true on the second run.
+    expect(stderrBuf).toContain('reusing');
+    expect(stderrBuf).toContain('rk_live_existing');
+    // And the stored credential is left exactly as it was.
+    const creds = JSON.parse(
+      await readFile(join(home, RETICLE_DIR, CREDENTIALS_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    // The KEY is unchanged — nothing was minted — and the entry is upgraded to the stamped shape on
+    // the way through, so a legacy credential stops being ambiguous the first time it is reused.
+    expect(creds['proj_1']).toEqual({ key: 'rk_live_existing00', url: TEST_URL });
+  });
+
+  it('mints a fresh key when the stored one no longer works', async () => {
+    // A revoked or rotated key must not strand the repo. Validation is the whoami call the mint
+    // path already makes for dashboardUrl, so reuse costs no extra round trip.
+    await writeHomeFile([SESSION_FILE], `{"token":"tok","orgName":"Acme","url":"${TEST_URL}"}`);
+    await writeHomeFile([CREDENTIALS_FILE], JSON.stringify({ proj_1: 'rk_live_revoked000' }));
+    responder = (url) => {
+      if (true === url.endsWith('/v1/projects'))
+        return { body: { projects: [{ projectId: 'proj_1', name: 'Storefront' }] } };
+      if (true === url.endsWith('/v1/cloud/whoami'))
+        return { status: 401, body: { error: { message: 'revoked' } } };
+      return {
+        body: { projectId: 'proj_1', projectName: 'Storefront', key: 'rk_live_fresh00000' },
+      };
+    };
+
+    const code = await cmdLink(['--project', 'storefront']);
+
+    expect(code).toBe(0);
+    expect(requests.filter((r) => 'POST' === r.method && r.url.endsWith('/v1/keys')).length).toBe(
+      1,
+    );
+    const creds = JSON.parse(
+      await readFile(join(home, RETICLE_DIR, CREDENTIALS_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(creds['proj_1']).toEqual({ key: 'rk_live_fresh00000', url: TEST_URL });
+  });
+
+  it('config rewrites sync flags and verify mode in place without dialling', async () => {
+    await writeRepoFile(
+      [CLOUD_LINK_FILE],
+      JSON.stringify({ projectId: 'proj_1', projectName: 'Proj', url: 'http://cloud.test' }),
+    );
+
+    const code = await runCloudCommand(['config', '--memory', 'off', '--verify', 'server']);
+
+    expect(code).toBe(0);
+    const cfg = JSON.parse(
+      await readFile(join(cwd, RETICLE_DIR, CLOUD_LINK_FILE), 'utf8'),
+    ) as Record<string, unknown>;
+    expect(cfg['sync']).toEqual({ runs: true, memory: false, flows: true });
+    expect(cfg['verify']).toBe('server');
+    expect(requests).toHaveLength(0);
+  });
+
+  it('push runs a full sync cycle: asks first, sends nothing, still collects decisions', async () => {
+    /*
+     * `push` used to re-upload every local run artifact on every invocation and never look at what
+     * came the other way. It is now one cycle of the replication protocol, which changes the
+     * contract in two visible ways and both are the point:
+     *
+     *   • it ASKS before sending, so an unchanged repo sends no bundle at all;
+     *   • it PULLS even with nothing to push, because a quiet machine is exactly the one whose
+     *     dashboard somebody has been triaging on.
+     */
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { knownRunIds: [], stateHashes: {}, triage: [], cursor: '0:' } });
+
+    const code = await runCloudCommand(['sync']);
+
+    expect(code).toBe(0);
+    const out = lastJsonOutput() as Record<string, unknown>;
+    expect(out['ok']).toBe(true);
+    expect(out['sent']).toEqual({ runs: 0, flows: 0, records: [] });
+    expect(out['pulled']).toBe(0);
+
+    const paths = requests.map((r) => r.url.replace(TEST_URL, ''));
+    expect(paths, 'asked and collected; sent no bundle').toEqual([
+      '/v1/sync/status',
+      '/v1/sync/pull',
+    ]);
+    expect(requests.every((r) => r.authorization === `Bearer ${TEST_KEY}`)).toBe(true);
+  });
+
+  /**
+   * `push` reported success while the dashboard threw away everything it was handed.
+   *
+   * From the field: a repo whose artifacts the cloud refused got `{"ok":true, …, "rejected":[…]}`
+   * on stdout and exit 0. Every fact needed to diagnose it was in that payload, and the two things
+   * a script actually reads — the boolean and the exit code — both said the push had worked.
+   *
+   * Driven through the real verb with a real artifact: the run file is written by the SAME builder
+   * the daemon writes with, so this cannot pass against a hand-rolled shape the product never
+   * produces. Only the HTTP responses are scripted, which is where the refusal comes from — this
+   * build validates no run artifact locally on the way out.
+   */
+  describe('push when the cloud refuses the artifacts it was sent', () => {
+    const REFUSAL = 'run artifact failed validation: schemaVersion: Invalid literal value';
+    const FROZEN = 1_700_000_000_000;
+
+    /** One run artifact, stamped by the writer, on disk where `push` reads them from. */
+    const writeCurrentRunArtifact = async (runId: string): Promise<void> => {
+      const run = buildVerificationRun(
+        {
+          runId,
+          durationMs: 1_200,
+          profile: RunProfile.DEV,
+          project: { name: 'checkout', framework: RunFramework.REACT },
+          agent: { id: 'claude-code', kind: RunAgentKind.CODING_AGENT },
+          trigger: { kind: RunTrigger.EDIT },
+          changedFiles: [],
+          flows: [],
+          checks: [
+            { kind: PredicateKind.NET, predicate: 'POST /api/orders', status: Verified.YES },
+            { kind: PredicateKind.ROUTE, predicate: '/orders/confirmed', status: Verified.YES },
+            { kind: PredicateKind.TEXT, predicate: 'Order confirmed', status: Verified.YES },
+          ],
+          risks: [],
+          evidence: {
+            consoleErrors: [],
+            networkAnomalies: [],
+            stateAssertions: [],
+            timeline: [],
+          },
+        },
+        () => FROZEN,
+      );
+      const dir = join(cwd, RETICLE_DIR, 'runs');
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, `${runId}.json`), JSON.stringify(run, null, 2));
+    };
+
+    /** Answer the three sync doors; the push door refuses every run it is offered. */
+    const refusingCloud = (url: string): StubResponse => {
+      if (url.includes('/v1/sync/status')) return { body: { knownRunIds: [], stateHashes: {} } };
+      if (url.includes('/v1/sync/pull')) return { body: { triage: [], cursor: '0:' } };
+      return { body: { runs: { accepted: 0, rejected: [{ index: 0, reason: REFUSAL }] } } };
+    };
+
+    beforeEach(() => {
+      process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+      process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    });
+
+    it('exits non-zero, because a caller reads the exit code and nothing else', async () => {
+      await writeCurrentRunArtifact('run_refused');
+      responder = refusingCloud;
+
+      const code = await runCloudCommand(['sync']);
+
+      expect(code, 'exit 0 tells a CI step the sync worked').toBe(1);
+    });
+
+    it('says ok:false on stdout, where an agent parsing the JSON will see it', async () => {
+      await writeCurrentRunArtifact('run_refused');
+      responder = refusingCloud;
+
+      await runCloudCommand(['sync']);
+
+      expect((lastJsonOutput() as Record<string, unknown>)['ok']).toBe(false);
+    });
+
+    it('still carries the rejection and its reason, which is the only actionable half', async () => {
+      await writeCurrentRunArtifact('run_refused');
+      responder = refusingCloud;
+
+      await runCloudCommand(['sync']);
+
+      const out = lastJsonOutput() as Record<string, unknown>;
+      expect(out['sent']).toEqual({
+        runs: 0,
+        flows: 0,
+        records: [],
+        rejected: [{ index: 0, reason: REFUSAL }],
+      });
+      // And on stderr, where a human reading a terminal is looking.
+      expect(stderrBuf).toContain(REFUSAL);
+    });
+
+    it('the artifact really was offered — the refusal came from the cloud, not from here', async () => {
+      // The other half of the report this came from claimed `push` validates artifacts locally
+      // against an older schema. It does not: the bundle goes out untouched and the verdict on it
+      // is the server's. Pinned so a future local validator cannot be added silently.
+      await writeCurrentRunArtifact('run_refused');
+      responder = refusingCloud;
+
+      await runCloudCommand(['sync']);
+
+      const pushed = requests.find((r) => 'POST' === r.method && r.url.endsWith('/v1/sync'));
+      const runs = (pushed?.body as { runs?: Array<Record<string, unknown>> } | undefined)?.runs;
+      expect(runs).toHaveLength(1);
+      expect(runs?.[0]?.['runId']).toBe('run_refused');
+      expect(runs?.[0]?.['schemaVersion']).toBe(RUN_FILE_VERSION);
+    });
+
+    it('exits 0 for the same artifact once the cloud accepts it', async () => {
+      // The control. Without it, "push exits 1" could be true for every push, which would be a
+      // worse bug than the one being fixed.
+      await writeCurrentRunArtifact('run_accepted');
+      responder = (url) => {
+        if (url.includes('/v1/sync/status')) return { body: { knownRunIds: [], stateHashes: {} } };
+        if (url.includes('/v1/sync/pull')) return { body: { triage: [], cursor: '0:' } };
+        return { body: { runs: { accepted: 1, rejected: [] } } };
+      };
+
+      const code = await runCloudCommand(['sync']);
+
+      expect(code).toBe(0);
+      const out = lastJsonOutput() as Record<string, unknown>;
+      expect(out['ok']).toBe(true);
+      expect(out['sent']).toEqual({ runs: 1, flows: 0, records: [] });
+    });
+  });
+
+  it('runs lists the linked project runs with the key as bearer', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { runs: [{ runId: 'run_1' }] } });
+
+    const code = await runCloudCommand(['runs']);
+
+    expect(code).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe('GET');
+    expect(requests[0]?.url).toBe(`${TEST_URL}/v1/runs`);
+    expect(requests[0]?.authorization).toBe(`Bearer ${TEST_KEY}`);
+    expect(lastJsonOutput()).toEqual({ runs: [{ runId: 'run_1' }] });
+  });
+
+  // A drive's local record can be gone (another machine, a cleaned checkout); the platform kept it.
+  it('runs <id> reads one run from the platform, and says when it is not there yet', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { runId: 'harness-1', status: 'done' } });
+    expect(await runCloudCommand(['runs', 'harness-1'])).toBe(0);
+    expect(requests[0]?.url).toBe(`${TEST_URL}/v1/runs/harness-1`);
+    expect(lastJsonOutput()).toEqual({ runId: 'harness-1', status: 'done' });
+
+    responder = () => ({ status: 404, body: {} });
+    expect(await runCloudCommand(['runs', 'harness-2'])).toBe(1);
+  });
+
+  it('regression fetches the CI report and exits clean on zero broken flows', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { broken: [] } });
+
+    const code = await runCloudCommand(['runs', 'regression']);
+
+    expect(code).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe('GET');
+    expect(requests[0]?.url).toBe(`${TEST_URL}/v1/project/regression`);
+    expect(requests[0]?.authorization).toBe(`Bearer ${TEST_KEY}`);
+    expect(lastJsonOutput()).toEqual({ broken: [] });
+  });
+
+  it('share mints a public link for one run and refuses a missing run id', async () => {
+    process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+    process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+    responder = () => ({ body: { shareUrl: 'https://cloud.test/s/abc' } });
+
+    expect(await runCloudCommand(['runs', 'share'])).toBe(2);
+    expect(requests).toHaveLength(0);
+
+    const code = await runCloudCommand(['runs', 'share', 'run_abc']);
+    expect(code).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe('POST');
+    expect(requests[0]?.url).toBe(`${TEST_URL}/v1/runs/run_abc/share`);
+    expect(requests[0]?.authorization).toBe(`Bearer ${TEST_KEY}`);
+    expect(lastJsonOutput()).toEqual({ shareUrl: 'https://cloud.test/s/abc' });
+  });
+
+  /**
+   * `reticle memory` — the one reader whose whole job is "what does THIS project know".
+   *
+   * The platform names the project on the response ENVELOPE, not on each entry, and this command
+   * used to print the body verbatim. A workspace key that resolved to a sibling project therefore
+   * printed that sibling's established knowledge under this project's heading, and a person reading
+   * it had nothing to tell the two apart. The three cases below are the platform's real
+   * `{ projectId, entries }` shape, which is the shape the entry-level filter could not see.
+   */
+  describe('memory refuses an answer it cannot show to be about this project', () => {
+    const linkedHere = async (): Promise<void> => {
+      await writeRepoFile(
+        [CLOUD_LINK_FILE],
+        JSON.stringify({ projectId: 'proj_1', projectName: 'Proj', url: TEST_URL }),
+      );
+      await writeHomeFile([CREDENTIALS_FILE], JSON.stringify({ proj_1: TEST_KEY }));
+    };
+
+    it('names the linked project on the wire and prints what comes back', async () => {
+      await linkedHere();
+      const entries = [{ statement: 'ours', status: 'proved' }];
+      responder = () => ({ body: { projectId: 'proj_1', entries } });
+
+      const code = await runCloudCommand(['runs', 'memory']);
+
+      expect(code).toBe(0);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe(`${TEST_URL}/v1/memory?projectId=proj_1&limit=100`);
+      expect(lastJsonOutput()).toEqual({ projectId: 'proj_1', entries });
+    });
+
+    /**
+     * The refusal has to be LOUD and it has to be EMPTY. Printing an empty list would report "this
+     * project knows nothing", which is a different fact from "this response could not be shown to be
+     * about this project" and the one a person is likelier to act on — and a caller piping this into
+     * an agent would hand it a confident no-answer.
+     */
+    it('prints NOTHING and exits non-zero when the envelope names another project', async () => {
+      await linkedHere();
+      responder = () => ({
+        body: { projectId: 'proj_sibling', entries: [{ statement: 'theirs', status: 'proved' }] },
+      });
+
+      const code = await runCloudCommand(['runs', 'memory']);
+
+      expect(code).toBe(1);
+      expect(stdoutBuf.trim()).toBe('');
+      expect(stderrBuf).toContain('different project');
+    });
+
+    it('prints NOTHING and exits non-zero when the envelope names no project at all', async () => {
+      await linkedHere();
+      responder = () => ({ body: { entries: [{ statement: 'whose?', status: 'proved' }] } });
+
+      const code = await runCloudCommand(['runs', 'memory']);
+
+      expect(code).toBe(1);
+      expect(stdoutBuf.trim()).toBe('');
+      expect(stderrBuf).toContain('does not say which project');
+    });
+
+    /**
+     * The unlinked path, and the one case where refusing would be WRONG.
+     *
+     * CI is this path: `RETICLE_API_KEY` in the environment, no `cloud.json` on the runner, so the
+     * read names no project and there is nothing for the envelope to contradict. Refusing here to
+     * close a leak that needs two repos would break every single-project install — which is why
+     * `NOT_ASKED` is its own verdict rather than folded into `UNSCOPED`. It is also the branch no
+     * test covered: every case above writes a `cloud.json`, so the guard could have been inverted
+     * with all of them still green.
+     */
+    it('reads and prints normally when this repo is not linked and the key comes from the env', async () => {
+      process.env['RETICLE_CLOUD_URL'] = TEST_URL;
+      process.env['RETICLE_CLOUD_KEY'] = TEST_KEY;
+      const entries = [{ statement: 'readable', status: 'proved' }];
+      // The server answers about SOME project, and with no link there is nothing to disagree with.
+      responder = () => ({ body: { projectId: 'some-other-project', entries } });
+
+      const code = await runCloudCommand(['runs', 'memory']);
+
+      expect(code).toBe(0);
+      // No `projectId=` in the query: there is no linked id to send, and inventing one would scope
+      // the read to a project the server has never heard of.
+      expect(requests[0]?.url).toBe(`${TEST_URL}/v1/memory?limit=100`);
+      expect(lastJsonOutput()).toEqual({ projectId: 'some-other-project', entries });
+    });
+  });
+});

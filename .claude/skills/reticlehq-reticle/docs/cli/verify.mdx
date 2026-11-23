@@ -1,0 +1,115 @@
+---
+title: reticle verify
+description: Drive a URL once, replay every saved flow, and exit zero only on a real pass.
+icon: circle-check
+---
+
+`reticle verify` is the CI command: no model in the loop, no MCP. On a free port it boots the engine in drive mode, waits for the in-page SDK to dial back, replays every saved flow, renders the verdict, and exits. When a Reticle daemon already owns the port, it asks that daemon to replay the flows instead.
+
+```bash
+npx @reticlehq/server verify <url> [--headed] [--timeout N] [--storage-state <file>] [--expect <json> | --expect-file <path>]
+```
+
+It uses the same runner and the same verdict as the MCP and HTTP paths, so a platform agent that can only run a shell command gets a byte-identical artifact.
+
+## Arguments and flags
+
+| Argument | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `url` | string, positional, **required** | none | The preview URL to drive |
+| `--headed` | boolean | `false` (headless) | Show the browser |
+| `--timeout N` | number, ms | `15000` | How long to wait for a browser session to dial back. With `--expect`, how long the predicate may take to come true instead, default `4000` |
+| `--storage-state <file>` | string | unset | A Playwright storage state file. This is how you verify flows behind a login without scripting the login every time |
+| `--results-json <file>` | string | unset | Also write one verdict per journey to this file: `{ schemaVersion, verdict, results: [{ journey, verdict, reason?, runId?, steps }], score }`, each verdict `yes`, `no` or `unknown`. `schemaVersion` is 2 (a file without it has only `verdict` and `results`). `steps` is `{ passed, failed, unknown }` for the journey, and `score` is the total with `value` = passed / total. A step counts only when every earlier step of its journey passed; a step never reached is `unknown` and stays in the total. With `--sweep`, verdicts after a failed step are reported apart as `steps.swept` and never raise the score. A skipped journey is `unknown`, and the run is `yes` only when every journey is. `runId` names the run the journey came from, and is set only when that run reached the platform. Written when verify boots its own browser and a run finishes; a refusal before that writes nothing. The [GitHub Action](https://github.com/reticlehq/reticle/tree/main/action) posts this file |
+| `--port N` | number | `RETICLE_PORT`, else the project's port, else `4400` | The bridge port the app dials |
+| `--session-id <id>` | string | unset | Use a tab that is already connected |
+| `--select <label>` | string, repeatable | unset | Verify only flows carrying this label |
+| `--expect '<json predicate>'` / `--expect-file <path>` | string | unset | One verdict on one predicate, no saved flows needed. Asks the daemon that owns the port and never starts one; with no daemon it refuses. Waits up to `--timeout` for the predicate, the way `reticle_assert { action: "wait" }` does, so a request still in flight after the page loads is waited for. Exits `0` only on `verified: "yes"`. Cannot be combined with `--storage-state` |
+| `--explore` / `--persona "<who does what>"` | boolean / string | off | No saved flows yet? The Harness drives the app and records them. `--persona` implies `--explore`. Needs a linked project (`reticle connect`, or `RETICLE_API_KEY` in CI). It runs at any instrumentation score |
+| `--against <reference-url>` | string | unset | Compare the URL with a reference build, for example a pull request preview with production. See [Compare two builds](#compare-two-builds). Cannot be combined with `--expect`, `--expect-file`, `--explore` or `--persona` |
+| `--confirm-dangerous` | boolean | off | Let this run press the controls the replay guard holds as destructive, such as a "Place order" or "Delete" button in a saved flow. Without it such a step is refused, so a checkout flow cannot pass. It covers this run only and is never saved into a flow. |
+
+On Windows PowerShell, write the predicate to a file and pass `--expect-file` so the JSON never goes through shell quoting:
+
+```powershell
+'{"kind":"text","contains":"Saved"}' | Set-Content expect.json
+npx @reticlehq/server verify http://localhost:3000 --expect-file expect.json
+```
+
+## Compare two builds
+
+```bash
+npx @reticlehq/server verify https://pr-42.preview.example.com --against https://example.com
+```
+
+`--against` answers one question: did the change alter what users see? It drives both running builds with the same actions and reports each difference in what a person can read and use.
+
+- **The actions.** Each saved flow in `.reticle/flows/` (with `--select`, only the flows with those labels) is replayed one step at a time, and the page is read after every step. Then the explorer of `reticle_verify { action: "crawl", exhaustive: true }` walks the reference breadth first. It fills each empty text field with its own value (`text 1`, `text 2`), clicks each control, and waits a short time after each action. Both builds then get the same list of actions.
+- **What is compared.** The accessibility tree, reduced to what a person sees: names, text, values, and the checked, selected, disabled, expanded and pressed states, in page order. Case and spacing are folded. Refs, focus, layout, test ids, source locations and component names are removed.
+- **Noise.** The reference is driven two times, each time in a new browser. A line that differs between those two runs (a clock, a random id) is ignored. A step that the reference did on only one of its runs is not compared.
+- **A step the candidate cannot do.** When the reference did a step and the candidate could not (the control is gone, or a flow anchor does not resolve), that is a difference.
+
+The command uses the daemon on `--port`, and starts one when there is none. Each run is a leased browser tab, so the apps do not need `reticle init`. Each replayed flow step is written as a run, the same as any replay.
+
+The explorer clicks every control it finds. The action guard refuses a control it holds as destructive, and `--confirm-dangerous` removes that guard. Point `--against` at a build whose data you can change, not at a production database.
+
+Each difference prints the actions that first reached it, then `-` for the lines only the reference shows and `+` for the lines only the candidate shows. Differences with the same lines are printed one time, with the number of steps they were seen at. Exit `0` only when steps were compared and nothing differs. A run that compared no step exits `1`, because it proved nothing.
+
+`--results-json <file>` writes `{ schemaVersion: 1, reference, candidate, identical, differences: [{ id, kind, actions, removed, added, seen }], journeys, compared, unstable, ignored, explored }`. `kind` is `changed` or `unreached`. `id` is a hash of the difference's lines, so the same difference has the same id on every run. `ignored` counts the lines skipped as noise, and `unstable` counts the steps not compared.
+
+## What it prints
+
+The rendered run report on stdout. On failure it names the cause on stderr instead, and there are two refusals worth knowing:
+
+```
+No app connected: Reticle drove the URL but no @reticlehq/browser session dialed back.
+  Make sure the SDK is in the build and reticle.connect() runs on the preview page (for a non-localhost preview: allowNonLocalhost + a pairing token).
+```
+
+```
+No saved flows to verify (.reticle/flows is empty), so refusing to report a pass for verifying nothing.
+  Flows are recorded interactively by an agent (reticle_record{action:"start"} → act → reticle_flow_save via the
+  MCP tools), then committed to .reticle/flows/. In CI, check those files in and re-run `reticle verify`.
+  Or let Reticle record them for you: `reticle verify <url> --explore` drives the app itself and saves what it
+  drove, so every run after the first one replays with no model in the loop.
+```
+
+<Warning>
+  Both of those are honesty guards, and both exit `1`. Verifying nothing is never a pass.
+</Warning>
+
+A URL that does not answer is not one of those two. It surfaces as the underlying Playwright error, prefixed with `verify failed:`, and also exits `1`. Real capture:
+
+```
+verify failed: page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:59999/
+Call log:
+  - navigating to "http://localhost:59999/", waiting until "domcontentloaded"
+```
+
+<Warning>
+  `verify` never starts a second daemon on a port that already has one. With a daemon there, it
+  replays the saved flows (or answers `--expect`, or runs `--explore`) through that daemon. Only
+  `--headed` and `--storage-state` need a browser of its own, so with a daemon on the port those
+  refuse and print the ways out (drive through the running daemon, ask it via `reticle_run`, move
+  both to another port with `--port` or `RETICLE_PORT`, or stop it). This bites most often on a
+  developer machine, where an agent has usually left a daemon running; in CI the port is normally
+  free.
+</Warning>
+
+## Exit codes
+
+| Code | Meaning                                                           |
+| ---- | ----------------------------------------------------------------- |
+| `0`  | The verdict was a pass                                            |
+| `1`  | Failed, or no session, or no flows, or the engine could not start |
+
+## Worked example
+
+```bash
+npm run build && npm run preview &
+npx @reticlehq/server verify http://localhost:4173 --timeout 60000
+```
+
+<Card title="Recording the flows this replays" icon="vial" href="/testing">
+  Flows are recorded interactively, then committed to `.reticle/flows/`.
+</Card>

@@ -1,0 +1,53 @@
+---
+title: License status
+description: Show the enterprise license status resolved from the environment, offline, with reticle status.
+icon: key
+---
+
+[`reticle status`](/cli/status) reports whether an enterprise license is active. It resolves the license entirely from the environment. Nothing leaves the machine.
+
+```bash
+npx @reticlehq/server status --json
+```
+
+The block that `status` prints has a `license` row only when a key is set. `--json` always carries the `license` object.
+
+`reticle license` is the old name. It still works for one release, prints one line naming `status`, and prints the `reticle_license` line below.
+
+## What it prints
+
+The `license` object of `status --json`. `reticle license` printed the same fields as one `reticle_license` JSON line on stderr. On a checkout with no issuer key configured:
+
+```json
+{
+  "t": "2026-08-15T18:42:26.758Z",
+  "event": "reticle_license",
+  "contact": "hey@reticle.sh",
+  "status": "eval",
+  "detail": "evaluation mode (no issuer key configured)"
+}
+```
+
+| `status`  | Meaning                                             |
+| --------- | --------------------------------------------------- |
+| `active`  | A valid license is present                          |
+| `eval`    | Evaluation mode. No issuer key is configured        |
+| `missing` | No license, and the build expects one               |
+| `expired` | The key verified, but its expiry has passed         |
+| `invalid` | The key was rejected, or the build is misconfigured |
+
+`detail` is a sentence explaining the status. An active license also carries `licenseId`, `org`, `plan` and `expiresAt`.
+
+## Exit codes
+
+Always `0`.
+
+## Worked example
+
+```bash
+npx @reticlehq/server status --json | jq -r .license.status
+```
+
+<Card title="Enterprise" icon="building" href="/enterprise">
+  License keys, the roadmap, and the licensing model.
+</Card>

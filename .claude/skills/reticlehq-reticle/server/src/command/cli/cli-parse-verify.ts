@@ -1,0 +1,312 @@
+/**
+ * The `reticle verify` grammar.
+ *
+ * Split out of `cli-parse.ts` when that file crossed the line cap. Cohesive on its own terms: this is
+ * the one command that takes a preview URL, a browser, a timeout, a saved storage state, a session to
+ * pin, a predicate to assert AND a persona to drive as — so it carries more grammar than the rest of
+ * the CLI put together.
+ */
+import {
+  EXPECT_FLAG,
+  HEADED_FLAG,
+  PORT_FLAG,
+  VERIFY_COMMAND,
+  missingOperand,
+  missingValue,
+  notANumber,
+  unknownArgument,
+} from './cli-parse-grammar.js';
+
+const TIMEOUT_FLAG = '--timeout';
+const STORAGE_STATE_FLAG = '--storage-state';
+/** The same predicate, read from a file, which no shell can mangle. See `parseExpect`. */
+const EXPECT_FILE_FLAG = '--expect-file';
+const SESSION_ID_FLAG = '--session-id';
+
+/**
+ * `--expect` and `--storage-state` cannot both be honoured, so the pair is refused rather than
+ * half-applied.
+ *
+ * `--expect` takes its verdict from the tab a running daemon already owns — it binds nothing and
+ * launches nothing, which is exactly what makes it work while the port is busy. There is nowhere in
+ * that path to load a storage state, and the flag was not refused, it was dropped: a restricted-user
+ * absence assertion was graded against a logged-in admin tab and PASSED. A false green is worse than
+ * a missing answer, and the only honest reply to a question this command cannot ask is to say so.
+ */
+const MSG_EXPECT_WITH_STORAGE_STATE =
+  `${EXPECT_FLAG} cannot be combined with ${STORAGE_STATE_FLAG}: the predicate is graded against ` +
+  'the tab the running daemon already owns, so the storage state would never be loaded and the ' +
+  'verdict would be about whoever is signed in there.\n' +
+  `  Use one of them: ${EXPECT_FLAG} on its own asserts against the session you have, and ` +
+  `${STORAGE_STATE_FLAG} without ${EXPECT_FLAG} makes Reticle drive the url with that state and ` +
+  'replay the saved flows.';
+/** Let Reticle drive the app itself and record what it drove, when nothing is saved yet. */
+const EXPLORE_FLAG = '--explore';
+/** Who to be while exploring — a persona, or the business outcome to reach. Implies --explore. */
+const PERSONA_FLAG = '--persona';
+/** Narrow the suite to flows carrying this label. Repeatable — a set is the union of what you name. */
+const SELECT_FLAG = '--select';
+/** Write the per-journey verdicts to this file as JSON, for a CI step that posts them. */
+const RESULTS_JSON_FLAG = '--results-json';
+/** Acknowledge, for this run only, the steps the replay guard holds as destructive ("Place order"). */
+const CONFIRM_DANGEROUS_FLAG = '--confirm-dangerous';
+/** A missing step 1 control on a freshly loaded start page fails the flow (#2061). */
+export const REQUIRE_START_CONTROL_FLAG = '--require-start-control';
+/** Keep judging after a step whose consequence failed, so every step gets a verdict (the score). */
+export const SWEEP_FLAG = '--sweep';
+/** Compare the url with this reference build, and report each difference in what users see. */
+export const AGAINST_FLAG = '--against';
+
+/**
+ * `--against` compares two builds with the same actions. A predicate asks another question, and a
+ * model drive does not repeat its actions, so neither can join it.
+ */
+const MSG_AGAINST_ALONE =
+  `${AGAINST_FLAG} compares two builds with the same actions. It cannot be combined with ` +
+  `${EXPECT_FLAG}, ${EXPECT_FILE_FLAG}, ${EXPLORE_FLAG} or ${PERSONA_FLAG}. Run them as two commands.`;
+
+export type VerifySuffix =
+  | {
+      kind: 'ok';
+      url: string;
+      headless: boolean;
+      port: number;
+      timeoutMs?: number;
+      storageState?: string;
+      sessionId?: string;
+      expect?: unknown;
+      /** A path to read the predicate from, when `--expect-file` was used instead of `--expect`. */
+      expectFile?: string;
+      explore?: boolean;
+      persona?: string;
+      select?: string[];
+      resultsJson?: string;
+      confirmDangerous?: boolean;
+      requireStartControl?: boolean;
+      sweep?: boolean;
+      /** The reference build's url, when the url is to be compared with it. */
+      against?: string;
+    }
+  | { kind: 'error'; message: string };
+
+/**
+ * Parse `verify <url> [--port N] [--headed] [--timeout N] [--storage-state <file>]
+ * [--session-id <id>]`. The first non-flag token is the preview URL. `defaultPort` is already
+ * env + `.reticle.json` + 4400.
+ */
+/**
+ * Read a predicate off the command line, allowing for what a Windows shell did to it on the way.
+ *
+ * `cmd.exe` does not treat `'` as a quote character, so the command every doc and README shows
+ * arrives with LITERAL single quotes around the JSON. That is unambiguous, so it is undone: a
+ * matching pair, and only when what is inside then parses.
+ *
+ * PowerShell calling a native executable strips the INNER double quotes instead, and `{kind:signal}`
+ * is not JSON and cannot be repaired without guessing which bare words were keys and which were
+ * string values. Guessing there would assert something the caller did not write, so it is named
+ * instead — with the two forms that do work, because a predicate that does not parse produces NO
+ * verdict at all, which is the worst of the three possible outcomes.
+ */
+function parseExpect(
+  raw: string,
+): { kind: 'ok'; value: unknown } | { kind: 'error'; message: string } {
+  const unwrapped =
+    raw.length > 1 && raw.startsWith("'") && raw.endsWith("'") ? raw.slice(1, -1) : raw;
+  try {
+    return { kind: 'ok', value: JSON.parse(unwrapped) };
+  } catch {
+    if (looksQuoteStripped(unwrapped)) {
+      return {
+        kind: 'error',
+        message:
+          `${EXPECT_FLAG} received ${unwrapped}, which has had its double quotes removed — that is ` +
+          'PowerShell passing an argument to a native program, not a problem with the predicate. ' +
+          `Use ${EXPECT_FILE_FLAG} <path> (no quoting at all), or escape them: ` +
+          `${EXPECT_FLAG} "{\\"kind\\":\\"signal\\",\\"name\\":\\"order:placed\\"}"`,
+      };
+    }
+    // Named as a JSON problem rather than an unknown argument: the value IS the predicate, and
+    // "unknown argument" would send the reader looking at the flag instead of at their quoting.
+    return {
+      kind: 'error',
+      message: `${EXPECT_FLAG} needs a JSON predicate; could not parse: ${unwrapped}`,
+    };
+  }
+}
+
+/** A JSON object with every double quote gone: braces, a colon, and not one `"` anywhere. */
+function looksQuoteStripped(value: string): boolean {
+  return (
+    value.startsWith('{') && value.endsWith('}') && value.includes(':') && !value.includes('"')
+  );
+}
+
+export function parseVerifySuffix(args: string[], defaultPort: number): VerifySuffix {
+  let headless = true;
+  let url: string | undefined;
+  let timeoutMs: number | undefined;
+  let storageState: string | undefined;
+  let sessionId: string | undefined;
+  let expect: unknown;
+  let expectFile: string | undefined;
+  let explore = false;
+  let persona: string | undefined;
+  const select: string[] = [];
+  let resultsJson: string | undefined;
+  let confirmDangerous = false;
+  let requireStartControl = false;
+  let sweep = false;
+  let against: string | undefined;
+  let port = defaultPort;
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i];
+    if (arg === undefined) {
+      break;
+    }
+    if (arg === HEADED_FLAG) {
+      headless = false;
+    } else if (arg === PORT_FLAG) {
+      i++;
+      const n = args[i];
+      if (n === undefined) {
+        return missingValue(PORT_FLAG);
+      }
+      const parsed = parseInt(n, 10);
+      if (isNaN(parsed)) {
+        return notANumber(PORT_FLAG, n);
+      }
+      port = parsed;
+    } else if (arg === TIMEOUT_FLAG) {
+      i++;
+      const n = args[i];
+      if (n === undefined) {
+        return missingValue(TIMEOUT_FLAG);
+      }
+      const parsed = parseInt(n, 10);
+      if (isNaN(parsed)) {
+        return notANumber(TIMEOUT_FLAG, n);
+      }
+      timeoutMs = parsed;
+    } else if (arg === STORAGE_STATE_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(STORAGE_STATE_FLAG);
+      }
+      storageState = v;
+    } else if (arg === SESSION_ID_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(SESSION_ID_FLAG);
+      }
+      sessionId = v;
+    } else if (arg === SELECT_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(SELECT_FLAG);
+      }
+      // Repeatable rather than comma-split: a label is free-form, and a comma inside one would
+      // silently become two selections that match nothing.
+      select.push(v);
+    } else if (arg === RESULTS_JSON_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(RESULTS_JSON_FLAG);
+      }
+      resultsJson = v;
+    } else if (arg === AGAINST_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(AGAINST_FLAG);
+      }
+      against = v;
+    } else if (arg === EXPLORE_FLAG) {
+      explore = true;
+    } else if (arg === CONFIRM_DANGEROUS_FLAG) {
+      confirmDangerous = true;
+    } else if (arg === REQUIRE_START_CONTROL_FLAG) {
+      requireStartControl = true;
+    } else if (arg === SWEEP_FLAG) {
+      sweep = true;
+    } else if (arg === PERSONA_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(PERSONA_FLAG);
+      }
+      // A persona is what to explore AS, so naming one is asking for the drive. Requiring both
+      // flags would only give a user a way to say something they cannot mean.
+      persona = v;
+      explore = true;
+    } else if (arg === EXPECT_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(EXPECT_FLAG);
+      }
+      const read = parseExpect(v);
+      if ('error' === read.kind) {
+        return read;
+      }
+      expect = read.value;
+    } else if (arg === EXPECT_FILE_FLAG) {
+      i++;
+      const v = args[i];
+      if (v === undefined) {
+        return missingValue(EXPECT_FILE_FLAG);
+      }
+      expectFile = v;
+    } else if (arg.startsWith('--')) {
+      return unknownArgument(arg);
+    } else if (url === undefined) {
+      url = arg;
+    } else {
+      return unknownArgument(arg);
+    }
+    i++;
+  }
+  if (url === undefined) {
+    return missingOperand(VERIFY_COMMAND, 'a url');
+  }
+  // Two ways to say the same thing, and no way to say two different things. Preferring one
+  // silently is how a run asserts something the person did not write.
+  if (expect !== undefined && expectFile !== undefined) {
+    return {
+      kind: 'error',
+      message: `${EXPECT_FLAG} and ${EXPECT_FILE_FLAG} both name the predicate; pass one`,
+    };
+  }
+  if (against !== undefined && (expect !== undefined || expectFile !== undefined || explore)) {
+    return { kind: 'error', message: MSG_AGAINST_ALONE };
+  }
+  // Refused here, where nothing has been bound and no browser exists yet, because the damage this
+  // pair does is a verdict taken against the wrong user. A predicate from a file is the same
+  // predicate, so it is refused the same way.
+  if ((expect !== undefined || expectFile !== undefined) && storageState !== undefined) {
+    return { kind: 'error', message: MSG_EXPECT_WITH_STORAGE_STATE };
+  }
+  return {
+    kind: 'ok',
+    url,
+    headless,
+    port,
+    ...(expect !== undefined ? { expect } : {}),
+    ...(expectFile !== undefined ? { expectFile } : {}),
+    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+    ...(storageState !== undefined ? { storageState } : {}),
+    ...(sessionId !== undefined ? { sessionId } : {}),
+    ...(explore ? { explore } : {}),
+    ...(persona !== undefined ? { persona } : {}),
+    ...(select.length > 0 ? { select } : {}),
+    ...(resultsJson !== undefined ? { resultsJson } : {}),
+    ...(confirmDangerous ? { confirmDangerous } : {}),
+    ...(requireStartControl ? { requireStartControl } : {}),
+    ...(sweep ? { sweep } : {}),
+    ...(against !== undefined ? { against } : {}),
+  };
+}

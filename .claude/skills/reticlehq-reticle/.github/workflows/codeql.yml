@@ -1,0 +1,59 @@
+name: CodeQL
+
+# Static analysis (OpenSSF Scorecard SAST). Scans the TypeScript/JavaScript for injection, unsafe
+# deserialization, path traversal, and the like — the same classes we hand-audit — on PRs, pushes to
+# main, and a weekly schedule so a newly-published query catches an old pattern.
+
+on:
+  push:
+    branches: [main]
+  # Every pull request, whatever it targets. This used to say `branches: [main]`, which came from the
+  # template and meant a pull request into a release or feature branch was never scanned at all. Work
+  # here lands on long-lived branches for weeks before those branches go to main, so that covered the
+  # last merge of a release and none of the ones that built it. The push trigger above did eventually
+  # scan the code, after it was already in.
+  pull_request:
+  # The merge queue builds a fresh commit for each queued pull request, and that commit is what lands
+  # on main. Scanning only the pull request's head left the landed commit unscanned.
+  merge_group:
+  schedule:
+    - cron: '27 4 * * 1' # Mondays, off the hour to avoid the load spike
+
+# A superseded pull-request run holds runners the next one needs; cancel it. Pushes to main and
+# scheduled runs always finish, same rule as ci.yml.
+concurrency:
+  group: '${{ github.workflow }}-${{ github.ref }}'
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload results to the Security tab
+    strategy:
+      matrix:
+        language: [javascript-typescript]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+        with:
+          languages: ${{ matrix.language }}
+          # Broader query set than the default — worth it for a security-adjacent tool.
+          queries: security-and-quality
+          # Scan the code we SHIP. Test fixtures, benchmarks, and one-off scripts are not published;
+          # their unused-var / quality notes are noise on the Security tab, not user-facing risk.
+          config: |
+            paths-ignore:
+              - apps
+              - bench
+              - scripts
+              - '**/*.test.ts'
+              - '**/*.test.mjs'
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
+      - name: Analyze
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3

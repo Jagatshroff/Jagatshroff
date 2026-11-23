@@ -1,0 +1,1391 @@
+use destructive_command_guard::packs::PackRegistry;
+use destructive_command_guard::packs::regex_engine::needs_backtracking_engine;
+use std::collections::{HashMap, HashSet};
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn test_audit_backtracking_requirements() {
+    // Map of PackID -> Set of Pattern Names that require backtracking.
+    //
+    // This map, not `docs/pattern_audit.md`, is the source of truth: the test
+    // below derives the actual answer from `needs_backtracking_engine` and
+    // fails on any mismatch in either direction. The doc predates several packs
+    // and is not kept in sync.
+    let expected_backtracking: HashMap<&str, HashSet<&str>> = HashMap::from([
+        (
+            "apigateway.apigee",
+            HashSet::from([
+                "apigeecli-apis-get",
+                "apigeecli-apis-list",
+                "apigeecli-developers-get",
+                "apigeecli-developers-list",
+                "apigeecli-envs-get",
+                "apigeecli-envs-list",
+                "apigeecli-orgs-get",
+                "apigeecli-orgs-list",
+                "apigeecli-products-get",
+                "apigeecli-products-list",
+                "gcloud-apigee-apis-describe",
+                "gcloud-apigee-apis-list",
+                "gcloud-apigee-deployments-describe",
+                "gcloud-apigee-deployments-list",
+                "gcloud-apigee-developers-describe",
+                "gcloud-apigee-developers-list",
+                "gcloud-apigee-environments-describe",
+                "gcloud-apigee-environments-list",
+                "gcloud-apigee-organizations-describe",
+                "gcloud-apigee-organizations-list",
+                "gcloud-apigee-products-describe",
+                "gcloud-apigee-products-list",
+            ]),
+        ),
+        (
+            "apigateway.aws",
+            HashSet::from([
+                "apigateway-get-api-key",
+                "apigateway-get-api-keys",
+                "apigateway-get-authorizers",
+                "apigateway-get-deployment",
+                "apigateway-get-deployments",
+                "apigateway-get-domain-names",
+                "apigateway-get-method",
+                "apigateway-get-models",
+                "apigateway-get-resource",
+                "apigateway-get-resources",
+                "apigateway-get-rest-api",
+                "apigateway-get-rest-apis",
+                "apigateway-get-stage",
+                "apigateway-get-stages",
+                "apigateway-get-usage-plans",
+                "apigateway-help",
+                "apigatewayv2-get-api",
+                "apigatewayv2-get-apis",
+                "apigatewayv2-get-authorizers",
+                "apigatewayv2-get-domain-names",
+                "apigatewayv2-get-integration",
+                "apigatewayv2-get-integrations",
+                "apigatewayv2-get-route",
+                "apigatewayv2-get-routes",
+                "apigatewayv2-get-stage",
+                "apigatewayv2-get-stages",
+                "apigatewayv2-help",
+            ]),
+        ),
+        (
+            "apigateway.kong",
+            HashSet::from([
+                "deck-convert",
+                "deck-diff",
+                "deck-dump",
+                "deck-file",
+                "deck-help",
+                "deck-ping",
+                "deck-validate",
+                "deck-version",
+                "kong-admin-explicit-get",
+                "kong-check",
+                "kong-config-parse",
+                "kong-health",
+                "kong-help",
+                "kong-version",
+            ]),
+        ),
+        (
+            "backup.borg",
+            HashSet::from([
+                "borg-check",
+                "borg-create",
+                "borg-diff",
+                "borg-extract",
+                "borg-info",
+                "borg-list",
+                "borg-mount",
+            ]),
+        ),
+        (
+            "backup.rclone",
+            HashSet::from([
+                "rclone-check",
+                "rclone-config",
+                "rclone-copy",
+                "rclone-ls",
+                "rclone-lsd",
+                "rclone-lsl",
+                "rclone-size",
+            ]),
+        ),
+        (
+            "cicd.jenkins",
+            HashSet::from(["jenkins-curl-do-delete", "jenkins-curl-explicit-get"]),
+        ),
+        (
+            "backup.restic",
+            HashSet::from([
+                "restic-backup",
+                "restic-check",
+                "restic-diff",
+                "restic-find",
+                "restic-ls",
+                "restic-restore",
+                "restic-snapshots",
+                "restic-stats",
+            ]),
+        ),
+        (
+            "backup.velero",
+            HashSet::from([
+                "velero-backup-create",
+                "velero-backup-describe",
+                "velero-backup-get",
+                "velero-backup-logs",
+                "velero-restore-create",
+                "velero-schedule-get",
+                "velero-version",
+            ]),
+        ),
+        (
+            "cdn.cloudflare_workers",
+            HashSet::from([
+                "wrangler-d1-info",
+                "wrangler-d1-list",
+                "wrangler-dev",
+                "wrangler-help",
+                "wrangler-kv-get",
+                "wrangler-kv-list",
+                "wrangler-kv-namespace-list",
+                "wrangler-r2-bucket-list",
+                "wrangler-r2-object-get",
+                "wrangler-tail",
+                "wrangler-version",
+                "wrangler-whoami",
+            ]),
+        ),
+        (
+            "cdn.fastly",
+            HashSet::from([
+                "fastly-backend-describe",
+                "fastly-backend-list",
+                "fastly-domain-describe",
+                "fastly-domain-list",
+                "fastly-help",
+                "fastly-profile",
+                "fastly-service-describe",
+                "fastly-service-list",
+                "fastly-service-search",
+                "fastly-vcl-describe",
+                "fastly-vcl-list",
+                "fastly-version",
+                "fastly-version-list",
+                "fastly-whoami",
+            ]),
+        ),
+        (
+            "cicd.github_actions",
+            HashSet::from([
+                "gh-actions-api-delete-secrets",
+                "gh-actions-api-delete-variables",
+                "gh-actions-api-explicit-get",
+                "gh-actions-run-cancel",
+                "gh-actions-run-list",
+                "gh-actions-run-view",
+                "gh-actions-secret-list",
+                "gh-actions-secret-remove",
+                "gh-actions-variable-list",
+                "gh-actions-variable-remove",
+                "gh-actions-workflow-disable",
+                "gh-actions-workflow-list",
+                "gh-actions-workflow-view",
+            ]),
+        ),
+        (
+            "cloud.aws",
+            HashSet::from([
+                "athena-delete-with-where",
+                "ec2-delete-dry-run",
+                "ec2-terminate-dry-run",
+                "s3-cp",
+                "s3-ls",
+                "sts-identity",
+            ]),
+        ),
+        (
+            "cloud.azure",
+            HashSet::from([
+                "az-help",
+                "az-help-short",
+                "az-list",
+                "az-show",
+                // `az account` descendants and the management-group guard
+                // on `group-delete` (#384).
+                "group-delete",
+                "account-alias-delete",
+                "account-clear",
+                "account-lock-delete",
+                "account-management-group-delete",
+                "account-management-group-hierarchy-settings-delete",
+                "account-management-group-subscription-remove",
+                "account-subscription-cancel",
+            ]),
+        ),
+        (
+            "cloud.gcp",
+            HashSet::from([
+                "gcloud-auth",
+                "gcloud-config",
+                "gcloud-describe",
+                "gcloud-info",
+                "gcloud-list",
+                "gsutil-cp",
+                "gsutil-ls",
+                "gsutil-rb",
+            ]),
+        ),
+        (
+            "containers.compose",
+            HashSet::from(["compose-down-no-volumes"]),
+        ),
+        (
+            "containers.docker",
+            HashSet::from([
+                "docker-build",
+                "docker-exec",
+                "docker-images",
+                "docker-inspect",
+                "docker-logs",
+                "docker-ps",
+                "docker-pull",
+                "docker-run",
+                "docker-stats",
+                // #548: the force flag must be an option word of this docker
+                // command. Atomic groups keep each shell word whole, and a
+                // lookahead ends the flag at a word boundary.
+                "rm-force",
+                "rmi-force",
+            ]),
+        ),
+        (
+            "containers.podman",
+            HashSet::from([
+                "podman-build",
+                "podman-exec",
+                "podman-images",
+                "podman-inspect",
+                "podman-logs",
+                "podman-ps",
+                "podman-pull",
+                "podman-run",
+                // #548: scoped to podman's own option words, as in docker.
+                "rm-force",
+                "rmi-force",
+            ]),
+        ),
+        (
+            "core.filesystem",
+            HashSet::from([
+                "rm-f-r-tmp",
+                "rm-f-r-tmpdir",
+                "rm-f-r-tmpdir-brace",
+                "rm-f-r-var-tmp",
+                "rm-force-recursive-tmp",
+                "rm-force-recursive-tmpdir",
+                "rm-force-recursive-tmpdir-brace",
+                "rm-force-recursive-var-tmp",
+                "rm-fr-tmp",
+                "rm-fr-tmpdir",
+                "rm-fr-tmpdir-brace",
+                "rm-fr-tmpdir-brace-quoted",
+                "rm-fr-tmpdir-quoted",
+                "rm-fr-var-tmp",
+                "rm-r-f-tmp",
+                "rm-r-f-tmpdir",
+                "rm-r-f-tmpdir-brace",
+                "rm-r-f-var-tmp",
+                "rm-recursive-force-tmp",
+                "rm-recursive-force-tmpdir",
+                "rm-recursive-force-tmpdir-brace",
+                "rm-recursive-force-var-tmp",
+                "rm-rf-tmp",
+                "rm-rf-tmpdir",
+                "rm-rf-tmpdir-brace",
+                "rm-rf-tmpdir-brace-quoted",
+                "rm-rf-tmpdir-quoted",
+                "rm-rf-var-tmp",
+                "cp-sensitive-then-delete",
+                "dd-overwrite-general",
+                "dd-overwrite-root-home",
+                "dd-tmp",
+                "dd-tmpdir",
+                "dd-tmpdir-brace",
+                "dd-var-tmp",
+                "find-delete-root-home",
+                "find-delete-tmp",
+                "find-delete-tmpdir",
+                "find-delete-tmpdir-brace",
+                "find-delete-var-tmp",
+                // Same `$`/backtick guard as find-delete-tmp, plus "no
+                // backslash except the terminating `\;`": lookaheads.
+                "find-exec-rm-tmp",
+                "find-exec-rm-var-tmp",
+                "ln-symlink-sensitive-then-delete",
+                // #550: `mv` must be a whole shell word, which takes a
+                // lookbehind and a lookahead around the command word.
+                "mv-dynamic-path",
+                "mv-relative-into-home",
+                "mv-sensitive-source-root-home",
+                "mv-tmp",
+                "mv-tmpdir",
+                "mv-tmpdir-brace",
+                "mv-to-trash",
+                "mv-to-trash-quoted",
+                "mv-var-tmp",
+                "mv-within-home",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so the
+                // second `>` of `>>` cannot start a second match of its own.
+                "redirect-append-git-internals-relative",
+                "redirect-truncate-dynamic-path",
+                // Shares the `(?<![<>])` lookbehind its siblings use, so a
+                // read redirect (`<`) or an append (`>>`) is not read as a
+                // truncating one.
+                "redirect-truncate-git-internals-relative",
+                "redirect-truncate-root-home",
+                // Needs a negative lookahead (no `--dry-run`/`-n` in the
+                // segment) and a positive one (`--delete*` present anywhere
+                // before the destination), neither of which is linear.
+                "rsync-delete-sensitive-dest",
+                "rsync-sensitive-then-delete",
+                "shred-root-home",
+                "shred-tmp",
+                "shred-tmpdir",
+                "shred-tmpdir-brace",
+                "shred-var-tmp",
+                "tar-remove-files-root-home",
+                "tar-remove-files-tmp",
+                "tar-remove-files-tmpdir",
+                "tar-remove-files-tmpdir-brace",
+                "tar-remove-files-var-tmp",
+                "truncate-tmp",
+                "truncate-tmpdir",
+                "truncate-tmpdir-brace",
+                "truncate-var-tmp",
+                "truncate-zero-general",
+                "truncate-zero-root-home",
+                "unlink-root-home",
+                "unlink-tmp",
+                "unlink-tmpdir",
+                "unlink-tmpdir-brace",
+                "unlink-var-tmp",
+                // Backreferences enforce that the fork-bomb's three
+                // identifiers are the same token (issue #302).
+                "fork-bomb",
+            ]),
+        ),
+        (
+            "core.git",
+            HashSet::from([
+                // `git rm --force` must not fire on `--cached`, `--dry-run`
+                // or `-n`, and "none of these appear in this segment" is a
+                // negative lookahead.
+                "rm-force",
+                // `git checkout .` must not fire on `checkout -b .` or
+                // `checkout --orphan .`, and "not one of these subcommands" is
+                // a pair of negative lookaheads, so this rule is on the
+                // backtracking engine like its `checkout-ref-discard` sibling.
+                "checkout-discard-cwd",
+                "checkout-ref-discard",
+                // `git rm -f` must not fire with `--cached` (worktree kept) or
+                // a dry run anywhere in the segment: a negative lookahead.
+                "rm-force",
+                // The clean and reset rules walk from the subcommand to their
+                // flag over git's real option-parsing window, which ends at a
+                // bare `--` (#429, #434). "Not a bare `--`" is a negative
+                // lookahead, so these rules run on the backtracking engine.
+                "clean-dry-run-long",
+                "clean-dry-run-short",
+                "clean-force",
+                "reset-hard",
+                "reset-merge",
+                "push-force-long",
+                "restore-staged-long",
+                "restore-staged-short",
+                "restore-worktree",
+                // Backreference pins redirect target == shown path (#373).
+                "show-redirect-overwrite-source",
+                // `--reset` and `-u` may appear in either order, so each is
+                // a positive lookahead from the subcommand.
+                "read-tree-reset",
+                // Git LFS verb guards (Refs PR #383). `lfs-prune-dry-run` ran
+                // on the linear engine after 91715d5 replaced its trailing
+                // `(?![\w-])` lookahead with `(?:\s|$)`; it is back here
+                // because its walk to `--dry-run` now stops at a bare `--`
+                // (#429), which is a negative lookahead.
+                "lfs-migrate-rewrite",
+                "lfs-prune-dry-run",
+                "lfs-prune",
+                "lfs-uninstall",
+            ]),
+        ),
+        (
+            "database.mongodb",
+            HashSet::from([
+                "mongo-aggregate",
+                "mongo-count",
+                "mongo-explain",
+                "mongo-find",
+                "mongodump-no-drop",
+            ]),
+        ),
+        // `truncate-table` needs the backtracking engine on purpose: separating
+        // SQL DDL from Tailwind's `truncate` utility class costs a
+        // punctuation-aware lookbehind and a "not followed by a hyphenated
+        // token" lookahead (issue #403). These packs are opt-in and the
+        // expression is anchored on a literal keyword, so the cost is bounded.
+        (
+            "database.mysql",
+            // drop-column / update-without-where: the shared SQL expressions
+            // (database::DROP_COLUMN_PATTERN, UPDATE_WITHOUT_WHERE_PATTERN).
+            HashSet::from([
+                "drop-column",
+                "mysqldump-no-drop",
+                "truncate-table",
+                "update-without-where",
+            ]),
+        ),
+        (
+            "database.postgresql",
+            HashSet::from([
+                // `DROP` not followed by a metadata-only target (DEFAULT,
+                // NOT NULL, CONSTRAINT, …): a negative lookahead.
+                "drop-column",
+                "pg-dump-no-clean",
+                "truncate-table",
+                // `SET` with no `WHERE` before the statement ends: a tempered
+                // negative lookahead.
+                "update-without-where",
+            ]),
+        ),
+        (
+            "database.redis",
+            HashSet::from([
+                "redis-config-get",
+                "redis-dbsize",
+                "redis-get",
+                "redis-info",
+                "redis-keys",
+                "redis-scan",
+            ]),
+        ),
+        (
+            "database.sqlite",
+            HashSet::from(["drop-column", "update-without-where"]),
+        ),
+        ("dns.generic", HashSet::from(["dns-dig-safe"])),
+        (
+            "dns.cloudflare",
+            HashSet::from([
+                "cloudflare-api-delete-dns-record",
+                "cloudflare-api-delete-zone",
+                "cloudflare-api-get",
+            ]),
+        ),
+        (
+            "email.ses",
+            HashSet::from([
+                "ses-get-send-quota",
+                "ses-get-template",
+                "ses-list-identities",
+                "ses-list-templates",
+                "sesv2-get-account",
+            ]),
+        ),
+        (
+            "featureflags.flipt",
+            HashSet::from([
+                "flipt-config",
+                "flipt-evaluate",
+                "flipt-flag-create",
+                "flipt-flag-get",
+                "flipt-flag-list",
+                "flipt-flag-update",
+                "flipt-help",
+                "flipt-namespace-create",
+                "flipt-namespace-get",
+                "flipt-namespace-list",
+                "flipt-rule-create",
+                "flipt-rule-get",
+                "flipt-rule-list",
+                "flipt-segment-create",
+                "flipt-segment-get",
+                "flipt-segment-list",
+                "flipt-server",
+                "flipt-version",
+            ]),
+        ),
+        (
+            "featureflags.launchdarkly",
+            HashSet::from([
+                "launchdarkly-api-delete-environments",
+                "launchdarkly-api-delete-flags",
+                "launchdarkly-api-delete-generic",
+                "launchdarkly-api-delete-projects",
+                "launchdarkly-api-delete-segments",
+                "launchdarkly-api-get",
+                "ldcli-environments-create",
+                "ldcli-environments-get",
+                "ldcli-environments-list",
+                "ldcli-flags-create",
+                "ldcli-flags-get",
+                "ldcli-flags-list",
+                "ldcli-flags-update",
+                "ldcli-help",
+                "ldcli-metrics-get",
+                "ldcli-metrics-list",
+                "ldcli-projects-create",
+                "ldcli-projects-get",
+                "ldcli-projects-list",
+                "ldcli-segments-create",
+                "ldcli-segments-get",
+                "ldcli-segments-list",
+                "ldcli-version",
+            ]),
+        ),
+        (
+            "featureflags.split",
+            HashSet::from([
+                "split-api-delete-environments",
+                "split-api-delete-generic",
+                "split-api-delete-segments",
+                "split-api-delete-splits",
+                "split-api-get",
+                "split-environments-create",
+                "split-environments-get",
+                "split-environments-list",
+                "split-help",
+                "split-segments-create",
+                "split-segments-get",
+                "split-segments-list",
+                "split-splits-create",
+                "split-splits-get",
+                "split-splits-list",
+                "split-splits-update",
+                "split-traffic-types-get",
+                "split-traffic-types-list",
+                "split-version",
+                "split-workspaces-get",
+                "split-workspaces-list",
+            ]),
+        ),
+        (
+            "featureflags.unleash",
+            HashSet::from([
+                "unleash-environments-get",
+                "unleash-environments-list",
+                "unleash-api-delete-features",
+                "unleash-api-delete-generic",
+                "unleash-api-delete-projects",
+                "unleash-api-get",
+                "unleash-features-create",
+                "unleash-features-enable",
+                "unleash-features-get",
+                "unleash-features-list",
+                "unleash-features-update",
+                "unleash-help",
+                "unleash-projects-create",
+                "unleash-projects-get",
+                "unleash-projects-list",
+                "unleash-strategies-get",
+                "unleash-strategies-list",
+                "unleash-version",
+            ]),
+        ),
+        (
+            "infrastructure.ansible",
+            HashSet::from(["playbook-all-hosts"]),
+        ),
+        (
+            "infrastructure.atmos",
+            HashSet::from([
+                "atmos-clean",
+                "atmos-deploy",
+                "atmos-destroy",
+                "atmos-helmfile-destroy",
+                "atmos-helmfile-diff",
+                "atmos-terraform-apply",
+                "atmos-terraform-output",
+                "atmos-terraform-plan",
+                "atmos-terraform-validate",
+            ]),
+        ),
+        (
+            "infrastructure.pulumi",
+            HashSet::from([
+                "destroy",
+                "pulumi-about",
+                "pulumi-config",
+                "pulumi-logs",
+                "pulumi-preview",
+                "pulumi-stack-init",
+                "pulumi-stack-ls",
+                "pulumi-stack-select",
+                "pulumi-version",
+                "pulumi-whoami",
+            ]),
+        ),
+        (
+            "infrastructure.terraform",
+            HashSet::from([
+                "destroy",
+                "terraform-fmt",
+                "terraform-graph",
+                "terraform-init",
+                "terraform-output",
+                "terraform-plan",
+                "terraform-providers",
+                "terraform-show",
+                "terraform-state-list",
+                "terraform-state-show",
+                "terraform-validate",
+                "terraform-version",
+            ]),
+        ),
+        (
+            "kubernetes.helm",
+            // Destructive uninstall/rollback no longer contain preview
+            // vetoes (#435). Only the read-only verb-boundary lookaheads
+            // need backtracking; the argument-aware preview proof is linear.
+            HashSet::from([
+                "helm-diff",
+                "helm-get",
+                "helm-history",
+                "helm-inspect",
+                "helm-lint",
+                "helm-list",
+                "helm-repo",
+                "helm-search",
+                "helm-show",
+                "helm-status",
+                "helm-template",
+            ]),
+        ),
+        (
+            "kubernetes.kubectl",
+            HashSet::from([
+                // The `api-delete-*` rules (#449) use lookahead to require the
+                // DELETE method and the resource path independently of the
+                // order `curl` happens to put them in, so they need the
+                // backtracking engine.
+                "api-delete-collection",
+                "api-delete-namespace",
+                "api-delete-persistent-storage",
+                "api-delete-workload",
+                // `--prune` without a `--dry-run` anywhere in the command: a
+                // negative lookahead.
+                "apply-prune",
+                "delete-from-stdin",
+                "kubectl-api",
+                "kubectl-config",
+                "kubectl-describe",
+                "kubectl-diff",
+                "kubectl-explain",
+                "kubectl-get",
+                "kubectl-logs",
+                "kubectl-top",
+                "kubectl-version",
+            ]),
+        ),
+        // #435 removes redundant render exemptions and destructive preview
+        // vetoes. The remaining positive proof and delete rules are linear.
+        ("kubernetes.kustomize", HashSet::new()),
+        (
+            "loadbalancer.traefik",
+            HashSet::from([
+                "traefik-api-delete",
+                "traefik-api-get",
+                "traefik-api-read",
+                "traefik-healthcheck",
+                "traefik-version",
+            ]),
+        ),
+        (
+            "messaging.kafka",
+            HashSet::from([
+                "kafka-acls-list",
+                "kafka-configs-describe",
+                "kafka-consumer-groups-describe",
+                "kafka-consumer-groups-list",
+                "kafka-topics-describe",
+                "kafka-topics-list",
+            ]),
+        ),
+        (
+            "messaging.nats",
+            HashSet::from([
+                "nats-bench",
+                "nats-consumer-info",
+                "nats-consumer-ls",
+                "nats-kv-get",
+                "nats-kv-ls",
+                "nats-pub",
+                "nats-server-info",
+                "nats-stream-info",
+                "nats-stream-ls",
+                "nats-sub",
+            ]),
+        ),
+        (
+            "monitoring.datadog",
+            HashSet::from([
+                "datadog-api-delete",
+                "datadog-api-get",
+                "datadog-ci-dashboards-list",
+                "datadog-ci-monitors-list",
+            ]),
+        ),
+        (
+            "monitoring.newrelic",
+            HashSet::from([
+                "newrelic-apm-app-get",
+                "newrelic-api-delete",
+                "newrelic-api-get",
+                "newrelic-entity-search",
+                "newrelic-graphql-delete-mutation",
+                "newrelic-query",
+            ]),
+        ),
+        (
+            "monitoring.pagerduty",
+            HashSet::from([
+                "pagerduty-api-delete-schedule",
+                "pagerduty-api-delete-service",
+                "pagerduty-api-get",
+            ]),
+        ),
+        (
+            "monitoring.prometheus",
+            HashSet::from([
+                "grafana-api-delete-alert-notification",
+                "grafana-api-delete-dashboard",
+                "grafana-api-delete-datasource",
+                "grafana-api-get",
+                "prometheus-api-get",
+                "prometheus-tsdb-delete-series",
+            ]),
+        ),
+        (
+            "monitoring.splunk",
+            HashSet::from(["splunk-list", "splunk-search", "splunk-show"]),
+        ),
+        (
+            "package_managers",
+            HashSet::from([
+                "apt-get-list",
+                "apt-list",
+                "apt-remove",
+                "brew-uninstall",
+                "cargo-publish",
+                "cargo-yank",
+                "npm-audit",
+                "npm-install",
+                "npm-list",
+                "npm-publish",
+                "npm-unpublish",
+                "pip-list",
+                "pip-uninstall",
+                "pnpm-install",
+                "pnpm-publish",
+                "poetry-env-list",
+                "poetry-publish",
+                "poetry-remove",
+                "poetry-show",
+                "yarn-add",
+                "yarn-audit",
+                "yarn-list",
+                "yarn-publish",
+                "yum-remove",
+            ]),
+        ),
+        (
+            "payment.braintree",
+            HashSet::from(["braintree-api-delete", "braintree-api-get"]),
+        ),
+        ("payment.square", HashSet::from(["square-api-get"])),
+        (
+            "payment.stripe",
+            HashSet::from(["stripe-api-delete", "stripe-api-get"]),
+        ),
+        (
+            // Azure DevOps CLI extension (#385): every rule uses `(?<![\w-])`
+            // / `(?![\w-])` verb guards, so the whole pack backtracks.
+            "platform.azure_devops",
+            HashSet::from([
+                "az-devops-help",
+                "az-devops-help-short",
+                "boards-classification-node-delete",
+                "boards-work-item-delete",
+                "devops-extension-uninstall",
+                "devops-invoke-delete",
+                "devops-invoke-write",
+                "devops-logout",
+                "devops-project-delete",
+                "devops-security-group-delete",
+                "devops-security-group-membership-remove",
+                "devops-security-permission-reset",
+                "devops-security-permission-reset-all",
+                "devops-service-endpoint-delete",
+                "devops-team-delete",
+                "devops-user-remove",
+                "devops-wiki-delete",
+                "devops-wiki-page-delete",
+                "pipelines-delete",
+                "pipelines-folder-delete",
+                "pipelines-variable-delete",
+                "pipelines-variable-group-delete",
+                "repos-delete",
+                "repos-policy-delete",
+                "repos-ref-delete",
+            ]),
+        ),
+        (
+            "platform.github",
+            HashSet::from([
+                "gh-api-delete-actions-secret",
+                "gh-api-delete-actions-variable",
+                "gh-api-delete-deploy-key",
+                "gh-api-delete-generic",
+                "gh-api-delete-hook",
+                "gh-api-delete-release",
+                "gh-api-delete-repo",
+                "gh-api-explicit-get",
+                "gh-auth-status",
+                "gh-gist-delete",
+                "gh-gist-list-view",
+                "gh-help",
+                "gh-help-short",
+                "gh-help-topic",
+                "gh-issue-delete",
+                "gh-issue-list-view",
+                "gh-release-delete",
+                "gh-release-delete-asset",
+                "gh-release-list-view",
+                "gh-repo-archive",
+                "gh-repo-delete",
+                "gh-repo-deploy-key-delete",
+                "gh-repo-list-view",
+                "gh-run-cancel",
+                "gh-repo-visibility-change",
+                "gh-secret-delete",
+                "gh-secret-list",
+                "gh-ssh-key-delete",
+                "gh-ssh-key-list",
+                "gh-status",
+                "gh-variable-delete",
+                "gh-variable-list",
+            ]),
+        ),
+        (
+            // Kamal patterns deliberately use a leading negative lookbehind
+            // so embedded words such as `mykamal` cannot match, plus bounded
+            // flag-skipping groups between the CLI and subcommand.
+            "platform.kamal",
+            HashSet::from([
+                "kamal-audit",
+                "kamal-details",
+                "kamal-config",
+                "kamal-secrets",
+                "kamal-deploy",
+                "kamal-redeploy",
+                "kamal-setup",
+                "kamal-build",
+                "kamal-rollback",
+                "kamal-upgrade",
+                "kamal-registry",
+                "kamal-lock",
+                "kamal-server-bootstrap",
+                "kamal-init",
+                "kamal-docs",
+                "kamal-help",
+                "kamal-version",
+                "kamal-app-safe",
+                "kamal-accessory-safe",
+                "kamal-proxy-safe",
+                "kamal-remove",
+                "kamal-accessory-remove",
+                "kamal-app-remove",
+                "kamal-app-stop",
+                "kamal-proxy-remove",
+                "kamal-proxy-reboot",
+                "kamal-proxy-stop",
+                "kamal-accessory-reboot",
+                "kamal-accessory-stop",
+                "kamal-prune",
+            ]),
+        ),
+        (
+            // Modal patterns are command-token anchored with a negative
+            // lookbehind. Two safe patterns additionally use negative
+            // lookahead to express "create without --force" and "rm without
+            // -r". These are intentional fancy-regex patterns, not accidental
+            // backtracking regressions.
+            "platform.modal",
+            HashSet::from([
+                "modal-volume-list",
+                "modal-volume-get",
+                "modal-volume-create",
+                "modal-app-readonly",
+                "modal-container-readonly",
+                "modal-secret-list",
+                "modal-secret-create-no-force",
+                "modal-environment-list",
+                "modal-environment-mutate",
+                "modal-dict-readonly",
+                "modal-queue-readonly",
+                "modal-shell",
+                "modal-deploy",
+                "modal-token",
+                "modal-volume-rm",
+                "modal-environment-delete",
+                "modal-volume-delete",
+                "modal-secret-delete",
+                "modal-dict-delete",
+                "modal-queue-delete",
+                "modal-app-stop",
+                "modal-container-stop",
+                "modal-volume-rm-recursive",
+                "modal-dict-clear",
+                "modal-queue-clear",
+                "modal-secret-create-force",
+            ]),
+        ),
+        (
+            // Railway patterns share the same command-token lookbehind and
+            // bounded flag-skipping grammar as the other hosted-platform
+            // CLIs. Database-variable rules also use quote-aware lookarounds.
+            "platform.railway",
+            HashSet::from([
+                "railway-status",
+                "railway-project-list",
+                "railway-project-subcommand-list",
+                "railway-whoami",
+                "railway-logs",
+                "railway-service-list",
+                "railway-function-list",
+                "railway-environment-list",
+                "railway-volume-list",
+                "railway-variable-list",
+                "railway-project-delete",
+                "railway-project-subcommand-delete",
+                "railway-environment-delete",
+                "railway-service-delete",
+                "railway-function-delete",
+                "railway-volume-delete",
+                "railway-volume-detach",
+                "railway-variable-delete",
+                "railway-database-variable-set",
+                "railway-database-variable-legacy-set",
+                "railway-deployment-remove",
+            ]),
+        ),
+        (
+            "remote.scp",
+            HashSet::from(["scp-to-home", "scp-to-tmp", "scp-to-var-tmp"]),
+        ),
+        (
+            "search.elasticsearch",
+            HashSet::from([
+                "es-curl-close-index",
+                "es-curl-cluster-settings",
+                "es-curl-delete-by-query",
+                "es-curl-delete-doc",
+                "es-curl-delete-index",
+                "es-curl-get-cat",
+                "es-curl-get-cluster-health",
+                "es-curl-get-search",
+            ]),
+        ),
+        (
+            "search.meilisearch",
+            HashSet::from([
+                "meili-curl-delete-batch",
+                "meili-curl-delete-document",
+                "meili-curl-delete-documents",
+                "meili-curl-delete-index",
+                "meili-curl-delete-key",
+                "meili-curl-get-health",
+                "meili-curl-get-stats",
+                "meili-curl-get-version",
+                "meili-curl-search",
+            ]),
+        ),
+        (
+            "search.opensearch",
+            HashSet::from([
+                "os-curl-close-index",
+                "os-curl-delete-by-query",
+                "os-curl-delete-doc",
+                "os-curl-delete-index",
+                "os-curl-get-cat",
+                "os-curl-get-cluster-health",
+                "os-curl-get-search",
+            ]),
+        ),
+        (
+            "secrets.aws_secrets",
+            HashSet::from([
+                "aws-secretsmanager-describe",
+                "aws-secretsmanager-get",
+                "aws-secretsmanager-get-random-password",
+                "aws-secretsmanager-get-resource-policy",
+                "aws-secretsmanager-list",
+                "aws-secretsmanager-list-versions",
+                "aws-ssm-describe-parameters",
+                "aws-ssm-get-parameter",
+                "aws-ssm-get-parameters",
+            ]),
+        ),
+        (
+            "secrets.doppler",
+            HashSet::from([
+                "doppler-configs-list",
+                "doppler-configure",
+                "doppler-environments-list",
+                "doppler-projects-list",
+                "doppler-run",
+                "doppler-secrets-get",
+                "doppler-secrets-list",
+                "doppler-setup",
+            ]),
+        ),
+        (
+            "secrets.onepassword",
+            HashSet::from([
+                "op-account-get",
+                "op-document-get",
+                "op-group-list",
+                "op-item-get",
+                "op-item-list",
+                "op-read",
+                "op-user-list",
+                "op-vault-get",
+                "op-vault-list",
+                "op-whoami",
+            ]),
+        ),
+        (
+            "secrets.vault",
+            HashSet::from([
+                "vault-audit-list",
+                "vault-auth-list",
+                "vault-kv-get",
+                "vault-kv-list",
+                "vault-lease-lookup",
+                "vault-policy-list",
+                "vault-read",
+                "vault-secrets-list",
+                "vault-status",
+                "vault-token-lookup",
+                "vault-version",
+            ]),
+        ),
+        (
+            "storage.azure_blob",
+            HashSet::from([
+                "az-storage-account-keys-list",
+                "az-storage-account-list",
+                "az-storage-account-show",
+                "az-storage-blob-download",
+                "az-storage-blob-download-batch",
+                "az-storage-blob-exists",
+                "az-storage-blob-list",
+                "az-storage-blob-metadata-show",
+                "az-storage-blob-show",
+                "az-storage-blob-url",
+                "az-storage-container-exists",
+                "az-storage-container-list",
+                "az-storage-container-show",
+                "azcopy-copy",
+                "azcopy-env",
+                "azcopy-jobs-list",
+                "azcopy-jobs-show",
+                "azcopy-list",
+                "azcopy-login",
+            ]),
+        ),
+        (
+            "storage.gcs",
+            HashSet::from([
+                "gcloud-storage-buckets-describe",
+                "gcloud-storage-buckets-list",
+                "gcloud-storage-cat",
+                "gcloud-storage-cp",
+                "gcloud-storage-ls",
+                "gcloud-storage-objects-describe",
+                "gcloud-storage-objects-list",
+                "gsutil-cat",
+                "gsutil-cp",
+                "gsutil-du",
+                "gsutil-hash",
+                "gsutil-help",
+                "gsutil-ls",
+                "gsutil-rb",
+                "gsutil-rm",
+                "gsutil-stat",
+                "gsutil-version",
+            ]),
+        ),
+        (
+            "storage.minio",
+            HashSet::from([
+                "mc-admin-info",
+                "mc-admin-policy-list",
+                "mc-admin-user-list",
+                "mc-alias-list",
+                "mc-cat",
+                "mc-cp",
+                "mc-diff",
+                "mc-du",
+                "mc-find",
+                "mc-head",
+                "mc-ls",
+                "mc-stat",
+                "mc-version",
+            ]),
+        ),
+        (
+            "storage.s3",
+            HashSet::from([
+                "s3-copy",
+                "s3-list",
+                "s3-mb",
+                "s3-presign",
+                "s3-rm-dryrun",
+                "s3-sync-delete-dryrun",
+                "s3-sync-dryrun-delete",
+                "s3api-delete-object",
+                "s3api-get-object",
+                "s3api-head-object",
+                "s3api-list-objects",
+            ]),
+        ),
+        (
+            "system.disk",
+            // #448 moved this set in both directions at once.
+            //
+            // The eight `btrfs-*` and five `dmsetup-*` read-only patterns were
+            // here and are gone: anchoring them to command position replaced
+            // the unbounded prefix that forced the backtracking engine, so
+            // they now run on the linear one. That is a straight win, and
+            // leaving them listed would have kept a stale claim in a file
+            // whose whole job is to be exact.
+            //
+            // The three that arrived need it for reasons the linear engine
+            // cannot express: `dd-discard` uses lookaround for the `/dev/`
+            // carve-out, and `tee-device`/`copy-to-device` additionally
+            // capture the opening quote and match it with a `\1`
+            // backreference.
+            //
+            // The two GPT rules (#456) join them for the same reason as
+            // `fdisk-edit`: `gdisk-edit` excludes `-l` with a lookahead, and
+            // `sgdisk-modify` is built out of three of them — the dry-run
+            // withdrawal, the device requirement, and the "this option is not
+            // one of the read-only ones" test.
+            //
+            // `sfdisk-modify` is `sgdisk-modify`'s shape inverted: sfdisk writes
+            // even with no option (a layout on stdin), so it is denied unless a
+            // read-only option is present, which only a negative lookahead can
+            // say, plus the same `/dev/` requirement.
+            //
+            // `ddrescue-device` needs `-f`/`--force` anywhere in the segment
+            // AND a `/dev/` operand, in either order: a positive lookahead.
+            HashSet::from([
+                "copy-to-device",
+                "dd-discard",
+                "ddrescue-device",
+                "fdisk-edit",
+                "gdisk-edit",
+                "parted-modify",
+                "sfdisk-modify",
+                "sgdisk-modify",
+                "tee-device",
+                // #548: the force flag must be an option word of this umount
+                // command; atomic word groups and a word-end lookahead.
+                "umount-force",
+            ]),
+        ),
+        (
+            "system.permissions",
+            HashSet::from([
+                "chmod-non-recursive",
+                // The Windows rules select the backtracking engine on purpose.
+                // `icacls <path> … /t` and `takeown /f <path> /r` put the
+                // recursion switch on either side of the path, so the switch is
+                // proven with a lookahead over the segment while the path is
+                // matched in place; ordering them positionally would need one
+                // alternative per permutation and would still miss a new one.
+                // `icacls-grant-everyone` uses a trailing lookahead so
+                // `Everyone:(F)` and `Everyone:(OI)(CI)F` both end the match
+                // without consuming the closing paren.
+                //
+                // The cost is bounded: all three are gated behind the
+                // `icacls`/`cacls`/`takeown` keywords, so they never run on an
+                // ordinary POSIX command, and this pack is opt-in.
+                "icacls-recursive-system",
+                "takeown-recursive-system",
+                "icacls-grant-everyone",
+            ]),
+        ),
+        (
+            "system.services",
+            HashSet::from([
+                "service-status",
+                "systemctl-cat",
+                "systemctl-is",
+                "systemctl-list",
+                "systemctl-reload",
+                "systemctl-show",
+                "systemctl-status",
+                // bd-w3l7: negative lookaheads exempt a dry run
+                // (`modprobe -n -r`), `rmmod --help`/`--version`, and ssh
+                // text that only prints an unload. Each lookahead starts at
+                // the verb and reads that command's own words: none crosses
+                // `;`, `&` or `|`. Each rule is scoped to its executable
+                // (modprobe, rmmod, ssh), and the pack runs only on its own
+                // keywords, which include modprobe and rmmod.
+                "modprobe-remove",
+                "rmmod",
+                "ssh-remote-module-unload",
+            ]),
+        ),
+        (
+            "windows.filesystem",
+            HashSet::from([
+                "whatif-preview",
+                "remove-item-recurse",
+                "remove-item-recurse-force",
+                // Added by a9edb9a (direct-CLI .NET delete coverage) without a
+                // corresponding audit entry, which left this test red on main.
+                "dotnet-directory-delete-recursive",
+            ]),
+        ),
+        ("windows.misc", HashSet::from(["robocopy-mirror"])),
+        (
+            "windows.powershell",
+            HashSet::from(["force-stop-or-restart-computer"]),
+        ),
+        ("windows.system", HashSet::from(["diskpart"])),
+        (
+            "strict_git",
+            HashSet::from(["push-force-any", "push-mirror"]),
+        ),
+        // The egress preset keeps lookarounds to a minimum. `read-only-data-context`
+        // is the shared safe pattern in every sub-pack (it excludes `code tunnel`
+        // from the editor whitelist); the rest are rules that must distinguish
+        // an upload from a download by operand order, or an external
+        // destination from an internal one.
+        (
+            "careful_company_running_windows.chat",
+            HashSet::from(["read-only-data-context", "generic-incoming-webhook"]),
+        ),
+        (
+            "careful_company_running_windows.email",
+            // Outlook/CDO activation must be tied to a later `.Send()` while
+            // rejecting quoted constructor examples. The negative lookbehind
+            // and lazy bounded-input traversal therefore intentionally use
+            // fancy-regex; the engine's 100K-step ceiling and the pack's
+            // matching-budget regression bound pathological inputs.
+            HashSet::from(["read-only-data-context", "outlook-com-send"]),
+        ),
+        (
+            "careful_company_running_windows.guardrails",
+            HashSet::from([
+                "read-only-data-context",
+                // Destination-position detection needs lookaheads to keep a
+                // named -Destination value from running into later
+                // parameters (issue #313).
+                "agent-hook-config-overwrite",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.tunnel",
+            HashSet::from([
+                "read-only-data-context",
+                "network-diagnostics",
+                "netcat-zero-io-probe",
+            ]),
+        ),
+        (
+            "careful_company_running_windows.upload",
+            HashSet::from(["read-only-data-context", "internal-http-target"]),
+        ),
+        (
+            "careful_company_running_windows.transfer",
+            HashSet::from([
+                "read-only-data-context",
+                "aws-s3-upload",
+                "azure-blob-upload",
+                "gcs-upload",
+                "opaque-transfer-script",
+                "rsync-to-remote",
+            ]),
+        ),
+    ]);
+
+    let registry = PackRegistry::new();
+    let all_ids: HashSet<String> = registry
+        .all_pack_ids()
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let pack_infos = registry.list_packs(&all_ids);
+
+    let mut unexpected = Vec::new();
+    let empty_set = HashSet::new();
+
+    for info in pack_infos {
+        let pack = registry.get(&info.id).unwrap();
+        let pack_expected = expected_backtracking
+            .get(pack.id.as_str())
+            .unwrap_or(&empty_set);
+
+        // Check safe patterns
+        for p in &pack.safe_patterns {
+            let pattern_str = p.regex.as_str();
+            if needs_backtracking_engine(pattern_str) {
+                if !pack_expected.contains(p.name) {
+                    unexpected.push(format!(
+                        "Unexpected backtracking in SafePattern: {}/{} ({})",
+                        pack.id, p.name, pattern_str
+                    ));
+                }
+            } else if pack_expected.contains(p.name) {
+                unexpected.push(format!(
+                    "Expected backtracking in SafePattern but not found: {}/{} ({})",
+                    pack.id, p.name, pattern_str
+                ));
+            }
+        }
+
+        // Check destructive patterns
+        for p in &pack.destructive_patterns {
+            let pattern_str = p.regex.as_str();
+            let name = p.name.unwrap_or("UNNAMED");
+            if needs_backtracking_engine(pattern_str) {
+                if !pack_expected.contains(name) {
+                    unexpected.push(format!(
+                        "Unexpected backtracking in DestructivePattern: {}/{} ({})",
+                        pack.id, name, pattern_str
+                    ));
+                }
+            } else if pack_expected.contains(name) {
+                unexpected.push(format!(
+                    "Expected backtracking in DestructivePattern but not found: {}/{} ({})",
+                    pack.id, name, pattern_str
+                ));
+            }
+        }
+    }
+
+    assert!(
+        unexpected.is_empty(),
+        "Audit mismatch:\n{}",
+        unexpected.join("\n")
+    );
+}

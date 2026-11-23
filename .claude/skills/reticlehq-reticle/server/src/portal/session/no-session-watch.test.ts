@@ -1,0 +1,724 @@
+/**
+ * The daemon decides "has this project been through `reticle init`" ONCE, at boot — and the ordinary
+ * first-install order is the other way round: the daemon is already up (something started it), then
+ * `init` writes `.reticle.json`, then the app is wired. Reported from the field: `reticle status`
+ * answered "this project has not been through `reticle init`" while the config file sat there with a
+ * framework and a projectId in it and the Vite plugin was wired. The real cause was a dev server
+ * started before the plugin existed — and the one sentence the reader was most likely to act on sent
+ * them to re-run an install that was already done.
+ *
+ * The projectPort read in this file already carries this reasoning ("`.reticle.json` can be written
+ * by init after this daemon started"); `initialized` simply never got it.
+ */
+import { describe, expect, it, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { NoSessionAction } from '@reticlehq/core';
+import { startNoSessionWatch } from './no-session-watch.js';
+import { runWithClientDirectory } from '@/hooks/client-directory.js';
+import type { NoSessionNextAction } from './no-session-next-action.js';
+import type { SessionManager } from './session-manager.js';
+import { removeTempDirSync } from '@/machine/temp-dir.test-helpers.js';
+
+const dirs: string[] = [];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) removeTempDirSync(dir);
+});
+
+function projectDir(config: string | undefined): string {
+  const dir = mkdtempSync(join(tmpdir(), 'reticle-watch-'));
+  dirs.push(dir);
+  if (config !== undefined) writeFileSync(join(dir, '.reticle.json'), config, 'utf8');
+  return dir;
+}
+
+/** The few things the watch asks of a SessionManager, and nothing else. */
+function stubSessions(): {
+  manager: SessionManager;
+  hint: () => string;
+  next: () => NoSessionNextAction | undefined;
+} {
+  let installed: (() => string | undefined) | undefined;
+  let nextAction: (() => NoSessionNextAction | undefined) | undefined;
+  const manager = {
+    count: () => 0,
+    everConnected: () => false,
+    // Nothing has departed in these cases, so the lease branch stays off.
+    lastDeparted: () => undefined,
+    // Registered alongside the hint (#615): the branch code for the same diagnosis.
+    setNoSessionReason: () => {},
+    setNoSessionHint: (hint: (() => string | undefined) | undefined) => {
+      installed = hint;
+    },
+    setNoSessionLead: () => undefined,
+    setNoSessionNextAction: (next: (() => NoSessionNextAction | undefined) | undefined) => {
+      nextAction = next;
+    },
+    setConnectionRecorder: () => undefined,
+  } as unknown as SessionManager;
+  return {
+    manager,
+    hint: () => installed?.() ?? '',
+    next: () => nextAction?.(),
+  };
+}
+
+describe('the no-session diagnosis and a config written after boot', () => {
+  it('reads `.reticle.json` when the question is asked, not when the daemon booted', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const { manager, hint } = stubSessions();
+    // `initialized: false` is what the daemon computed at boot, before the file existed.
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+    });
+    // Let the port scan settle — the dev server IS up, which is the stale-process shape.
+    await Promise.resolve();
+    await Promise.resolve();
+    const message = hint();
+    stop();
+    expect(message).not.toMatch(/no `\.reticle\.json`/);
+    // The stale-process case is what is left once the config is accounted for, and it has an action.
+    expect(message).toMatch(/restart the dev server/i);
+  });
+
+  it('still reports a genuinely unwired directory as unwired', () => {
+    const dir = projectDir(undefined);
+    const { manager, hint } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+    });
+    const message = hint();
+    stop();
+    expect(message).toMatch(/no `\.reticle\.json`/);
+  });
+
+  it('builds the prose and next action from the same config discovered in another app', async () => {
+    const dir = projectDir(undefined);
+    const appDir = join(dir, 'apps', 'client');
+    mkdirSync(join(dir, '.git'), { recursive: true });
+    mkdirSync(appDir, { recursive: true });
+    writeFileSync(join(appDir, '.reticle.json'), JSON.stringify({ projectId: 'client-1' }), 'utf8');
+    const { manager, hint, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const why = hint();
+    const nextAction = next();
+    stop();
+
+    expect(why).toContain(appDir);
+    expect(nextAction?.action).not.toBe(NoSessionAction.RUN_INIT);
+    expect(nextAction?.reason).toContain(appDir);
+    expect(nextAction?.reason).not.toMatch(/no `\.reticle\.json` was found/i);
+  });
+
+  it('names a sibling Reticle listener as an observation, not a cause', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const { manager, hint } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+      occupiedSiblings: () => Promise.resolve([4460]),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    const message = hint();
+    stop();
+    expect(message).toContain(':4460');
+    expect(message).toMatch(/may or may not be related/);
+    expect(message).not.toMatch(/the daemon this app wants/i);
+  });
+});
+
+describe('the watch asks the route the tab died on what it answers now', () => {
+  /** A manager whose one departed session was on `url`. */
+  function stubWithLastKnown(url: string): ReturnType<typeof stubSessions> {
+    const stub = stubSessions();
+    const m = stub.manager as unknown as Record<string, unknown>;
+    m['everConnected'] = () => true;
+    m['lastKnown'] = () => ({ id: 's-gone', url });
+    return stub;
+  }
+
+  it('fetches the last-known URL in the background and the hint reads the status', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'next', projectId: 'app-1' }));
+    const { manager, hint } = stubWithLastKnown('http://localhost:3000/orders/explode');
+    const asked: string[] = [];
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([3000]),
+      occupiedSiblings: () => Promise.resolve([]),
+      routeStatus: (url) => {
+        asked.push(url);
+        return Promise.resolve(500);
+      },
+    });
+    // One macrotask turn lets the whole background refresh chain settle — probe, siblings, route.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(asked).toEqual(['http://localhost:3000/orders/explode']);
+    expect(message).toMatch(/HTTP 500/);
+    expect(message).toMatch(/server error/i);
+  });
+
+  it('a fetch that fails is no fact — the diagnosis is unchanged, not wrong', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'next', projectId: 'app-1' }));
+    const { manager, hint } = stubWithLastKnown('http://localhost:3000/orders/explode');
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([3000]),
+      occupiedSiblings: () => Promise.resolve([]),
+      routeStatus: () => Promise.resolve(undefined),
+    });
+    // One macrotask turn lets the whole background refresh chain settle — probe, siblings, route.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(message).toMatch(/torn down while on/i);
+    expect(message).not.toMatch(/server error|HTTP 5/i);
+  });
+
+  it('does not ask at all when nothing departed — no URL, no fetch', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'next', projectId: 'app-1' }));
+    const { manager } = stubSessions();
+    let asked = 0;
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([3000]),
+      occupiedSiblings: () => Promise.resolve([]),
+      routeStatus: () => {
+        asked += 1;
+        return Promise.resolve(500);
+      },
+    });
+    // One macrotask turn lets the whole background refresh chain settle — probe, siblings, route.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stop();
+    expect(asked).toBe(0);
+  });
+});
+
+/**
+ * The scan must cover THIS project's port, not only the well-known list.
+ *
+ * Reported: with a Next app already running on :3005 (`next dev -p 3005`), the diagnosis said
+ * nothing was listening and suggested starting the dev server again — a duplicate (reticle#1367).
+ * The port is named in the project's own text, so the scan can read it rather than guess.
+ */
+describe('the ports the background scan covers', () => {
+  /** A manager whose one departed session was on `url`, like the route-status cases above. */
+  function stubWithLastKnown(url: string): ReturnType<typeof stubSessions> {
+    const stub = stubSessions();
+    const m = stub.manager as unknown as Record<string, unknown>;
+    m['everConnected'] = () => true;
+    m['lastKnown'] = () => ({ id: 's-gone', url });
+    return stub;
+  }
+
+  it('probes the port the project dev script pins, so a running app is found', async () => {
+    const dir = projectDir(undefined);
+    writeFileSync(
+      join(dir, 'package.json'),
+      JSON.stringify({ scripts: { dev: 'next dev -p 3005' } }),
+      'utf8',
+    );
+    const { manager, hint } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      // Answers as the real scan would: only a scanned port can come back serving.
+      probe: (ports) => Promise.resolve(ports.includes(3005) ? [3005] : []),
+    });
+    // One macrotask turn lets the whole background refresh chain settle.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(message).not.toMatch(/nothing is listening/i);
+  });
+
+  it('also scans the project’s announced ports and the port the last session was on', async () => {
+    const dir = projectDir(undefined);
+    const seen: (readonly number[])[] = [];
+    const { manager } = stubWithLastKnown('http://localhost:4311/orders');
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      ownDevServerPorts: () => [4173],
+      probe: (ports) => {
+        seen.push(ports);
+        return Promise.resolve([]);
+      },
+      routeStatus: () => Promise.resolve(undefined),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    stop();
+    expect(seen[0]).toContain(4173);
+    expect(seen[0]).toContain(4311);
+  });
+
+  /**
+   * Reported: a preview server on :3020, its port set in `.env` and in code, and no `dev` script
+   * naming it. The answer said no app was running (reticle#1543).
+   */
+  it('probes the PORT the project sets in its .env file', async () => {
+    const dir = projectDir(undefined);
+    writeFileSync(join(dir, '.env'), 'PORT=3020\n', 'utf8');
+    const { manager, hint } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: (ports) => Promise.resolve(ports.includes(3020) ? [3020] : []),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(message).not.toMatch(/nothing is listening/i);
+  });
+
+  it('says the empty scan was partial, what it checked, and how to open a known URL', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const { manager, hint } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([]),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(message).toMatch(/is not proof/);
+    expect(message).toContain('`.env` files');
+    expect(message).toContain('reticle_lease {action:"acquire", url}');
+  });
+});
+
+describe('the watch detects non-JS projects when no dev script is found', () => {
+  it('names Flutter in nextAction when pubspec.yaml is present in the project directory', async () => {
+    const dir = projectDir(undefined);
+    writeFileSync(join(dir, 'pubspec.yaml'), 'name: mobile_flutter\n', 'utf8');
+    const { manager, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([]),
+    });
+    await Promise.resolve();
+    const nextAction = next();
+    stop();
+    expect(nextAction?.action).toBe(NoSessionAction.START_DEV_SERVER);
+    expect(nextAction?.reason).toContain('This is a Flutter project.');
+    expect(nextAction?.reason).not.toContain('no dev script');
+  });
+
+  it('names Flutter in nextAction when an injected exists predicate matches', async () => {
+    const dir = projectDir(undefined);
+    const { manager, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      exists: (file) => 'pubspec.yaml' === file,
+      probe: () => Promise.resolve([]),
+    });
+    await Promise.resolve();
+    const nextAction = next();
+    stop();
+    expect(nextAction?.action).toBe(NoSessionAction.START_DEV_SERVER);
+    expect(nextAction?.reason).toContain('This is a Flutter project.');
+    expect(nextAction?.reason).not.toContain('no dev script');
+  });
+
+  it('does not diagnose Flutter when a JS manifest is present too', async () => {
+    const dir = projectDir(undefined);
+    writeFileSync(join(dir, 'pubspec.yaml'), 'name: mobile_flutter\n', 'utf8');
+    writeFileSync(join(dir, 'package.json'), '{"name":"web"}\n', 'utf8');
+    const { manager, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([]),
+    });
+    await Promise.resolve();
+    const nextAction = next();
+    stop();
+    expect(nextAction?.reason).toContain('no dev script');
+    expect(nextAction?.reason).not.toContain('Flutter');
+  });
+});
+
+/**
+ * A scan older than the session it is asked about is no observation of that session's port.
+ *
+ * Reported from the persona drive: `reticle status` said "The dev server that served it has stopped
+ * — nothing answers on that port" while Vite answered on that very port. The scan that said so ran
+ * before the app was started (or while a session was live, when no scan runs at all), so the port
+ * was either never asked or asked before anything served it.
+ */
+describe('a departed port the scan has not looked at since', () => {
+  function stubWith(state: { live: number; url?: string }): ReturnType<typeof stubSessions> {
+    const stub = stubSessions();
+    const m = stub.manager as unknown as Record<string, unknown>;
+    m['count'] = () => state.live;
+    m['everConnected'] = () => state.url !== undefined;
+    m['lastKnown'] = () => (state.url === undefined ? undefined : { id: 's-gone', url: state.url });
+    return stub;
+  }
+
+  it('is not called stopped when the only scan ran before the session existed', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const state: { live: number; url?: string } = { live: 0 };
+    const { manager, hint } = stubWith(state);
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([]),
+      occupiedSiblings: () => Promise.resolve([]),
+      routeStatus: () => Promise.resolve(undefined),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    state.url = 'http://localhost:4394/';
+    const message = hint();
+    stop();
+    expect(message).not.toMatch(/has stopped/);
+  });
+
+  it('is still called stopped once a scan after the departure found nothing there', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const state: { live: number; url?: string } = { live: 0, url: 'http://localhost:4394/' };
+    const { manager, hint } = stubWith(state);
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([]),
+      occupiedSiblings: () => Promise.resolve([]),
+      routeStatus: () => Promise.resolve(undefined),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const message = hint();
+    stop();
+    expect(message).toMatch(/has stopped/);
+  });
+});
+
+/*
+ * A re-drive: after its lease was reaped, `reticle_session {list}` said "this daemon has never seen
+ * one" while a call on the old id answered "Last seen on http://localhost:17609/". A tab that
+ * reported no project cannot be another project's: it is the one this daemon last saw.
+ */
+describe('a tab the daemon last saw, that reported no project', () => {
+  it('is not "never seen one" to a caller in a project', async () => {
+    const dir = projectDir(JSON.stringify({ framework: 'vite', projectId: 'app-1' }));
+    const { manager, hint } = stubSessions();
+    Object.assign(manager, {
+      everConnected: () => true,
+      everConnectedTo: () => false,
+      lastKnown: () => ({ id: 'lease-1', url: 'http://localhost:17609/' }),
+      lastKnownFor: () => undefined,
+    });
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: () => Promise.resolve([17609]),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    const message = runWithClientDirectory(dir, () => hint());
+    stop();
+    expect(message).not.toMatch(/never seen one/);
+  });
+});
+
+/*
+ * An unwired Vite app with its dev server already up on :5173. The agent's first
+ * `reticle_session {list}` answered "nothing is listening on the ports Reticle scans" and handed it
+ * `npm run dev`, so the agent started a second dev server on :5174. The scan had seen :5173. The
+ * caller's answer then kept only the ports this project announced or last used, and an unwired
+ * project has neither.
+ */
+describe('a dev server already running in an unwired caller project', () => {
+  function unwiredViteApp(): string {
+    const dir = projectDir(undefined);
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { dev: 'vite' } }), 'utf8');
+    return dir;
+  }
+
+  it('is counted when the process on the port runs in that project', async () => {
+    const dir = unwiredViteApp();
+    const { manager, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+      occupiedSiblings: () => Promise.resolve([]),
+      listenerDirectory: (port) => (5173 === port ? dir : undefined),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const action = runWithClientDirectory(dir, () => next());
+    stop();
+    expect(action?.action).not.toBe(NoSessionAction.START_DEV_SERVER);
+    expect(action?.port).toBe(5173);
+  });
+
+  it('is named, not called absent, when the process runs in another folder', async () => {
+    const dir = unwiredViteApp();
+    const other = projectDir(undefined);
+    const { manager, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: false,
+      directory: dir,
+      probe: () => Promise.resolve([5173]),
+      occupiedSiblings: () => Promise.resolve([]),
+      listenerDirectory: () => other,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const action = runWithClientDirectory(dir, () => next());
+    stop();
+    expect(action?.action).toBe(NoSessionAction.START_DEV_SERVER);
+    expect(action?.reason).not.toMatch(/nothing is listening on the ports Reticle scans/);
+    expect(action?.reason).toMatch(/:5173/);
+  });
+});
+
+/**
+ * reticle#1543, and the review that took the first version out of #1639. An app on a port no file
+ * names is found only through the processes in its folder. Agent tools run in that folder too, and
+ * some serve a page: an agent-browser viewer read as the app, and the answer said "just open
+ * http://localhost:<port>" while the app was not running. So a listener ends "nothing is listening"
+ * and names a port, and it is never a place to send the agent. `probe` here answers for the tool's
+ * port the way the real one does: it serves a page, so a scan that asks about it hears one.
+ */
+describe('a process in the project folder listens on a port no file names', () => {
+  const TOOL_PORT = 59591;
+  const servesPage = (ports: readonly number[]): Promise<number[]> =>
+    Promise.resolve(ports.filter((port) => port === TOOL_PORT));
+
+  async function answerFor(
+    dir: string,
+    overrides: {
+      listenerDirectory?: (port: number) => string | undefined;
+      listeningPorts?: () => readonly number[];
+      occupiedSiblings?: () => Promise<readonly number[]>;
+      caller?: string;
+      everConnected?: boolean;
+    } = {},
+  ): Promise<{ hint: string; action: NoSessionNextAction | undefined }> {
+    const { manager, hint, next } = stubSessions();
+    manager.everConnected = (): boolean => true === overrides.everConnected;
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4400,
+      initialized: true,
+      directory: dir,
+      probe: servesPage,
+      occupiedSiblings: overrides.occupiedSiblings ?? (() => Promise.resolve([])),
+      ownDevServerPorts: () => [],
+      listenerDirectory: overrides.listenerDirectory ?? (() => dir),
+      listeningPorts: overrides.listeningPorts ?? (() => [TOOL_PORT]),
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const read = (): { hint: string; action: NoSessionNextAction | undefined } => ({
+      hint: hint(),
+      action: next(),
+    });
+    const answer =
+      overrides.caller === undefined ? read() : runWithClientDirectory(overrides.caller, read);
+    stop();
+    return answer;
+  }
+
+  function wiredApp(): string {
+    const dir = projectDir('{"projectId":"p"}');
+    writeFileSync(join(dir, 'package.json'), JSON.stringify({ scripts: { dev: 'vite' } }), 'utf8');
+    return dir;
+  }
+
+  it('does not send the agent to a listener that serves a page while the app is not running', async () => {
+    const { hint, action } = await answerFor(wiredApp());
+    expect(hint).not.toMatch(/just open/);
+    expect(hint).not.toContain(`localhost:${String(TOOL_PORT)}`);
+    expect(action?.port).not.toBe(TOOL_PORT);
+    expect(action?.command ?? '').not.toContain(String(TOOL_PORT));
+  });
+
+  it('does not say "just open" after a session has been here either', async () => {
+    const { hint, action } = await answerFor(wiredApp(), { everConnected: true });
+    expect(hint).not.toMatch(/just open/);
+    expect(action?.reason).not.toMatch(/just open/);
+    expect(action?.command ?? '').not.toContain(String(TOOL_PORT));
+  });
+
+  it('keeps the start command, for the agent whose listeners are only its own tools', async () => {
+    const { action } = await answerFor(wiredApp());
+    expect(action?.action).toBe(NoSessionAction.START_DEV_SERVER);
+    expect(action?.command).toContain('dev');
+  });
+
+  it('names the port and stops saying that nothing is listening', async () => {
+    const { hint, action } = await answerFor(wiredApp());
+    expect(hint).toContain(`processes in this folder listen on :${String(TOOL_PORT)}`);
+    expect(hint).not.toMatch(/nothing is listening/i);
+    expect(action?.reason).toContain(`processes in this folder listen on :${String(TOOL_PORT)}`);
+    expect(action?.reason).not.toMatch(/probably not running/);
+  });
+
+  it('names the port to a caller standing in that folder', async () => {
+    const dir = wiredApp();
+    const { hint, action } = await answerFor(dir, { caller: dir });
+    expect(hint).toContain(`processes in this folder listen on :${String(TOOL_PORT)}`);
+    expect(hint).not.toContain(`localhost:${String(TOOL_PORT)}`);
+    expect(action?.reason).toContain(`:${String(TOOL_PORT)}`);
+  });
+
+  it('does not name a listener that runs in another folder', async () => {
+    const elsewhere = projectDir(undefined);
+    const { hint, action } = await answerFor(wiredApp(), { listenerDirectory: () => elsewhere });
+    expect(hint).not.toContain(String(TOOL_PORT));
+    expect(action?.reason).not.toContain(String(TOOL_PORT));
+    expect(hint).toMatch(/nothing is listening/i);
+  });
+
+  it("does not name the daemon's own port or a sibling daemon's", async () => {
+    const { hint } = await answerFor(wiredApp(), {
+      listeningPorts: () => [4400, 4401],
+      occupiedSiblings: () => Promise.resolve([4401]),
+    });
+    expect(hint).not.toContain('processes in this folder listen');
+  });
+
+  it('names nothing for the home folder, where every process on the machine runs', async () => {
+    const home = homedir();
+    const { hint } = await answerFor(wiredApp(), {
+      listenerDirectory: () => join(home, 'some-repo'),
+      caller: home,
+    });
+    expect(hint).not.toContain('processes in this folder listen');
+  });
+});
+
+/**
+ * #2341: the session list advised a daemon split to a prior port, while a lease on the current app
+ * URL connected and verified. `.reticle.json` names this daemon's port, so the page dials here; the
+ * live daemon on the old port only remembers an earlier session.
+ */
+describe('a daemon left on the port this project used before', () => {
+  function stateWith(ports: readonly number[], projectId: string): string {
+    const dir = mkdtempSync(join(tmpdir(), 'reticle-state-'));
+    dirs.push(dir);
+    for (const port of ports) {
+      // This process stands in for both daemons, so both read as alive.
+      const entry = { port, pid: process.pid, cwd: dir, startedAt: 1, projectId };
+      writeFileSync(join(dir, `daemon-${String(port)}.json`), JSON.stringify(entry), 'utf8');
+      writeFileSync(
+        join(dir, `connected-${String(port)}.json`),
+        JSON.stringify([projectId]),
+        'utf8',
+      );
+    }
+    return dir;
+  }
+
+  function watch(configuredPort: number): { next: NoSessionNextAction | undefined; hint: string } {
+    const dir = projectDir(JSON.stringify({ projectId: 'app-2341', port: configuredPort }));
+    const { manager, hint, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4442,
+      initialized: true,
+      directory: dir,
+      stateDir: stateWith([4441, 4442], 'app-2341'),
+      probe: () => Promise.resolve([]),
+    });
+    const answer = { next: next(), hint: hint() };
+    stop();
+    return answer;
+  }
+
+  it('gives no split or restart advice when the configured port is this daemon', () => {
+    const { next, hint } = watch(4442);
+    expect(next?.action).not.toBe(NoSessionAction.DAEMON_SPLIT);
+    expect(hint).not.toContain('DIFFERENT Reticle daemon');
+  });
+
+  /**
+   * The old daemon was started from the project folder, so the listener scan saw a process in this
+   * folder on :4441. That process is Reticle itself, never the app, and must not be offered as one.
+   */
+  it('does not offer the old daemon’s port as a process that could be the app', async () => {
+    const dir = projectDir(JSON.stringify({ projectId: 'app-2341', port: 4442 }));
+    const { manager, hint, next } = stubSessions();
+    const stop = startNoSessionWatch({
+      sessions: manager,
+      port: 4442,
+      initialized: true,
+      directory: dir,
+      stateDir: stateWith([4441, 4442], 'app-2341'),
+      probe: () => Promise.resolve([]),
+      occupiedSiblings: () => Promise.resolve([]),
+      listeningPorts: () => [4441],
+      listenerDirectory: () => dir,
+    });
+    // One macrotask: every step of the injected scan resolves at once, so it has run by then.
+    await new Promise((r) => setTimeout(r, 0));
+    expect(hint()).not.toContain(':4441');
+    expect(next()?.action).not.toBe(NoSessionAction.DAEMON_SPLIT);
+    stop();
+  });
+
+  it('still reports the split when the configured port is the other daemon', () => {
+    const { next, hint } = watch(4441);
+    expect(next?.action).toBe(NoSessionAction.DAEMON_SPLIT);
+    expect(hint).toContain('DIFFERENT Reticle daemon (:4441)');
+  });
+});

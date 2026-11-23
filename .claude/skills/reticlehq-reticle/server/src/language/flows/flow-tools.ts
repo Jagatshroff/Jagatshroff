@@ -1,0 +1,990 @@
+import { CALL_SECRETS_ARG, callSecretsArg } from './fields/flow-secret-field.js';
+import { REPLAYABILITY_OUTPUT, SKIP_WRITES_ARG } from './flow-replayable.js';
+import { flowAuthor } from './flow-author.js';
+import { FLOW_MUTATE_TOOL } from './flow-mutate-tools.js';
+import { seedSchema, workerCountSchema } from '@/surface/tools/args/numeric-bounds.js';
+import { confirmDangerousArg } from '@/surface/tools/args/confirm-dangerous-arg.js';
+import { z } from 'zod';
+import { emptyFlowRefusal } from './empty-flow.js';
+import { aliasParam, aliasUsed } from '@/surface/tools/args/alias-args.js';
+import { REPLAY_TRUST_OUTPUT, stillRecording, stillRecordingMessage } from './flow-result.js';
+import { resolveAnnotateTarget } from './annotate-notes/annotate-target.js';
+import {
+  type ProjectId,
+  FlowErrorCode,
+  RecordedSaveError,
+  type FlowReplayResult,
+  SuiteIsolation,
+} from '@reticlehq/core';
+import type { FlowFile } from '@reticlehq/core';
+import { recordSuiteFlakes } from './suite/suite-flakes.js';
+import { ReticleTool, asNumber, asString, type SuiteVerdict } from '@reticlehq/core';
+import { log } from '@/log.js';
+import { cloudFetch, syncFlowToCloud, SyncOutcome } from '@/memory/cloud/cloud-sync.js';
+import { mapWithConcurrency, resolveConcurrency } from './suite/parallel-suite.js';
+import { acquireLeasedSession, suiteFixtureSeed } from '@/surface/tools/lease-tools.js';
+import { homedir } from 'node:os';
+import { withShotRun, defaultRunId } from '@/judgement/runs/default-run-id.js';
+import { resolveProjectCloud } from '@/memory/cloud/cloud-config.js';
+import { buildSuiteVerdict } from './decision.js';
+import * as Bounded from './suite/sequential-run.js';
+import { FLOW_ASSERTIONS_OUTPUT, classifyFlowAssertions, flattenSteps } from './flow-classify.js';
+import { recordingBacktrackWarning } from './recording/recording-backtrack.js';
+import { isValidFlowName, flowPath } from '@/memory/project/dir/reticle-dir.js';
+import { type FlowAnnotations } from './flows.js';
+import type { ToolDef, ToolDeps } from '@/surface/tools/tool-kit.js';
+import { flowsForListing, flowsForSession, flowsForSessionId } from './flow-store-for-session.js';
+import { rootForTarget, sessionTarget, type ProjectTarget } from '@/memory/project/session-root.js';
+import { originOf } from '@/portal/session/session-manager.js';
+import { resolveSuiteSelection } from './suite-selection.js';
+import { flowErrorMessage, latestRecordedFlow } from './flow-replay-run.js';
+import {
+  persistAndSyncVerificationRun,
+  type TimedReplay,
+} from '@/judgement/runs/verification-sync.js';
+import { runServerVerify } from './suite/server-verify.js';
+import { healFlow } from './heal-run.js';
+import { RESULT_FIELD, resultField, suiteResult } from '@/surface/tools/reticle-result.js';
+import { replayOneFlow } from './single-replay.js';
+
+export { replayNamedFlow } from './flow-replay-run.js';
+import { replayAndLearn } from './flow-learning.js';
+import { leasableAppUrl, leaseFailureReplay, sessionUrlOf } from './flow-lease.js';
+export { leasableAppUrl, leaseFailureReplay, sessionUrlOf } from './flow-lease.js';
+
+/**
+ * Best-effort mirror of a just-saved flow to Reticle (only when logged in — both cloud env vars
+ * set). Fire-and-forget: resolves the config, POSTs via the platform fetch, and logs the outcome. Any
+ * failure is swallowed so a network hiccup never affects the local save.
+ */
+async function syncSavedFlowToCloud(
+  deps: ToolDeps,
+  flow: FlowFile,
+  target: ProjectTarget,
+): Promise<void> {
+  // Per-project cloud: sync a saved flow only when cloud is attached AND flow sync is enabled.
+  // The link file of the project this flow belongs to — the flow itself was already saved through
+  // `flowsForSession`, and reading the credential from a different tree is how one project's work
+  // reaches another project's dashboard.
+  const cloud = await resolveProjectCloud(
+    deps.fs,
+    rootForTarget(deps, target),
+    homedir(),
+    process.env,
+  );
+  if (null === cloud.config || !cloud.policy.flows) {
+    return;
+  } // not attached / flows disabled → local only
+  const result = await syncFlowToCloud(flow, cloud.config, target.projectId, cloudFetch);
+  if (result.outcome !== SyncOutcome.SYNCED) {
+    log('cloud-flow-sync-failed', { flow: flow.name, status: result.status, error: result.error });
+  }
+}
+
+/** A step index no recorded flow reaches; bounds `to` and `at`. */
+const MAX_REPLAY_STEP = 10_000;
+
+/** Stand-in path for a flow whose name fails the path-segment guard — never a real join. */
+const INVALID_FLOW_NAME_PATH = '(invalid flow name — not a usable path)';
+
+/**
+ * How a save reports that nobody said what the flow is for.
+ *
+ * Declared once and shared by every save tool: an undeclared field is stripped from
+ * `structuredContent` by a schema-strict MCP client, so a save path that forgot this line would
+ * report the nudge to the unit tests and to nobody else.
+ */
+const INTENT_GAP_FIELD = z
+  .unknown()
+  .optional()
+  .describe(
+    'Present ONLY when the flow was saved with nothing saying what it is for: { kind, missing, cost, fix }. The flow is on disk either way — this never blocks a save. Close it by saving again with `intent`, or by setting the flow file’s `intentId` to an intent already in the ledger. Nothing here is ever derived from the flow name, the steps or the assertions: a guessed goal reads as the author’s own words.',
+  );
+
+/** `flow`: the name reticle_annotate gives the field the flow tools call `flowName`. */
+const FLOW_NAME_ALIAS = z
+  .string()
+  .optional()
+  .describe('Alias for `flowName` (the name reticle_annotate uses).');
+
+export const FLOW_TOOLS: ToolDef[] = [
+  FLOW_MUTATE_TOOL,
+  {
+    name: ReticleTool.FLOW_SAVE,
+    description:
+      'Persist a STOPPED recording (by name) as a git-checked, anchor-resolved flow at .reticle/flows/<name>.json. A recording that is still running is refused: stop it first with reticle_record{action:"stop"}, and the refusal names the exact call. Each step is bound to a SEMANTIC anchor (testid/role/signal), never a volatile ref; steps without a resolvable testid are kept with degraded:true (a "add a data-testid here" marker) rather than dropped. Returns { name, stepCount, degraded, empty, assertions, warning? } — `assertions.grade` is asserted | presence-only | assertion-free: a flow that only acts (or only checks element presence) will pass even if the feature breaks, so when grade is not "asserted" follow assertions.warning and add a consequence assertion via reticle_annotate (assert-signal / assert-net / success-state). `warning` is present when the recording left a page and returned to it: replay has no navigation steps, so the next click will look for a control on a page the tab is no longer on.',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      name: z.string().optional().describe('Alias for `flowName`.'),
+      flowName: z
+        .string()
+        .optional()
+        .describe(
+          'Which RECORDING to save — the name reticle_record{start} was called with ("last-journey" for the reticle_act {steps} just proved). Omit when only one is stopped. This is a lookup key, not the filename: pass `saveAs` to choose that.',
+        ),
+      saveAs: z
+        .string()
+        .optional()
+        .describe(
+          'Name for the flow file (.reticle/flows/<saveAs>.json), and the name reticle_flow{action:"load"} / reticle_flow_replay take. Omit to reuse the recording name.',
+        ),
+      intent: z
+        .string()
+        .optional()
+        .describe(
+          'What this flow is FOR, in prose: which user does what, and what should become true. Answer it here rather than in a second call. Without it the flow still saves, but the day it goes red the report can only name the step that broke, not the thing that stopped being true.',
+        ),
+      sessionId: z
+        .string()
+        .optional()
+        .describe('Active session ID — scopes the saved flow to that app.'),
+    },
+    // Schema MUST match what the handler actually returns on BOTH paths: success
+    // { name, stepCount, degraded, empty, assertions? } and error { error, code }. The prior schema
+    // declared { saved, path } — fields the handler never returns — so a schema-validating MCP
+    // client rejected every reticle_flow_save result ("expected boolean"). Unit tests call the handler
+    // directly and bypass MCP output validation, so only a live MCP run caught it (cf. the same
+    // class of bug fixed for FLOW_LIST above).
+    outputSchema: {
+      name: z.string().optional(),
+      stepCount: z.number().optional(),
+      degraded: z.number().optional(),
+      empty: z.boolean().optional(),
+      assertions: FLOW_ASSERTIONS_OUTPUT,
+      intentGap: INTENT_GAP_FIELD,
+      normalized: z.array(z.string()).optional(),
+      warning: z
+        .string()
+        .optional()
+        .describe(
+          'Present when the recording left a page and returned to it. Replay has no navigation steps, so the next click will look for a control on a page the tab is no longer on.',
+        ),
+      error: z.string().optional(),
+      code: z.string().optional(),
+    },
+    handler: (deps: ToolDeps, args) => {
+      const aliases = ['flow', 'name', 'recordingName'];
+      const normalized = aliasUsed(args, 'flowName', aliases);
+      const explicitName = asString(aliasParam(args, 'flowName', aliases)['flowName']);
+      // The one stopped recording when the call names none — the same defaulting record{stop} and
+      // annotate use. With several, nothing is picked: the refusal below names them.
+      const name = resolveAnnotateTarget(explicitName, deps.recordings.compiled());
+      const program = deps.recordings.getCompiled(name);
+      if (program === undefined) {
+        /*
+         * Name what DOES exist.
+         *
+         * `flowName` here is the RECORDING's name, while every other flow tool reads it as the name
+         * to save AS — so recording `default` and saving as `sign-in` looks obviously right and
+         * answers "no compiled recording by that name". The old message then said "record one
+         * first", which is advice to repeat the step that just succeeded. Cost a real investigation
+         * before the names were compared.
+         */
+        const held = deps.recordings.compiled();
+        const running = stillRecording(deps.recordings.active(), name, explicitName, held);
+        if (running !== undefined) {
+          return Promise.resolve({
+            error: stillRecordingMessage(running),
+            code: FlowErrorCode.NO_RECORDING,
+          });
+        }
+        return Promise.resolve({
+          error:
+            0 === held.length
+              ? flowErrorMessage(FlowErrorCode.NO_RECORDING)
+              : `no recording named '${name}'. This is the name the RECORDING was made under, not ` +
+                `the name to save it as — stopped and ready to save: ${held.map((n) => `'${n}'`).join(', ')}.`,
+          code: FlowErrorCode.NO_RECORDING,
+        });
+      }
+      // The name to save AS, which is not the name looked up above.
+      //
+      // `flowName` selects the recording; a recording is named at `record{start}`, often `default`
+      // or whatever the drive began as. Every other flow tool reads a flow name as the thing you
+      // load and replay, so a caller naming their flow at save time had no way to do it and had to
+      // `mv` the file on disk. The error message below already had to explain this ambiguity; that
+      // it needed explaining is the bug (#698).
+      const saveAs = asString(args['saveAs']);
+      if (saveAs !== undefined && !isValidFlowName(saveAs)) {
+        return Promise.resolve({
+          error: `'${saveAs}' is not a usable flow name — it becomes a filename under .reticle/flows/.`,
+          code: FlowErrorCode.INVALID_NAME,
+        });
+      }
+      // fold any structured annotations (expect/dynamic/success/intent) onto the saved flow.
+      // Keyed by the RECORDING name: annotations were left against the recording, not the file.
+      const success = deps.annotations.success(name);
+      // The inline argument wins over an annotation left from an earlier call: it is the more recent
+      // statement, and it is the one the author just typed.
+      const intent = asString(args['intent']) ?? deps.annotations.intent(name);
+      const annotations: FlowAnnotations = {
+        stepExpect: deps.annotations.stepExpect(name),
+        dynamic: deps.annotations.dynamic(name),
+        ...(success !== undefined ? { success } : {}),
+        ...(intent !== undefined ? { intent } : {}),
+      };
+      const target = sessionTarget(deps, asString(args['sessionId']));
+      const { projectId } = target;
+      // A zero-step recording is not a flow. Saving it wrote a file the suite reports "unverifiable"
+      // forever while telling the agent it had saved a regression test — see empty-flow.
+      const emptyRefusal = emptyFlowRefusal(program.steps.length, name);
+      if (emptyRefusal !== undefined) {
+        return Promise.resolve(emptyRefusal);
+      }
+      const { flows, root } = flowsForSession(deps, target);
+      const author = flowAuthor();
+      const toSave = {
+        ...program,
+        ...(saveAs === undefined ? {} : { name: saveAs }),
+        ...(author === undefined ? {} : { author }),
+      };
+      return flows.save(toSave, annotations, projectId).then(async (res) => {
+        if (!res.ok) {
+          return { error: flowErrorMessage(res.code, res.detail), code: res.code };
+        }
+        deps.annotations.clear(name);
+        // Grade the saved flow's assertions so the agent learns immediately if it just saved a flow
+        // that asserts nothing observable (passes even when the feature is broken).
+        const loaded = await flows.load(res.value.name, projectId);
+        // The absolute path, always. A save that reports success and not WHERE cost a reporter a
+        // `find` across their disk to discover it had landed in an unrelated repo. The name came
+        // back from a save that succeeded, so the guard is a type narrowing rather than a doubt.
+        const saved = res.value.name;
+        const path = isValidFlowName(saved) ? flowPath(root, saved, projectId) : undefined;
+        const backtrack = recordingBacktrackWarning(program.routes ?? []);
+        // Load what this flow INVOKES, so a composite is graded on the journey it runs rather than
+        // on the one step it contains. Without this a composite whose sub-flows all assert still
+        // warns that it checks nothing, and the only ways to silence that are to duplicate the
+        // sub-flow's assertion into every caller or to stop reading the warning.
+        const invoked = loaded.ok ? await loadInvoked(flows, loaded.value, projectId) : new Map();
+        return loaded.ok
+          ? {
+              ...(0 === normalized.length ? {} : { normalized }),
+              ...res.value,
+              ...(path === undefined ? {} : { path }),
+              assertions: classifyFlowAssertions(loaded.value, invoked),
+              ...(backtrack === undefined ? {} : { warning: backtrack }),
+            }
+          : {
+              ...res.value,
+              ...(path === undefined ? {} : { path }),
+              ...(backtrack === undefined ? {} : { warning: backtrack }),
+            };
+      });
+    },
+  },
+  {
+    name: ReticleTool.FLOW_LIST,
+    description:
+      'List saved flow names under .reticle/flows (a fresh agent learns the demonstrated journeys ' +
+      'without a browser). Scoped to the connected app: with a session it lists that project’s ' +
+      'flows plus legacy untagged ones; with no browser it lists every flow in the repo.',
+    inputSchema: {
+      sessionId: z
+        .string()
+        .optional()
+        .describe(
+          'Active session ID — scopes the list to that app. Omit to list every saved flow.',
+        ),
+    },
+    outputSchema: {
+      flows: z.array(
+        z.object({ name: z.string(), path: z.string(), createdAt: z.number().optional() }),
+      ),
+      note: z
+        .string()
+        .optional()
+        .describe('Set when the list is for another project than the tab.'),
+    },
+    // Return {name, path} objects to MATCH the declared outputSchema. Returning bare name strings
+    // (the prior bug) made schema-validating MCP clients reject the result ("expected object,
+    // received string") — caught driving the live demo.
+    handler: (deps: ToolDeps, args) => {
+      // The APP's flows, not the daemon's: a list of the daemon's folder showed a React dashboard a
+      // HUD of Electron and Tauri flows. The note says when the tab is another project's (#2427).
+      const listing = flowsForListing(deps, asString(args['sessionId']));
+      const { flows: store, root, projectId, note } = listing;
+      return store.list(projectId).then((names) => ({
+        ...(note === undefined ? {} : { note }),
+        // `list` deliberately returns invalid names so they are reported rather than silently
+        // dropped — but the declared outputSchema requires `path` on EVERY entry, and omitting it made
+        // a strict MCP client reject the whole listing (the agent then sees no flows at all, which is
+        // worse than the bad path it replaced). So every entry keeps a string `path`; an invalid name
+        // gets an explanatory marker instead of a joined filesystem path, which is what must never
+        // happen for a traversal-shaped name.
+        flows: names.map((name) =>
+          isValidFlowName(name)
+            ? { name, path: flowPath(root, name, projectId) }
+            : { name, path: INVALID_FLOW_NAME_PATH },
+        ),
+      }));
+    },
+  },
+  {
+    name: ReticleTool.FLOW_LOAD,
+    description:
+      'Read + validate a saved flow by flowName from .reticle/flows/<flowName>.json. Returns the FlowFile (version, flowName, createdAt, anchored steps) or a structured { error, code }. Step `expect` (and flow `success`) accepts the same allOf grammar as reticle_act_and_wait; a parse failure names the step and key rather than calling the file malformed.',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z
+        .string()
+        .describe('Flow file name (without .json extension) from reticle_flow{action:"list"}.'),
+      sessionId: z
+        .string()
+        .optional()
+        .describe('Active session ID — resolves the flow within that app’s scope.'),
+    },
+    outputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z.string(),
+      steps: z.array(z.unknown()),
+      createdAt: z.number().optional(),
+    },
+    handler: (deps: ToolDeps, args) => {
+      const { flows, projectId } = flowsForSessionId(deps, asString(args['sessionId']));
+      return flows
+        .load(asString(aliasParam(args, 'flowName', ['flow'])['flowName']) ?? '', projectId)
+        .then((res) => {
+          if (!res.ok) {
+            return { error: flowErrorMessage(res.code, res.detail), code: res.code };
+          }
+          const { name, ...rest } = res.value;
+          return { flowName: name, ...rest };
+        });
+    },
+  },
+  {
+    name: ReticleTool.FLOW_DELETE,
+    description:
+      'Delete a saved flow file so a renamed/obsolete flow stops lingering in the replay list. Scoped ' +
+      'to the connected app. Returns { deleted: true } or a structured { error, code } (code not_found ' +
+      'when no such flow — deleting an absent flow is an error, not a silent no-op).',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z
+        .string()
+        .describe('Flow file name (without .json extension) from reticle_flow{action:"list"}.'),
+      sessionId: z
+        .string()
+        .optional()
+        .describe('Active session ID — resolves the flow within that app’s scope.'),
+    },
+    outputSchema: {
+      deleted: z.boolean().optional(),
+      error: z.string().optional(),
+      code: z.string().optional(),
+    },
+    handler: (deps: ToolDeps, args) => {
+      const { flows, projectId } = flowsForSessionId(deps, asString(args['sessionId']));
+      return flows
+        .remove(asString(aliasParam(args, 'flowName', ['flow'])['flowName']) ?? '', projectId)
+        .then((res) => {
+          if (!res.ok) {
+            return { error: flowErrorMessage(res.code, res.detail), code: res.code };
+          }
+          return { deleted: true };
+        });
+    },
+  },
+  {
+    name: ReticleTool.FLOW_REPLAY,
+    description:
+      "Replay a git-checked flow from .reticle/flows/<name>.json. RE-RESOLVES each step's semantic " +
+      'anchor (testid via reticle_query; signal via predicate) against LIVE DOM. On anchor MISS returns ' +
+      'DRIFT { step, anchor, drift:{ reasonKind, reason, nearest } } and stops. ' +
+      'Returns { name, status: ok|drift|error|unverifiable, steps:[...] }. ' +
+      'Action failures are status:error. ' +
+      'Status unverifiable means flow could not be graded (missing secrets, unmet preconditions, lost ' +
+      'document) — neither pass nor fail, treat as UNKNOWN. ' +
+      'An ok replay of a flow asserting no consequence also carries unverifiable:{reason} — do not ' +
+      'treat as proof. verifiedReason names the clause that decided the status. ' +
+      'Early halt carries halted:{atStep, notAttempted}: `steps` is shorter because replay stopped. ' +
+      'A start page that kept loading past the step budget carries startPageWait:{waitedMs, budgetMs, stillLoading}.',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z
+        .string()
+        .optional()
+        .describe(
+          'Flow file name (without .json extension) from reticle_flow{action:"list"}. Required, here or as `flow`.',
+        ),
+      [CALL_SECRETS_ARG]: callSecretsArg,
+      confirmDangerous: confirmDangerousArg('this replay'),
+      from: z
+        .union([z.number().int().nonnegative(), z.string().min(1)])
+        .optional()
+        .describe(
+          'Resume at this step (index or step id). Earlier steps re-run as unchecked, unreported setup; a setup step marked effect:"commits" refuses the resume.',
+        ),
+      to: z
+        .number()
+        .int()
+        .positive()
+        .max(MAX_REPLAY_STEP)
+        .optional()
+        .describe('Stop before this step (drive only to a point journeys branch from).'),
+      at: z
+        .number()
+        .int()
+        .nonnegative()
+        .max(MAX_REPLAY_STEP)
+        .optional()
+        .describe(
+          'Continue at this step on the page as it is (after another flow ran `to` it); 0 replays the whole flow on the page the flow before it left, with no reload.',
+        ),
+      sweep: z
+        .boolean()
+        .optional()
+        .describe(
+          'BUG SWEEP: keep going past a step whose action ran and whose declared consequence merely did not hold, returning one verdict PER STEP instead of stopping at the first failure. Default false — a regression flow wants the first break. A step whose ANCHOR did not resolve still halts either way.',
+        ),
+      seed: seedSchema
+        .optional()
+        .describe(
+          'Replay under SEEDED PERTURBATION: the endpoints this flow declared it depends on are each delayed by a different amount, so responses can arrive out of their recorded order. The same seed reproduces the same run exactly — a race nobody can re-run is a rumour. Only the TIMING changes; the real server answers and the real body comes back. Races, double-submits and stale-response bugs are invisible on a fast machine and appear here.',
+        ),
+      sessionId: z
+        .string()
+        .optional()
+        .describe(
+          'Active session ID from reticle_sessions. Omit when only one browser session is open.',
+        ),
+    },
+    outputSchema: {
+      perturbed: z
+        .array(z.unknown())
+        .optional()
+        .describe('Present when `seed` was given: which endpoints were delayed, and by how long.'),
+      [RESULT_FIELD]: z.string().optional(),
+      // The flow's name — always present in FlowReplayResult (the description promises `{ name, … }`),
+      // but omitted here, so a validating profile stripped it and a replay result arrived anonymous.
+      name: z.string(),
+      status: z.string().describe('ok | drift | error | unverifiable'),
+      runId: z.string().optional().describe('The run this replay was written down as.'),
+      steps: z.array(z.unknown()),
+      proposals: z.array(z.unknown()).optional(),
+      deviation: z
+        .unknown()
+        .optional()
+        .describe(
+          'Push-default deviation report over the replay segments: ranked deviations vs the learned envelope + a nominal count, or a fall-back note below 3 runs.',
+        ),
+      error: z.object({ code: z.string(), message: z.string() }).optional(),
+      // Same rule as `unverifiable` below, and the same failure if it is left out.
+      halted: z
+        .object({ atStep: z.number(), notAttempted: z.number() })
+        .optional()
+        .describe(
+          'Set when the replay STOPPED at a failing step: `steps` is shorter than the flow, and this says where it stopped and how many steps were never attempted. Absent means every step ran.',
+        ),
+      // Declared for the same reason as `halted`: an undeclared field is stripped.
+      startPageWait: z
+        .object({ waitedMs: z.number(), budgetMs: z.number(), stillLoading: z.boolean() })
+        .optional()
+        .describe(
+          'Set when replay waited past the step budget because the start page was still loading. stillLoading is what the tab said the last time replay asked. Absent means the wait stayed inside the budget.',
+        ),
+      // Declared here or a validating profile strips it -- the same way `name` was stripped once.
+      // A field the handler sets and the schema omits arrives as nothing, silently.
+      /*
+       * What this flow has learned, and the two answers that are the whole point of learning.
+       *
+       * Declared because an undeclared field is STRIPPED from a validating profile's response — the
+       * comment a few lines above records the same defect happening to `name`, which made a replay
+       * result arrive anonymous. Omitting these meant a guarded defect could come back, the flow
+       * could detect it, and the field naming the regression never reached the caller: the feature's
+       * entire stated payoff, unobservable.
+       */
+      learned: z
+        .array(z.unknown())
+        .optional()
+        .describe(
+          'Every defect this flow has seen: `open` while it is still happening, `guarded` once a run stopped showing it. Written back to the flow, so the next replay starts from it.',
+        ),
+      promoted: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Defects this run saw disappear for the second consecutive time. The app got better here.',
+        ),
+      regressed: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Guarded defects that came back. This flow proved once that they were gone, so their return is a regression nothing else would have caught.',
+        ),
+      ...REPLAY_TRUST_OUTPUT,
+      decision: z
+        .object({
+          verdict: z.string(),
+          summary: z.string(),
+          whatChanged: z.string().optional(),
+          whereInSource: z.string().optional(),
+          suggestedFix: z.string().optional(),
+          nextAction: z.string(),
+        })
+        .optional()
+        .describe('Autonomy envelope: verdict + what changed + where + fix + next action.'),
+    },
+    // The decision envelope is attached by replayNamedFlow only on drift/fail (clean pass stays
+    // token-flat). Single-flow replay and whole-suite verify share that one implementation.
+    handler: (deps: ToolDeps, args): Promise<FlowReplayResult> =>
+      replayOneFlow(
+        deps,
+        aliasParam(args, 'flowName', ['flow']),
+        leasableAppUrl(deps, asString(args['sessionId'])),
+      ),
+  },
+  {
+    name: ReticleTool.FLOW_VERIFY,
+    description:
+      'Replay EVERY saved flow (or a given subset) and return ONE consolidated suite verdict — the ' +
+      'autonomous regression check to run after a build/change. Deterministic (no LLM per flow). ' +
+      'Returns { status: pass|fail, total, passed, failed, summary, failures:[{ flow, verdict, ' +
+      'whatChanged, whereInSource, nextAction }] } plus `flaky` (flows seen to pass AND fail on unchanged code) — passing flows are counted, only failures carry ' +
+      'detail (the actionable fix). One call replaces N hand-driven replays.',
+    inputSchema: {
+      [CALL_SECRETS_ARG]: callSecretsArg,
+      names: z
+        .array(z.string())
+        .optional()
+        .describe('Flow names to verify. Omit for every saved flow.'),
+      labels: z
+        .array(z.string())
+        .optional()
+        .describe('Verify flows with ANY of these labels. Quarantined flows never run.'),
+      parallel: workerCountSchema
+        .optional()
+        .describe(
+          'Run this many flows at once, each in its own isolated leased browser context (needs the browser pool). Clamped to the pool capacity and the flow count. Omit for the sequential single-tab run.',
+        ),
+      ignoreHTTPSErrors: z
+        .boolean()
+        .optional()
+        .describe(
+          'Accept a self-signed or local-CA certificate for parallel flow leases. Omit to inherit the source lease setting; otherwise certificate checks stay on.',
+        ),
+      confirmDangerous: confirmDangerousArg('this run of the suite'),
+      skipWrites: SKIP_WRITES_ARG,
+      budgetMs: Bounded.BUDGET_MS_ARG,
+      sessionId: z
+        .string()
+        .optional()
+        .describe(
+          'Active session ID from reticle_sessions. Omit when only one browser session is open.',
+        ),
+    },
+    outputSchema: {
+      status: z.string().describe('pass | fail | unverifiable | partial'),
+      ...Bounded.PARTIAL_OUTPUT,
+      runId: z.string().optional().describe('The run this suite was written down as.'),
+      total: z.number(),
+      passed: z.number(),
+      failed: z.number(),
+      summary: z.string(),
+      [RESULT_FIELD]: z.string().optional(),
+      failures: z.array(z.unknown()),
+      isolation: z
+        .string()
+        .optional()
+        .describe(
+          'How the flows were kept apart: "shared-session" (sequential, one live tab, state carries between flows) or "per-flow-lease" (each flow its own context). Counts from the two are NOT comparable — a sequential pass can rest on state an earlier flow left behind.',
+        ),
+      flaky: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Flows that have both passed and failed on UNCHANGED code — intermittent, not regressions. Omitted when none are known.',
+        ),
+      coverage: z
+        .object({ steps: z.number(), declared: z.number() })
+        .optional()
+        .describe(
+          'Steps driven, and how many declared a consequence. 47 of 63 is not "75% verified" — it is verified for 47 and silent about 16.',
+        ),
+      contradictions: z
+        .array(z.unknown())
+        .optional()
+        .describe(
+          'Channel disagreements found anywhere in the suite, INCLUDING on flows that passed — each addressed back to its flow and step. A green flow with one is the false green a regression suite exists to catch, so their presence also stops the suite reporting `pass`.',
+        ),
+      unreached: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Known routes this run never opened — every route the project's flows start on, minus the ones replayed. Coverage above counts what was driven; this counts what was not looked at.",
+        ),
+      quarantined: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Flows you asked for that were NOT run because they are quarantined. Named rather than subtracted: a suite that quietly returns fewer flows than were selected is one whose coverage nobody can account for.',
+        ),
+      unmatched: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Names or labels that matched no flow — a typo, or a set that no longer exists. Reported because silently passing over one is how "all green" comes to mean "nothing ran".',
+        ),
+      cycles: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Flows whose `needs` form a cycle. None of them ran: an order was declared that cannot exist, and inventing one would produce a suite nobody can reason about when it fails.',
+        ),
+      unsatisfied: z
+        .array(z.unknown())
+        .optional()
+        .describe(
+          'Flows whose prerequisite is not in this run — filtered out by a label, quarantined, or never saved. They did NOT run, because failing them would report the wrong thing.',
+        ),
+      replayability: REPLAYABILITY_OUTPUT,
+      skippedWrites: z.array(z.string()).optional().describe('Flows held back by skipWrites.'),
+      // Session-EXEMPT, so it does not inherit `sessionEnvelopeShape` — declare the one-shot human
+      // feedback ask here or a validating profile strips it off the suite verdict.
+      feedback_prompt: z.unknown().optional(),
+    },
+    // The run id is minted first, so each replayed step's screenshot is filed under the run.
+    handler: (deps: ToolDeps, args): Promise<SuiteVerdict> =>
+      withShotRun(defaultRunId(), async (): Promise<SuiteVerdict> => {
+        const sessionId = asString(args['sessionId']);
+        const confirmed = true === args['confirmDangerous'] ? { confirmDangerous: true } : {};
+        // "Replay all" means all of THIS app's flows (+ legacy), not every project's on a shared daemon.
+        const target = sessionTarget(deps, sessionId);
+        const { projectId } = target;
+        const selected = await resolveSuiteSelection(deps, target, args);
+        const requested = selected.run;
+        /** Named rather than subtracted — a suite that returns fewer than were asked for must say so. */
+        const heldBack = {
+          ...(0 === selected.quarantined.length ? {} : { quarantined: selected.quarantined }),
+          ...(0 === selected.unmatched.length ? {} : { unmatched: selected.unmatched }),
+          ...(selected.cycles === undefined ? {} : { cycles: selected.cycles }),
+          ...(selected.unsatisfied === undefined ? {} : { unsatisfied: selected.unsatisfied }),
+          ...(selected.writing === undefined ? {} : { skippedWrites: selected.writing }),
+        };
+        // verify:server — hand the whole suite to the hosted runner; it records the verification itself.
+        const cloud = await resolveProjectCloud(
+          deps.fs,
+          rootForTarget(deps, target),
+          homedir(),
+          process.env,
+        );
+        const server = await runServerVerify(deps, cloud, sessionId, requested);
+        if (server !== null) {
+          return server;
+        }
+        // PARALLEL: flows race the DOM only when they share ONE tab. Given the lease pool, each
+        // flow gets its own isolated context, so a large suite finishes in interactive time. Opt-in via
+        // `parallel`; a missing prerequisite (no pool, unknown app URL) falls back to the sequential path
+        // rather than failing — a suite must always be runnable.
+        //
+        // NOTE: this applies even to a ONE-flow suite. Skipping leases for a single flow looked harmless
+        // (no speedup to win) but silently downgraded an explicit `parallel` request to a shared-tab run,
+        // so the flow inherited whatever state the previous run left behind — isolation is the point here,
+        // not only concurrency.
+        const parallelArg = asNumber(args['parallel']);
+        const pool = deps.pool;
+        const appUrl = leasableAppUrl(deps, sessionId);
+        if (
+          parallelArg !== undefined &&
+          pool !== undefined &&
+          appUrl !== undefined &&
+          requested.length > 0
+        ) {
+          const concurrency = resolveConcurrency(requested.length, pool.capacity(), parallelArg);
+          const ignoreHTTPSErrors =
+            'boolean' === typeof args['ignoreHTTPSErrors']
+              ? args['ignoreHTTPSErrors']
+              : pool.ignoresHTTPSErrors?.(deps.sessions.resolve(sessionId).id);
+          /*
+           * Captured ONCE, before any flow runs, from the page the agent is already driving.
+           *
+           * Each leased flow then boots already holding it, which is what closes the gap this suite
+           * had: a flow that logs out used to leave every flow after it signed out, and no navigation
+           * repairs that — the problem is not where the subject is, it is what it holds. Seeded before
+           * the first navigation, because restoring into a page that has already decided it is signed
+           * out is a fixture that appears to work and does nothing.
+           *
+           * `undefined` whenever it cannot be had, and the suite then runs exactly as it did before:
+           * every flow from cold, which is correct and merely slower.
+           */
+          // The LIVE PAGE URL, not `appUrl`. `leasableAppUrl` returns an origin, and the provider
+          // finds a page by comparing full URLs — so an origin matched no page, the lookup answered
+          // "nothing driven here", and this returned `undefined` on every run. Silent, and it made the
+          // seeding below a no-op: every leased flow booted cold while the code read as if it did not.
+          const seed = await suiteFixtureSeed(
+            deps.realInput,
+            sessionUrlOf(deps, sessionId) ?? appUrl,
+          );
+          const outcomes = await mapWithConcurrency(requested, concurrency, async (flowName) => {
+            const start = deps.now();
+            const lease = await acquireLeasedSession(
+              pool,
+              deps.sessions,
+              appUrl,
+              projectId,
+              seed,
+              ignoreHTTPSErrors,
+            );
+            try {
+              const replay = await replayAndLearn(deps, {
+                flowName,
+                sessionId: lease.sessionId,
+                ...confirmed,
+              });
+              return { replay, durationMs: deps.now() - start };
+            } finally {
+              await lease.release().catch(() => undefined);
+            }
+          });
+          const parallelRuns = await Promise.all(
+            outcomes.map(async (o, i) => {
+              const name = requested[i] ?? '';
+              const replay =
+                o.ok && o.value !== undefined ? o.value.replay : leaseFailureReplay(name, o.error);
+              const loaded = await flowsForSession(deps, target)
+                .flows.load(name, projectId)
+                .catch(() => null);
+              const flow = loaded !== null && loaded.ok ? loaded.value : undefined;
+              return flow === undefined ? { replay } : { replay, flow };
+            }),
+          );
+          const timed: TimedReplay[] = outcomes.map((o, i) => ({
+            ...(parallelRuns[i] ?? { replay: leaseFailureReplay(requested[i] ?? '', o.error) }),
+            durationMs: o.ok && o.value !== undefined ? o.value.durationMs : 0,
+          }));
+          const flaky = await recordSuiteFlakes(deps.fs, rootForTarget(deps, target), parallelRuns);
+          const runId = await persistAndSyncVerificationRun(deps, timed, target);
+          const verdict = buildSuiteVerdict(
+            parallelRuns,
+            selected.knownRoutes,
+            SuiteIsolation.PER_FLOW_LEASE,
+          );
+          return {
+            ...verdict,
+            ...(runId === undefined ? {} : { runId }),
+            ...(flaky.length > 0 ? { flaky: [...flaky] } : {}),
+            ...heldBack,
+            ...resultField(() => suiteResult(rootForTarget(deps, target), verdict, timed, runId)),
+          };
+        }
+        // The flow FILE travels with each replay so the verdict can tell a green that verified
+        // something from a green that could never have gone red. Without it the suite reported "all 1
+        // flow pass" for a flow with no steps at all.
+        const runs: { replay: FlowReplayResult; flow?: FlowFile }[] = [];
+        const timed: TimedReplay[] = [];
+        // Sequential default: every flow replays against the same live session, so they must not overlap.
+        // Each starts where the last left the app; a reset was built and reverted (see the ledger's 9.2).
+        // Bounded by a time budget and the session staying up; `resolve` follows a reload to its successor.
+        let driven = sessionId;
+        const stoppedEarly = await Bounded.runSequentially(requested, {
+          now: deps.now,
+          budgetMs: asNumber(args['budgetMs']) ?? Bounded.DEFAULT_SUITE_BUDGET_MS,
+          sessionAlive: () => {
+            try {
+              driven = deps.sessions.resolve(driven).id;
+              return true;
+            } catch {
+              return false;
+            }
+          },
+          run: async (flowName) => {
+            const start = deps.now();
+            const replay = await replayAndLearn(deps, { flowName, sessionId, ...confirmed });
+            const loaded = await flowsForSession(deps, target)
+              .flows.load(flowName, projectId)
+              .catch(() => null);
+            const flow = loaded !== null && loaded.ok ? loaded.value : undefined;
+            runs.push(flow === undefined ? { replay } : { replay, flow });
+            timed.push({
+              replay,
+              durationMs: deps.now() - start,
+              ...(flow === undefined ? {} : { flow }),
+            });
+          },
+        });
+        // The flake ledger the CLI gate already keeps — see FlakeStore. It was only ever written by
+        // `reticle flow` on the command line, so an AGENT running this tool a hundred times learned
+        // nothing about which flows are intermittent. Same product, same ledger, two surfaces, and the
+        // one an agent uses was the blind half.
+        const flaky = await recordSuiteFlakes(deps.fs, rootForTarget(deps, target), runs);
+        // Emit the consolidated run artifact (Runs tab) + best-effort cloud push. Never blocks the verdict.
+        const runId = await persistAndSyncVerificationRun(deps, timed, target);
+        const verdict = Bounded.withStop(
+          buildSuiteVerdict(runs, selected.knownRoutes, SuiteIsolation.SHARED_SESSION),
+          stoppedEarly.notRun,
+          stoppedEarly.stopped,
+        );
+        // A flow that has both passed and failed on UNCHANGED code is a different thing from a
+        // regression, and an agent that cannot tell them apart either chases a ghost or ignores a real
+        // break. Present only when the ledger has seen enough runs to say so.
+        return {
+          ...verdict,
+          ...(runId === undefined ? {} : { runId }),
+          ...(flaky.length > 0 ? { flaky: [...flaky] } : {}),
+          ...heldBack,
+          ...resultField(() => suiteResult(rootForTarget(deps, target), verdict, timed, runId)),
+        };
+      }),
+  },
+  {
+    name: ReticleTool.FLOW_SAVE_RECORDED,
+    description:
+      'Persist the HUMAN-recorded flow from the live tab. The recorder toolbar compiles the ' +
+      "human's real clicks/inputs into a semantically anchored FlowFile in-page and emits it; this " +
+      'tool reads the LATEST recorded-flow from the session and writes it to .reticle/flows/<name>.json ' +
+      '(no recompilation — the browser already resolved every anchor). Pass `name` to override the ' +
+      'recorded name. Returns { name, stepCount, degraded, empty } or { error, code } (code ' +
+      'flow_no_recorded when no recording is present).',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z
+        .string()
+        .optional()
+        .describe(
+          'Override the flow name embedded in the recorded flow. Omit to use the recorder-assigned name.',
+        ),
+      intent: z
+        .string()
+        .optional()
+        .describe(
+          'What this flow is FOR, in prose: which user does what, and what should become true. The recorder captures clicks, not goals, so this is the only place the goal can come from. Without it the flow still saves, but the day it goes red the report can only name the step that broke.',
+        ),
+      ...{
+        sessionId: z
+          .string()
+          .optional()
+          .describe(
+            'Active session ID from reticle_sessions. Omit when only one browser session is open.',
+          ),
+      },
+    },
+    // Match the handler's actual return (SaveSummary { name, stepCount, degraded, empty } or
+    // { error, code }) — the prior `flowName` key silently stripped the real `name`/`empty` fields.
+    outputSchema: {
+      name: z.string().optional(),
+      stepCount: z.number().optional(),
+      degraded: z.number().optional(),
+      empty: z.boolean().optional(),
+      intentGap: INTENT_GAP_FIELD,
+      error: z.string().optional(),
+      code: z.string().optional(),
+    },
+    handler: async (deps: ToolDeps, args) => {
+      const session = deps.sessions.resolve(asString(args['sessionId']));
+      const recorded = latestRecordedFlow(session.eventsSince(0));
+      if (recorded === undefined) {
+        return {
+          error: 'no human recording on this tab — start the recorder toolbar and click Stop first',
+          code: RecordedSaveError.NO_RECORDED_FLOW,
+        };
+      }
+      const override = asString(aliasParam(args, 'flowName', ['flow'])['flowName']);
+      const intent = asString(args['intent']);
+      const flow: FlowFile = {
+        ...recorded.flow,
+        ...(override === undefined ? {} : { name: override }),
+        ...(intent === undefined ? {} : { intent }),
+      };
+      // The store stamps the project into the file AND routes it to the per-project subdir (a shared
+      // daemon serves many apps), so location and content agree from one source of truth.
+      const emptyRecorded = emptyFlowRefusal(flow.steps.length, flow.name);
+      if (emptyRecorded !== undefined) {
+        return emptyRecorded;
+      }
+      // Resolved like every other path now. This save used to go to the daemon's root while the
+      // recorded-flow save resolved per session, so where a flow landed depended on which tool wrote
+      // it — and the pair that disagreed were the two ways to save the same thing.
+      const target: ProjectTarget = { projectId: session.projectId, origin: originOf(session.url) };
+      const res = await flowsForSession(deps, target).flows.saveFlow(flow, session.projectId);
+      if (!res.ok) {
+        return { error: flowErrorMessage(res.code, res.detail), code: res.code };
+      }
+      // If logged in to Reticle, mirror the saved flow to the team's regression suite. Best-effort
+      // and non-blocking: the flow is already on disk, so a sync failure never fails the save.
+      void syncSavedFlowToCloud(deps, flow, target);
+      // Return the SaveSummary as-is ({ name, stepCount, degraded, empty }) — the outputSchema
+      // declares `name`, so the old `flowName` key was silently stripped by schema-strict clients.
+      return res.value;
+    },
+  },
+  {
+    name: ReticleTool.FLOW_HEAL,
+    description:
+      'Self-healing replay. Re-runs reticle_flow_replay; on testid DRIFT computes confidence-scored ' +
+      'nearest-match rebind PROPOSALS. With apply:false (default) returns the proposed diff WITHOUT ' +
+      'writing. With apply:true, writes the confident rebind(s) back into .reticle/flows/<name>.json and ' +
+      'returns what changed — never silently. Before writing, apply re-replays the healed flow and ' +
+      're-asserts its success consequence: if the rebound locator resolves but the consequence no ' +
+      'longer fires, the write is REFUSED (status:consequence_broken) — it heals the locator, never ' +
+      'the intent. A drift with no proposal above the confidence floor is status:unhealable (file ' +
+      'untouched). Returns { name, status: healed|drift|unhealable|consequence_broken|' +
+      'nothing_to_heal|error, applied, proposals[], changed[], message }.',
+    inputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z.string().describe('Flow file name to heal (from reticle_flow{action:"list"}).'),
+      apply: z.boolean().optional().describe('Write the rebind. Omit to see the proposal only.'),
+      confirmDangerous: confirmDangerousArg('this heal replay'),
+      sessionId: z
+        .string()
+        .optional()
+        .describe(
+          'Active session ID from reticle_sessions. Omit when only one browser session is open.',
+        ),
+    },
+    outputSchema: {
+      flow: FLOW_NAME_ALIAS,
+      flowName: z.string(),
+      status: z.string(),
+      applied: z.boolean(),
+      proposals: z.array(z.unknown()),
+      changed: z.array(z.unknown()),
+      message: z.string(),
+      error: z.object({ code: z.string(), message: z.string() }).optional(),
+    },
+    handler: (deps: ToolDeps, args) =>
+      healFlow(deps, args).then(({ name, ...rest }) => ({ flowName: name, ...rest })),
+  },
+];
+
+/**
+ * Every flow reachable from this one by `invoke`, loaded once.
+ *
+ * Breadth-first with a `seen` set so a cycle terminates: typecheck refuses those at rest, and this
+ * runs at SAVE, which is exactly where a bad composite arrives before anything has checked it.
+ *
+ * A sub-flow that fails to load is simply absent from the map. The classifier then declines to
+ * credit it, which is the conservative direction — a composite graded on a flow nobody could read
+ * would be graded on a promise.
+ */
+async function loadInvoked(
+  flows: {
+    load: (name: string, projectId?: ProjectId) => Promise<{ ok: boolean; value?: FlowFile }>;
+  },
+  flow: FlowFile,
+  projectId?: ProjectId,
+): Promise<Map<string, FlowFile>> {
+  const out = new Map<string, FlowFile>();
+  const queue = [flow];
+  const seen = new Set<string>([flow.name]);
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (current === undefined) {
+      continue;
+    }
+    for (const step of flattenSteps(current.steps)) {
+      const name = step.invoke;
+      if (name === undefined || seen.has(name)) {
+        continue;
+      }
+      seen.add(name);
+      const sub = await flows.load(name, projectId);
+      if (!sub.ok || sub.value === undefined) {
+        continue;
+      }
+      out.set(name, sub.value);
+      queue.push(sub.value);
+    }
+  }
+  return out;
+}

@@ -1,0 +1,149 @@
+---
+title: '@reticlehq/browser'
+description: The Reticle instrumentation SDK that runs inside your page, observing the DOM, network, console, routing and state.
+icon: window
+---
+
+`@reticlehq/browser` is the Reticle SDK that runs inside your page. It installs the observers, builds semantic snapshots, executes actions, and talks to the bridge. Install it directly only if you are **not** on React or want to call `connect()` yourself, because [`@reticlehq/react`](/packages/react) already re-exports all of it.
+
+**Apache 2.0. Depends on `@reticlehq/core`.**
+
+## Why it exists
+
+This is what makes Reticle different from a browser-automation tool. Because it runs _inside_ the app rather than driving it from outside, it can see a state mutation and a fired signal, not just a rendered pixel. It never imports a Node API; that boundary is enforced by the dependency graph.
+
+[`reticle_look { action: "find" }`](/tools/query) speaks role, label and testid instead of CSS selectors through its own local accessibility engine: one engine computes both what elements are called and what they match by, so a reported identity always round-trips.
+
+## When you need it directly
+
+Install it yourself when you are not on React, or when you want `connect()` under your own control. React users install [`@reticlehq/react`](/packages/react) instead, which re-exports everything here.
+
+```bash
+npm i -D @reticlehq/browser
+```
+
+```ts
+import { reticle } from '@reticlehq/browser';
+
+if (import.meta.env.DEV) {
+  // reticle.local.js holds this machine's pairing token. Do not commit it.
+  import('./reticle.local.js')
+    .catch(() => ({}))
+    .then((local) => reticle.connect({ token: local.token }));
+}
+```
+
+The bridge refuses a connect without the pairing token, also on localhost. `reticle init` writes `reticle.local.js` at the project root and adds it to `.gitignore`. Change the import path so that it points to that file. If you did not run `reticle init`, make the file yourself from the token that the daemon keeps in `~/.reticle/pairing-token`:
+
+```bash
+printf "export const token = '%s';\n" "$(cat ~/.reticle/pairing-token)" > reticle.local.js
+echo reticle.local.js >> .gitignore
+```
+
+With the Vite plugin and `inject: false`, pass `token: __RETICLE_TOKEN__` instead. See [the Vite plugin](/packages/vite-plugin).
+
+## Subpaths
+
+| Subpath | What it is |
+| --- | --- |
+| `./activate` | `activate({ publicKey })`. Connects the SDK on a staging or production deployment, but only when the page URL carries a valid signed ticket in the `reticle_activate` parameter. Without the parameter it does nothing. See [Production mode](/production-mode) |
+| `./inject` | The SDK build that a hosted verifier puts into a page from outside. An app does not import it |
+
+## The `reticle` singleton
+
+One instance, memoized on `globalThis` so hot module replacement does not create a second one.
+
+| Method              | Signature                                                  |
+| ------------------- | ---------------------------------------------------------- |
+| `connect`           | `(options?: ReticleConnectOptions) => void`                |
+| `connected`         | `get connected(): boolean`                                 |
+| `signal`            | `(name: string, data?: Record<string, unknown>) => void`   |
+| `routes`            | `(patterns: readonly string[]) => void`                    |
+| `busy`              | `<T>(work: Promise<T>) => Promise<T>`                      |
+| `state`             | `(name: string, value: unknown) => void`                   |
+| `renderCommit`      | `(commits: number) => void`                                |
+| `describe`          | `(input: CapabilitiesInput) => void`                       |
+| `endSession`        | `() => void`                                               |
+| `disconnect`        | `() => void`                                               |
+| `observeHotUpdates` | `(hot: unknown) => void` (called by the build integration) |
+
+`routes` declares the app's route patterns (`/runs/:id`, `*` for the rest), so each route change names its screen. `busy` declares work that only the app can see, such as a debounced save. A settle waits for it, and it returns `work`.
+
+Everything else on the class is private. `Reticle` itself is exported for typing.
+
+`trackShortTimers(maxMs?: number): () => void` is a separate export. It counts every short `setTimeout` (one second or less by default) as busy work, so a settle waits through a debounce. It returns the function that turns it off. It is off until you call it.
+
+## `ReticleConnectOptions`
+
+Every field is optional.
+
+| Option | Type | What it controls |
+| --- | --- | --- |
+| `url` | `string` | Bridge URL, when you are not on the default port |
+| `session` | `string` | Session id. Defaults to the auto id (`SESSION_AUTO` is re-exported here) |
+| `projectId` | `string` | Project identity stamped on the handshake |
+| `token` | `string` | Pairing token. Required on every page, also on localhost, because the daemon makes one on its first start. The build plugins pass it for you |
+| `allowNonLocalhost` | `boolean` | Opt in to connecting from a non-localhost origin |
+| `allowInProduction` | `boolean` | Opt in to connecting from a production build. Desktop apps need this |
+| `env` | `'development' \| 'production'` | Where the page runs. `production` needs a session nonce as `token`. Absent: development. The [production loader](/production-mode) sets it |
+| `scope` | `'observe' \| 'act'` | What a drive may do. Required with `env: 'production'` |
+| `testIdAttribute` | `string` | The attribute the app marks controls with, when it is not `data-testid` |
+| `overlay` | `boolean` | The in-page overlay |
+| `captureNetworkBodies` | `boolean` | Record request and response bodies |
+| `networkBodyMaxChars` | `number` | Per-body cap for captured bodies (default 8192) |
+| `captureErrorBodies` | `boolean` | Keep the body of a failed request even with body capture off (default true) |
+| `sourceMapping` | `boolean` | Whether the build stamps source locations. Set by the build plugin |
+| `exposePresenter` | `boolean` | Make Reticle's own presenter visible to tools. For Reticle contributors only |
+| `root` | `string` | Repository root, so source paths come back relative |
+| `sdkVersion` | `string` | Reported on the handshake for skew detection |
+| `present` | `boolean` | Presenter mode |
+| `pace` | `number` | Presenter pacing |
+| `narrationDwellMs` | `number` | Presenter narration dwell |
+| `border` | `'session' \| 'busy'` | Which border the overlay draws |
+| `logMax` | `number` | Console buffer cap |
+| `recorder` | `boolean` | Enable flow recording |
+| `annotate` | `boolean` | Enable the human annotation layer |
+| `endedFadeMs` | `number` | Fade after a session ends |
+| `idleEndMs` | `number` | Idle timeout before the session ends itself |
+| `redact` | `RedactionConfig` | Redaction policy, from core |
+
+Reticle itself sets two more fields, `injected` and `lease`. Do not set them in an app.
+
+## Capabilities
+
+Declaring a capability surface is what lets an agent discover what your app can do without guessing.
+
+```ts
+import { registerCapabilities } from '@reticlehq/browser';
+
+registerCapabilities({
+  testids: ['login-submit'],
+  signals: ['auth:granted'],
+  stores: ['session'],
+  flows: [{ name: 'login', steps: ['fill email', 'fill password', 'submit'] }],
+});
+```
+
+Also exported: `getCapabilities()`, `hasCapabilities()`, `setCapabilitiesListener(cb?)`, and the `Capabilities`, `CapabilitiesInput` and `CapabilityFlow` types.
+
+## State adapters
+
+Register a store and its contents become readable through [`reticle_look { action: "state" }`](/tools/state).
+
+`registerStore`, `unregisterStore`, `storeNames`, `readStores`, `readStoresWithTruncation`.
+
+Ready-made adapters ship for TanStack Query, Jotai, XState, Valtio, MobX, Recoil, Svelte, Pinia, and a plain push store: `tanstackQueryStore`, `jotaiStore`, `xstateStore`, `valtioStore`, `mobxStore`, `recoilStore`, `svelteStore`, `piniaStore`, `pushStore`.
+
+## Framework adapters
+
+`registerAdapter`, `identifyComponent`, `readComponentState`, `elementHasHoverHandlers`, `adapterNames`, with the `ReticleAdapter`, `ComponentInfo` and `ComponentSource` types. [`@reticlehq/react`](/packages/react) registers the React one.
+
+## Lower-level building blocks
+
+Exported because the server and the test runner use them, and because an integration may need them: `buildSnapshot`, `matchQuery`, `runQuery`, `executeAction`, `executeSequence`, `describe`, `getRole`, `getAccessibleName`, `getStates`, `isVisible`, `refs`, `RefRegistry`, `setIgnoreSelectors`, `Annotator`, `installAnnotator`, `resolveMarkAnchor`, `inspectChart`, `canvasChartData`.
+
+Signal helpers: `createReticleEmitter`, `commitAndSignal`, `registerReticleDomain`.
+
+<Card title="Instrumenting an app properly" icon="plug" href="/instrumentation">
+  Signals, stores, and what makes evidence strong rather than circumstantial.
+</Card>

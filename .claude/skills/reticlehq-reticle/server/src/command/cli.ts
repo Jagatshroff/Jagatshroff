@@ -1,0 +1,929 @@
+#!/usr/bin/env node
+import { OnboardingPhase, PlatformLinkVia } from '@reticlehq/core/telemetry';
+import { hudSignIn } from './cli/cloud-login.js';
+import {
+  agentsBlock,
+  handleSetupMcp,
+  handleSetupInstall,
+  handleSetupWaitAgents,
+  readAgentRows,
+  shouldWaitForAgents,
+} from './cli/setup-mcp-cli.js';
+import { reportStepFromCli } from './cli-onboarding.js';
+import { pathToFileURL } from 'node:url';
+import { openFailureNote, openLaunchFailureNote } from './cli/answers/open-note.js';
+import { writeCiHint } from './cli/ci-hint.js';
+import { currentAutomationHint, isCiEnv } from '@/telemetry/automation-hint.js';
+import { realpathSync } from 'node:fs';
+import { join } from 'node:path';
+import { installCrashGuard } from './setup/setup-command.js';
+import { handleStatus } from './cli/status-fields.js';
+export { handleStatus, reportStatus } from './cli/status-fields.js';
+import { reticleStateHome } from './daemon/daemon.js';
+import { ensureDaemon } from './cli/ensure-daemon.js';
+import { handleMcp } from './cli/mcp-command.js';
+import { handleReport } from './cli/report-command.js';
+import { handleContext } from './cli/context-command.js';
+import { handleHook } from './cli/hook/hook-command.js';
+import { HOOK_COMMAND } from './cli/cli-parse.js';
+import {
+  daemonProjectAt,
+  readDaemonRegistry,
+  resolveDaemonForProject,
+} from './daemon/daemon-resolve.js';
+import { pickDaemonPortToBind } from './daemon/binding/free-port.js';
+import { exitAfterClose } from './daemon/lifetime/daemon-exit.js';
+import { isSameOrAbove, portForInit, portFromEnv } from './setup/init/init-port.js';
+import { daemonStartOptions } from './cli/daemon-start-options.js';
+import { handleGate, loadNamedFlows, resolveChangedFiles } from './cli/cli-flow-commands.js';
+import { DaemonStartupError, RETICLE_DEFAULT_PORT, ReticleDir, ReticleEnv } from '@reticlehq/core';
+import { loadDotEnv } from '@/telemetry/dev-repo.js';
+import { licenseKeyFromEnvFiles } from '@/features/license/license-env.js';
+import { LICENSE_KEY_ENV } from '@/features/license/license.js';
+import { createNodeFileSystem } from '@/memory/project/fs/fs-port.js';
+import { affectedSavedFlows } from '@/language/flows/change/flow-sources.js';
+
+import { handleUpdate, handleRollback } from './cli/cli-update-commands.js';
+import { headlessByDefault } from './cli/daemon-start-options.js';
+
+import { startDaemon } from '@/index.js';
+import { cmdLink, connectInstalls, isCloudCommand, runCloudCommand } from './cli/cloud-cli.js';
+import { SERVER_VERSION } from './version/identity/server-version.js';
+import { log } from '@/log.js';
+import { isAlive, removePid, discoverDaemonPort, writeDaemonRegistry } from './daemon/daemon.js';
+import { probePresence, presenceIsUsable } from './daemon/binding/port-presence.js';
+import { probeDaemon } from '@/surface/mcp/mcp-proxy.js';
+import {
+  installDaemonResilience,
+  recordExitReason,
+  DaemonExitReason,
+} from './daemon/daemon-resilience.js';
+import { IdleShutdown, resolveIdleShutdownMs, resolveIdleCheckMs } from './daemon/idle-shutdown.js';
+import { DaemonHeartbeat, resolveHeartbeatMs } from './daemon/lifetime/heartbeat.js';
+import { everServedToolCall } from './daemon/lifetime/daemon-usefulness.js';
+import { installStartupTrap, recordStartupFailure } from './daemon/lifetime/startup-failure.js';
+import {
+  summarizeStatus,
+  decideOpen,
+  openInBrowser,
+  openCommand,
+} from './cli/launch/cli-launch.js';
+import { NAVIGATE_NO_SESSION_ID, navigateLeftTab, openCandidates } from './cli/open-navigate.js';
+import { fetchStatus } from './daemon/binding/daemon-status-probe.js';
+import { handleDrive } from './cli/drive/drive-command.js';
+import { handleVerify } from './cli/cli-verify.js';
+import { handleVerifyAgainst } from './cli/verify-against.js';
+import { handleCompare } from './cli/two-builds/compare-command.js';
+import { handleGrade } from './cli/finished-run/grade-command.js';
+import { FIRST_VERDICT_REASON, bareRunsFirstVerdict } from './cli/first-verdict.js';
+import { cmdFirstVerdict } from './cli/first-verdict-node.js';
+import { reportOnboardingStop } from '@/telemetry/onboarding-funnel.js';
+import { runKill } from './cli/cli-kill.js';
+import { runInit, buildNodeIo, InitFailure, type InitResult } from '@reticlehq/init';
+import { continueAfterInit } from './setup/init/init-runtime.js';
+import { initFirstFlow } from './cli/try-command.js';
+import { handleDoctor } from './cli/cli-doctor.js';
+import { writeFirstUseWarnings } from './cli/first-use-checks.js';
+import { serverInitHost } from './setup/init/init-host.js';
+import { describeLicense } from '@/features/license/license.js';
+import {
+  isLikelyDevServerPort,
+  devServerPortWarning,
+  readProjectPort,
+  readProjectId,
+  workspacePortConflict,
+  projectDirOf,
+} from './cli/ports/resolve/cli-port.js';
+import {
+  helpRunsAt,
+  helpVersionNote,
+  nodeSpawner,
+  readTextFile,
+  reexecAtVersion,
+  versionMatchNote,
+  versionToMatch,
+} from './cli/launch/sdk-version-match.js';
+import type { StartOptions } from '@/index.js';
+
+import { PORT_FLAG, parseCliArgs, CLI_USAGE, dialsTheDaemon } from './cli/cli-parse.js';
+import { renderHelp } from './cli/cli-usage.js';
+import { RENAMED_COMMANDS, renamedCommandFor, renamedNote } from './cli/cli-parse-grammar.js';
+import { handleFeedback, handleTelemetry } from '@/telemetry/feedback-cli.js';
+import { installDaemonTelemetry } from '@/telemetry/daemon-telemetry.js';
+import { reportCliRun, reportGateCompleted } from '@/telemetry/cli-telemetry.js';
+
+// Re-exported so existing imports (and the CLI tests) keep resolving from '@/cli.js'.
+export { parseCliArgs, CLI_USAGE };
+export type { CliResult } from './cli/cli-parse.js';
+
+/** Said when `connect` carries on past an init whose setup did not finish. */
+const MSG_CONNECT_AFTER_UNFINISHED_INIT =
+  'Setup did not finish (above) — signing in and linking anyway. Fix what it names, then run ' +
+  '`reticle init` again.';
+
+/**
+ * Said last, when the account is linked and the one thing left is installing a dependency. Exit 0:
+ * connect's job — signing in and linking — is done, and a non-zero exit read as a failed connect.
+ */
+export const MSG_CONNECTED_DEPS_PENDING =
+  '⚠ Connected, but the dependency install did not finish (see above). Run the install it names, ' +
+  'then `reticle init` to wire the app.';
+
+/**
+ * How `reticle connect` exits: the cloud step's code when linking failed; 0 when it linked and setup
+ * finished or left only the dependency install (said in `note`); 1 when setup stopped for anything
+ * else. `initUnfinished` is why init's setup did not finish, or undefined when it did.
+ */
+export function connectExit(
+  cloudCode: number,
+  initUnfinished: string | undefined,
+): { code: number; note?: string } {
+  if (0 !== cloudCode) {
+    return { code: cloudCode };
+  }
+  if (initUnfinished === undefined) {
+    return { code: 0 };
+  }
+  if (InitFailure.DEPENDENCY_INSTALL === initUnfinished) {
+    return { code: 0, note: MSG_CONNECTED_DEPS_PENDING };
+  }
+  return { code: 1 };
+}
+
+async function handleInit(parsed: {
+  port: number | undefined;
+  mcp: boolean;
+  dryRun: boolean;
+  install: boolean;
+  app?: string | undefined;
+  flow?: string | undefined;
+  env?: string[] | undefined;
+  filesOnly?: boolean | undefined;
+  newId?: boolean | undefined;
+  captureBodies?: boolean | undefined;
+  hooks?: boolean | undefined;
+  promptCapture?: boolean | undefined;
+  licenseKey?: string | undefined;
+  json?: boolean | undefined;
+  drive?: boolean | undefined;
+  open?: boolean | undefined;
+  agents?: boolean | undefined;
+  url?: string | undefined;
+  timeoutSeconds?: number | undefined;
+  driveModel?: string | undefined;
+  keepGoing?: boolean | undefined;
+}): Promise<InitResult> {
+  const cwd = process.cwd();
+  // RETICLE_PORT counts as explicit, as it does for every other command: resolved once here, so the
+  // port written into the project and the port the runtime phase binds are the same number.
+  const explicit = parsed.port ?? portFromEnv(process.env);
+  // The bridge port matters only when init goes on to start the app.
+  const bridgePort =
+    true === parsed.filesOnly || parsed.dryRun
+      ? undefined
+      : (explicit ?? readProjectPort(cwd) ?? RETICLE_DEFAULT_PORT);
+  await writeFirstUseWarnings(bridgePort);
+  const port = await portForInit(
+    explicit,
+    readProjectPort(cwd),
+    readProjectId(cwd),
+    {
+      // The registry names a daemon's owner; an older daemon that never registered is known by the
+      // projects its connected pages announced.
+      daemonProjects: async (p) => {
+        const claimed = daemonProjectAt(p, reticleStateHome());
+        if (claimed !== undefined && claimed.length > 0) {
+          return [claimed];
+        }
+        const { sessions } = summarizeStatus(await fetchStatus(p));
+        return [
+          ...new Set(sessions.flatMap((s) => (s.projectId === undefined ? [] : [s.projectId]))),
+        ];
+      },
+      daemonPresent: async (p) =>
+        presenceIsUsable(await probePresence(p, { tcpOpen: probeDaemon, status: fetchStatus })),
+      pickPort: (p) => pickDaemonPortToBind(p),
+      daemonStartedHere: (p) => {
+        const started = readDaemonRegistry(reticleStateHome()).find((e) => e.port === p)?.cwd;
+        return started !== undefined && isSameOrAbove(started, cwd);
+      },
+    },
+    cwd,
+  );
+  const io = buildNodeIo(cwd, serverInitHost(), { stderr: true === parsed.json });
+  const result = runInit(
+    {
+      cwd,
+      port,
+      mcp: parsed.mcp,
+      dryRun: parsed.dryRun,
+      install: parsed.install,
+      ...(parsed.app === undefined ? {} : { app: parsed.app }),
+      // Handed to init, not only to the drive phase below: the preflight names `--url` as the way
+      // past a missing package manager, and could not honour that while never being told about it.
+      ...(parsed.url === undefined ? {} : { url: parsed.url }),
+      captureBodies: true === parsed.captureBodies,
+      hooks: true === parsed.hooks,
+      newId: true === parsed.newId,
+      promptCapture: false !== parsed.promptCapture,
+      // The outcome is reported by confirmInstall instead, once it knows whether an app connected —
+      // `init` writing files was never the same thing as `init` working (#269).
+      deferOutcome: true,
+      continuesToRuntime: true !== parsed.filesOnly && true !== parsed.dryRun,
+    },
+    io,
+  );
+  await continueAfterInit({ ...parsed, port }, result, io, cwd, initFirstFlow, (print, mayWait) =>
+    agentsBlock(
+      readAgentRows(cwd),
+      print,
+      mayWait && shouldWaitForAgents(process.stdout.isTTY, isCiEnv(process.env)),
+    ),
+  );
+  return result;
+}
+
+// `serve`, `stop` and `restart` live in `cli/lifecycle/daemon-lifecycle.ts`: one idea, and the
+// largest group this file could give up without splitting something that belongs together.
+import { handleServe, handleStop, handleRestart } from './cli/lifecycle/daemon-lifecycle.js';
+
+/**
+ * Print the running package version (resolved once in server-version.ts), and nothing else.
+ *
+ * Bare on stdout so `V=$(reticle version)` works. It also wrote a JSON event to stderr, which a
+ * terminal shows: the first thing a new user typed after installing answered with a log line.
+ */
+function handleVersion(): void {
+  process.stdout.write(`${SERVER_VERSION}\n`);
+}
+
+/** `reticle license` (now `status`) — show enterprise activation resolved from the environment (offline; nothing leaves). */
+function handleLicense(): void {
+  log('reticle_license', { ...describeLicense(Date.now()) });
+}
+
+/**
+ * `reticle gate --list <file...>` (was `affected`) — print which saved flows must re-verify for the given changed files.
+ * Environment-side (costs the agent nothing per turn); the foundation of watch/gate. Never throws:
+ * a load error is logged, not fatal.
+ */
+
+async function handleAffected(files: string[], since: string | undefined): Promise<void> {
+  try {
+    const fs = createNodeFileSystem();
+    const reticleRoot = join(process.cwd(), ReticleDir.ROOT);
+    // The CLI gate still degrades to "no changes" rather than crash CI over a bad ref — the
+    // original reasoning, now opted into explicitly instead of handed a clean-looking empty list.
+    const changed = (await resolveChangedFiles(files, since, process.cwd())).files;
+    const result = affectedSavedFlows(
+      await loadNamedFlows(fs, reticleRoot, readProjectId(process.cwd())),
+      changed,
+    );
+    log('reticle_affected', {
+      changedFiles: changed,
+      affected: result.affected,
+      unknownProvenance: result.unknownProvenance,
+    });
+  } catch (error) {
+    log('reticle_affected_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * `reticle open [url]` — the one-command "show me the app". Resolves the port (the requested one if a
+ * daemon's there, else a running daemon it discovers — so the user never hunts for the port), ensures
+ * the daemon, then reuses the already-connected tab or opens a new browser at the url. Idempotent:
+ * re-running never piles up duplicate tabs.
+ */
+/** How long `reticle open` waits for the launched page to register before reporting on it. */
+const OPEN_SESSION_WAIT_MS = 8000;
+/** For the heartbeat's resident memory, in MB. */
+const BYTES_PER_MB = 1024 * 1024;
+
+/**
+ * Poll until a NEW session shows up, or the wait runs out. Returns whether one did.
+ *
+ * Compares against the count taken before launching rather than against zero, so opening a second
+ * app while one is already connected is not reported as an instant success.
+ */
+async function waitForNewSession(port: number, before: number): Promise<boolean> {
+  const deadline = Date.now() + OPEN_SESSION_WAIT_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const { sessions } = summarizeStatus(await fetchStatus(port));
+    if (sessions.length > before) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** What to do about a same-origin tab `open` left where it was. */
+const OPEN_LEFT_AS_IS_REMEDY =
+  'Pass --navigate to move it, drive it with reticle_navigate, or open the url in the browser yourself.';
+
+function handleOpen(requestedPort: number, url: string | undefined, navigate = false): void {
+  // Our project's daemon first: `discoverDaemonPort` returns the LOWEST live daemon on the machine,
+  // whoever it belongs to, so on a machine running two projects `reticle open` could drive the other
+  // one's browser. It stays as the last resort for a caller with no project id, where any daemon is
+  // better than none and there is no identity to confuse.
+  const myProject = readProjectId(process.cwd());
+  probeDaemon(requestedPort)
+    .then((here) =>
+      here
+        ? requestedPort
+        : (resolveDaemonForProject(myProject, reticleStateHome(), isAlive) ??
+          discoverDaemonPort() ??
+          requestedPort),
+    )
+    .then(async (port) => {
+      await ensureDaemon(port);
+      const { sessions } = summarizeStatus(await fetchStatus(port));
+      // `--navigate` MOVES a tab, so it may only pick one of ours: on a daemon serving two projects,
+      // the origin match alone could hand it the other project's tab. Reuse and the note are read-only.
+      const candidates = openCandidates(sessions, navigate, myProject);
+      const decision = decideOpen(candidates, url);
+      if ('need-url' === decision.action) {
+        log('reticle_open', {
+          port,
+          error:
+            'no app connected — pass a url: reticle open <url>. Desktop app (Electron/Tauri)? ' +
+            'There is no url to open: start it as you normally would and it connects to this bridge itself.',
+        });
+        return;
+      }
+      if ('reuse' === decision.action) {
+        log('reticle_open', { port, reusing: decision.url });
+        return;
+      }
+      // A tab on the right origin, on the WRONG page. Kept (that is what stops a tab piling up per
+      // run) but never reported as done: `reusing` here read as "your url is open" for a page nobody
+      // had opened.
+      if ('left-as-is' === decision.action && navigate && decision.sessionId !== undefined) {
+        const moved = await navigateLeftTab({
+          port,
+          sessionId: decision.sessionId,
+          url: decision.requested,
+        });
+        log('reticle_open', { port, ...moved });
+        // A loop or CI step reads the exit code, so a failed move must not exit 0.
+        if (moved['error'] !== undefined) {
+          process.exit(1);
+        }
+        return;
+      }
+      if ('left-as-is' === decision.action) {
+        // `--navigate` was asked for and could not be honoured: the tab never reported a session id
+        // to move. Suggesting `--navigate` back to someone who just passed it reads as being ignored.
+        const remedy = navigate ? NAVIGATE_NO_SESSION_ID : OPEN_LEFT_AS_IS_REMEDY;
+        log('reticle_open', {
+          port,
+          reusing: decision.url,
+          requested: decision.requested,
+          note:
+            `a tab is connected on this origin but sitting on ${decision.url} — it was LEFT THERE, ` +
+            `not navigated to ${decision.requested}. ${remedy}`,
+        });
+        if (navigate) {
+          process.exit(1);
+        }
+        return;
+      }
+      const launchError = await openInBrowser(decision.url);
+      if (launchError !== null) {
+        log('reticle_open', {
+          port,
+          error: `could not launch a browser: ${launchError}`,
+          // Points at the OS handler, not at `reticle doctor`. Doctor's browser check is about
+          // Reticle's own Chromium, which this command never touches — the same misdirect the
+          // no-session note below spells out at length, left standing here for one more release.
+          recovery: openLaunchFailureNote(
+            decision.url,
+            openCommand(decision.url, process.platform).cmd,
+          ),
+        });
+        process.exit(1);
+        return;
+      }
+      // Say whether a SESSION appeared, not merely that a launcher was invoked. `{"opened": url}`
+      // was printed unconditionally, so a run where nothing ever opened looked identical to a run
+      // where it did — reported from the field as twenty minutes lost to a phantom port problem.
+      const connected = await waitForNewSession(port, sessions.length);
+      // Read only when nothing arrived: the daemon may have refused the page, and says so here.
+      const daemonAnswer = connected ? {} : summarizeStatus(await fetchStatus(port));
+      log('reticle_open', {
+        port,
+        ...(port === requestedPort ? {} : { requestedPort }),
+        opened: decision.url,
+        connected,
+        ...(connected
+          ? {}
+          : {
+              // Two claims used to live here that this command cannot support. It said the browser
+              // "was launched" — it asked the OS to open a URL and cannot see whether a window
+              // appeared — and it offered "the app may still be loading" as a cause with equal
+              // weight to the real one. It then pointed at `reticle doctor`, whose Chromium check is
+              // about a browser THIS command never uses, so a missing Chromium reads as the
+              // explanation for a session that is missing for an unrelated reason. Both misdirects
+              // were reported from the field, each costing several calls of app-side wiring hunt.
+              note: openFailureNote(port, requestedPort, daemonAnswer, decision.url),
+            }),
+      });
+    })
+    .catch((err: unknown) => {
+      log('reticle_open', { error: err instanceof Error ? err.message : String(err) });
+      process.exit(1);
+    });
+}
+
+function handleDaemonInner(parsed: {
+  port: number;
+  driveUrl?: string;
+  headless: boolean;
+  http: boolean;
+  httpPort?: number;
+  httpToken?: string;
+}): void {
+  // The daemon the CLI starts is the one that can sign in for the panel: it owns ~/.reticle.
+  const options: StartOptions = {
+    ...daemonStartOptions(parsed),
+    hudSignIn: (repaint, link) => hudSignIn(repaint, undefined, undefined, link),
+    hudLink: (root) => cmdLink([], root, PlatformLinkVia.HUD),
+  };
+
+  // Until the daemon is ready, a throw or a rejection is a failed start. Write it to the log with
+  // its code, so the next start can say why this one died (#2043).
+  const disposeStartupTrap = installStartupTrap(process, log);
+  startDaemon(options)
+    .then((server) => {
+      disposeStartupTrap();
+      log('reticle_daemon_ready', { port: parsed.port, pid: process.pid });
+      // Daemon lifecycle telemetry: started, a one-shot project profile, the periodic counter flush,
+      // and the rich summary on shutdown. All of it lives in one module — see daemon-telemetry.ts.
+      const daemonTelemetry = installDaemonTelemetry(process.cwd(), undefined, parsed.port);
+      // Publish to the discovery registry so a build plugin can find this daemon by projectId — no
+      // hand-reconciled port. Written from the child (only it knows its cwd); removePid drops it.
+      const registryProjectId = readProjectId(process.cwd());
+      writeDaemonRegistry(parsed.port, {
+        pid: process.pid,
+        cwd: process.cwd(),
+        startedAt: Date.now(),
+        ...(registryProjectId !== undefined ? { projectId: registryProjectId } : {}),
+      });
+      // The daemon serves many agents — keep it alive through one agent's stray async error; only a
+      // genuine uncaught throw takes it down (cleanly, so the next `reticle mcp` respawns it fresh).
+      installDaemonResilience(process, log, () => {
+        removePid(parsed.port);
+        process.exit(1);
+      });
+      const shutdown = (reason: DaemonExitReason): void => {
+        // Recorded BEFORE the async chain: `installExitTrace` reads it when Node is on its way out,
+        // which is after everything below has run. Without it the exit line says `code: 0` and a
+        // reader cannot tell a tidy stop from the bridge disappearing — see #123.
+        recordExitReason(reason);
+        // Say so on the wire before anything closes. The proxy on the other end sees a clean stream
+        // end whether we retired on schedule or died under it, and it has no other way to tell —
+        // which is how a designed shutdown came to dominate the metric that means "the agent lost
+        // its tools". Told, the proxy classifies its own drop honestly. First, because the send has
+        // to reach a socket that is still open.
+        server.announceShutdown?.();
+        // Awaited before the close/exit chain: `process.exit(0)` kills an in-flight POST, and this is
+        // the one event carrying the whole session. The reason rides out on the session summary;
+        // the proxy sees only a socket end. See SessionSummary.exit. The summary and the close share
+        // one bound, so a close that never settles cannot keep this process on its port (#1937).
+        void exitAfterClose({
+          summary: () => daemonTelemetry.shutdown(reason),
+          close: () => server.close(),
+        }).then((code) => {
+          removePid(parsed.port);
+          process.exit(code);
+        });
+      };
+      // Wrapped rather than passed directly: a signal handler receives the signal name as its first
+      // argument, which would otherwise arrive as the reason.
+      process.on('SIGTERM', () => shutdown(DaemonExitReason.SIGNAL));
+      process.on('SIGINT', () => shutdown(DaemonExitReason.SIGNAL));
+      // `reticle stop` asks here first: on Windows a signal ends the process with no shutdown path.
+      server.onShutdownRequest?.(() => shutdown(DaemonExitReason.SIGNAL));
+      // Self-shut-down when idle so a detached daemon (and any headless Chromium it launched) never
+      // lingers on the user's machine after the editor closes. Reuses the same clean shutdown path.
+      const attachedGraceEnv = process.env[ReticleEnv.IDLE_ATTACHED];
+      const idleShutdown = new IdleShutdown({
+        graceMs: resolveIdleShutdownMs(process.env[ReticleEnv.IDLE_SHUTDOWN]),
+        checkIntervalMs: resolveIdleCheckMs(process.env[ReticleEnv.IDLE_CHECK]),
+        isIdle: server.isIdle ?? (() => false),
+        ...(server.agentAttached === undefined ? {} : { agentAttached: server.agentAttached }),
+        // Only when the var is actually SET. `resolveIdleShutdownMs(undefined)` returns the 5-minute
+        // DEFAULT, so passing it unconditionally would override the derived attached grace with the
+        // very number this change exists to stop using — shipping the bug while looking fixed.
+        ...(attachedGraceEnv === undefined || '' === attachedGraceEnv.trim()
+          ? {}
+          : { attachedGraceMs: resolveIdleShutdownMs(attachedGraceEnv) }),
+        onShutdown: () => {
+          log('reticle_daemon_idle_exit', { port: parsed.port });
+          shutdown(DaemonExitReason.IDLE);
+        },
+      });
+      idleShutdown.start();
+      // Say so, regularly, so a GAP in this log is itself evidence. `installExitTrace` hooks
+      // `'exit'`, which a SIGKILL never fires — so a killed daemon left nothing behind, and the one
+      // that exited tidily logged `code: 0`. A reader could not tell "shut down cleanly" from "the
+      // bridge every app on this machine needs is gone", and a correct SvelteKit install was written
+      // up as an install failure on exactly that ambiguity. See daemon/lifetime/heartbeat.ts.
+      new DaemonHeartbeat({
+        log,
+        intervalMs: resolveHeartbeatMs(process.env[ReticleEnv.HEARTBEAT]),
+        facts: () => ({
+          sessions: server.bridge.sessions.count(),
+          served: everServedToolCall(),
+          rssMb: Math.round(process.memoryUsage().rss / BYTES_PER_MB),
+        }),
+      }).start();
+    })
+    .catch((error: unknown) => {
+      disposeStartupTrap();
+      recordStartupFailure(log, error, DaemonStartupError.START);
+      removePid(parsed.port);
+      process.exit(1);
+    });
+}
+
+export function main(): void {
+  // A bug of OURS arrives as one sentence and a tidy machine, never a Node stack trace.
+  installCrashGuard();
+  // Before anything reads process.env — notably the telemetry gate and the bridge's security
+  // options — fold in a project-local `.env`. Values already in the environment always win.
+  loadDotEnv(process.cwd());
+  // The licence key specifically is searched for HARDER than the rest of the environment, because
+  // the daemon is spawned without an explicit cwd and inherits the editor's. A key in the app's own
+  // `.env` — or in the repo root when the editor started inside the app — was never read, and the
+  // run then reported the licence as `missing`, which is indistinguishable from having none at all.
+  // Only the key is taken; see license-env.ts for why nothing else is.
+  const licenseKey = licenseKeyFromEnvFiles(process.cwd());
+  if (licenseKey !== undefined) {
+    process.env[LICENSE_KEY_ENV] = licenseKey;
+  }
+  const argv = process.argv.slice(2);
+  // The agent's prompt hook, FIRST: before the version re-exec (it must not start a second CLI on
+  // every prompt) and before telemetry, which must never see that a prompt existed, let alone it.
+  // `--help` falls through to the parser, which prints what `hook` does.
+  if (HOOK_COMMAND === argv[0] && !argv.some((arg) => '--help' === arg || '-h' === arg)) {
+    // `tool` too: a hook that fails must never be reported to the agent as its tool failing.
+    const agentHook = ['prompt', 'prompt-write', 'tool', 'tool-write'].includes(argv[1] ?? '');
+    void handleHook(argv.slice(1))
+      .then((code) => process.exit(code))
+      // A hook that fails must still let the prompt through, so `prompt` exits 0 whatever happens.
+      .catch(() => process.exit(agentHook ? 0 : 1));
+    return;
+  }
+  // Before anything reports or writes: a CLI a major away from the project's SDK makes every verdict
+  // `version_skew`, and the unpinned `npx @reticlehq/server` every agent entry uses resolves the
+  // LATEST major whatever the project installed. Hand the same arguments to the matching release and
+  // step aside — it reports its own run. See cli/launch/sdk-version-match.ts.
+  // One project lookup for both questions below: it reads config and walks the workspace.
+  const versionInput = {
+    argv,
+    cliVersion: SERVER_VERSION,
+    env: process.env,
+    projectDir: projectDirOf(process.cwd()),
+    readFile: readTextFile,
+  };
+  const matchVersion = versionToMatch(versionInput);
+  if (matchVersion !== undefined) {
+    process.stderr.write(`${versionMatchNote(matchVersion, SERVER_VERSION)}\n`);
+    reexecAtVersion(matchVersion, argv, process.env, {
+      spawn: nodeSpawner,
+      exit: (code) => process.exit(code),
+      warn: (line) => process.stderr.write(`${line}\n`),
+    });
+    return;
+  }
+  // Help stays on this binary, so say which version the command it describes really runs at (#1378).
+  const helpVersion = helpRunsAt(versionInput);
+  if (helpVersion !== undefined) {
+    process.stdout.write(`${helpVersionNote(helpVersion, SERVER_VERSION)}\n\n`);
+  }
+  // Every invocation passes through here — the single chokepoint for the "how often is it used / how
+  // many distinct machines + projects" metrics. Fire-and-forget: a metric must never delay or fail a run.
+  //
+  // `_daemon` is EXCLUDED, and that exclusion is the whole point of this branch. `reticle mcp` and
+  // `reticle serve` start the daemon by re-running this very binary, so the child re-entered main()
+  // and emitted a second event for what a person experienced as one action. The old `invoke` metric
+  // was therefore inflated ~2x — and inflated worst on the agent-driven sessions that matter most,
+  // while one-shot commands like `version` counted once. That skewed the RATIO between commands, not
+  // just the scale, which is the kind of error you cannot correct for after the fact. The daemon's
+  // own lifecycle is already reported by `daemon_started` / `daemon_stopped`; it is not a CLI run.
+  reportCliRun(argv);
+  // An old name still runs, for one release, and says once what it is called now. Not when the
+  // person only asked for help: that answer names the new command itself, on stdout.
+  const renamedTo = renamedCommandFor(argv);
+  if (renamedTo !== undefined) {
+    const colour = true === process.stderr.isTTY && process.env['NO_COLOR'] === undefined;
+    process.stderr.write(`${renamedNote(argv[0] ?? '', renamedTo, colour)}\n`);
+  }
+  // Cloud subcommands (connect/sync/runs/config) are a distinct family with their own async client;
+  // handle them before the local typed parser so `reticle login` etc. work as one tool.
+  if (isCloudCommand(argv[0])) {
+    // Asking a command what it does is never a request to run it. These dispatch before the typed
+    // parser, so the rule there that recognises `--help` anywhere never sees them, and
+    // `reticle link --help` used to run the command: it reached for the network and answered
+    // `fetch failed` with exit 1, to somebody who had asked what the command was for.
+    if (argv.some((arg) => '--help' === arg || '-h' === arg)) {
+      process.stdout.write(`${renderHelp(argv[0], RENAMED_COMMANDS)}\n`);
+      return;
+    }
+    if ('connect' === argv[0]) {
+      void (async () => {
+        // A fresh project gets the same install, dev-server handover and browser proof as `init`.
+        // Its failure exits non-zero before any cloud binding can claim this repo is ready.
+        // A setup that did not finish is said above and still fails the run, but no longer ends it
+        // before sign-in: the second identical run was the only way to get signed in.
+        let unfinished: string | undefined;
+        if (readProjectId(process.cwd()) === undefined) {
+          const init = await handleInit({
+            port: undefined,
+            mcp: true,
+            dryRun: false,
+            install: connectInstalls(argv),
+            keepGoing: true,
+          });
+          if (1 === process.exitCode) {
+            // init hands no context over exactly when the dependency install failed (run.ts); its
+            // outcome's own reason is unset when the files were all written and the app was not.
+            unfinished =
+              init.context === undefined && init.outcome !== undefined
+                ? InitFailure.DEPENDENCY_INSTALL
+                : (init.outcome?.reason ?? InitFailure.OTHER);
+            process.exitCode = 0;
+            process.stderr.write(`${MSG_CONNECT_AFTER_UNFINISHED_INIT}\n`);
+          }
+        }
+        const exit = connectExit(await runCloudCommand(argv), unfinished);
+        if (exit.note !== undefined) {
+          process.stderr.write(`${exit.note}\n`);
+        }
+        return exit.code;
+      })()
+        .then((code) => process.exit(code))
+        .catch((cause: unknown) => {
+          process.stderr.write(
+            `reticle connect: ${cause instanceof Error ? cause.message : String(cause)}\n`,
+          );
+          process.exit(1);
+        });
+      return;
+    }
+    void runCloudCommand(argv).then((code) => process.exit(code));
+    return;
+  }
+  const envPort = portFromEnv(process.env);
+  const projectPort = readProjectPort(process.cwd());
+  // Say so rather than letting the daemon fight the dev server for the port and fail with an
+  // EADDRINUSE that mentions neither file nor cause.
+  if (projectPort !== undefined && isLikelyDevServerPort(projectPort)) {
+    process.stderr.write(`${devServerPortWarning(projectPort)}\n`);
+  }
+  // A monorepo root whose wired apps disagree on a port: nothing is picked, and without this line the
+  // default below would be — another project's daemon, answered as if it were this one.
+  const portConflict =
+    projectPort === undefined && envPort === undefined && !argv.includes(PORT_FLAG)
+      ? workspacePortConflict(process.cwd())
+      : undefined;
+  if (portConflict !== undefined) {
+    process.stderr.write(`${portConflict}\n`);
+  }
+  // Registry BEFORE the default, and after both explicit sources.
+  //
+  // This is the line that ends the split brain. Build plugins have always asked the registry which
+  // daemon serves this project; the CLI asked a number and then attached to whoever owned it. So
+  // every project on the machine funnelled into one daemon whose identity was whichever project won
+  // the race, and one kill on one well-known port was a machine-wide outage.
+  //
+  // An explicit port still wins, because a person who typed one is answering this question
+  // themselves. Below that, our OWN daemon wherever it is listening. Only then the default, which is
+  // now a starting preference rather than an assumption.
+  const myProjectId = readProjectId(process.cwd());
+  const myDaemonPort = resolveDaemonForProject(myProjectId, reticleStateHome(), isAlive);
+  const defaultPort = envPort ?? projectPort ?? myDaemonPort ?? RETICLE_DEFAULT_PORT;
+  // Headed by default; hidden only where there is no display to be headed on. A run nobody can see
+  // is a run nobody trusts, and every "did it actually do anything?" cost a human round-trip.
+  const parsed = parseCliArgs(argv, defaultPort, headlessByDefault(process.env, process.platform));
+  // The refusal the line above promised. Printing it and carrying on let the default port answer
+  // anyway, for whichever project's daemon owned it.
+  if (portConflict !== undefined && dialsTheDaemon(parsed)) {
+    process.exit(1);
+  }
+
+  switch (parsed.kind) {
+    case 'error':
+      // Two audiences, two channels. The structured line is for logs and scripts; the plain text is
+      // for the person who just typed the command. Emitting only the JSON meant a single typo came
+      // back as an escaped one-line wall of the entire help text — see the ParseError builders.
+      log('reticle_usage_error', { message: parsed.message });
+      process.stderr.write(
+        parsed.message === CLI_USAGE ? `${CLI_USAGE}\n` : `${parsed.message}\n\n${CLI_USAGE}\n`,
+      );
+      process.exit(1);
+      break;
+    case 'init':
+      void handleInit(parsed);
+      break;
+    case 'serve':
+      // Bare `reticle` in a folder Reticle has not wired: the first verdict, with no agent and no
+      // `init`. A wired project, and `reticle serve` itself, keep serving.
+      if (
+        bareRunsFirstVerdict(
+          argv,
+          myProjectId !== undefined || projectPort !== undefined || portConflict !== undefined,
+        )
+      ) {
+        void cmdFirstVerdict(parsed.port, !parsed.headless, (row) =>
+          reportOnboardingStop(
+            { phase: OnboardingPhase.FIRST_RUN, reason: FIRST_VERDICT_REASON, ...row },
+            { detach: true },
+          ),
+        )
+          .then((code) => process.exit(code))
+          .catch((cause: unknown) => {
+            process.stderr.write(
+              `reticle: ${cause instanceof Error ? cause.message : String(cause)}\n`,
+            );
+            process.exit(1);
+          });
+        break;
+      }
+      handleServe(parsed);
+      break;
+    case 'stop':
+      handleStop(parsed.port, parsed.quiet);
+      break;
+    case 'kill':
+      void runKill(parsed.port, parsed.force).then((freed) => {
+        if (!freed) {
+          process.exit(1);
+        }
+      });
+      break;
+    case 'restart':
+      void handleRestart(parsed.port, parsed.force);
+      break;
+    case 'status':
+      // Offline: the license key is read from the environment.
+      void handleStatus(parsed.port, parsed.json, { ...describeLicense(Date.now()) });
+      break;
+    case 'license':
+      handleLicense();
+      break;
+    case 'telemetry':
+      handleTelemetry(parsed.action);
+      break;
+    case 'feedback':
+      void handleFeedback(
+        parsed.text,
+        parsed.rating,
+        parsed.bug,
+        parsed.feedbackKind,
+        parsed.agent,
+        parsed.contact,
+      );
+      break;
+    case 'version':
+      handleVersion();
+      break;
+    case 'help':
+      process.stdout.write(`${renderHelp(parsed.topic, RENAMED_COMMANDS)}\n`);
+      break;
+    case 'removed':
+      process.stderr.write(`${parsed.message}\n`);
+      process.exit(1);
+      break;
+    case 'doctor':
+      void handleDoctor(parsed.port, parsed.fix, reportStepFromCli);
+      break;
+    case 'setup-mcp':
+      void writeFirstUseWarnings().then(() => {
+        handleSetupMcp(
+          reportStepFromCli,
+          true,
+          shouldWaitForAgents(process.stdout.isTTY, isCiEnv(process.env)),
+        );
+      });
+      break;
+    case 'setup-wait-agents':
+      void handleSetupWaitAgents(shouldWaitForAgents(process.stdout.isTTY, isCiEnv(process.env)));
+      break;
+    case 'setup-install':
+      void writeFirstUseWarnings().then(() => {
+        handleSetupInstall(
+          {
+            runtimeSecs: parsed.runtimeSecs,
+            installSecs: parsed.installSecs,
+            mcp: parsed.mcp,
+          },
+          reportStepFromCli,
+        );
+      });
+      break;
+    case 'open':
+      handleOpen(parsed.port, parsed.url, parsed.navigate);
+      break;
+    case 'drive':
+      handleDrive(parsed, readProjectId(process.cwd()));
+      break;
+    case 'verify':
+      void writeFirstUseWarnings().then(async () => {
+        // `--against` compares two builds through the daemon, and starts one when there is none.
+        if (parsed.against !== undefined) {
+          await handleVerifyAgainst({ ...parsed, against: parsed.against }, ensureDaemon, {
+            line: (text) => process.stdout.write(`${text}\n`),
+            fail: (text) => process.stderr.write(`${text}\n`),
+            exit: (code) => process.exit(code),
+          });
+          return;
+        }
+        handleVerify(parsed, () => {
+          writeCiHint({ automation: currentAutomationHint(process.env), machineOutput: false });
+        });
+      });
+      break;
+    case 'compare':
+      // Two builds through the daemon, which it starts when there is none. Nothing to install.
+      void handleCompare(parsed, ensureDaemon, {
+        line: (text) => process.stdout.write(`${text}\n`),
+        exit: (code) => process.exit(code),
+      });
+      break;
+    case 'grade':
+      // Reads the declared state sources and snapshot files. No daemon and no browser.
+      void handleGrade(parsed.args, {
+        line: (text) => process.stdout.write(`${text}\n`),
+        exit: (code) => process.exit(code),
+      });
+      break;
+    case 'affected':
+      void handleAffected(parsed.files, parsed.since).then(() => {
+        writeCiHint({ automation: currentAutomationHint(process.env), machineOutput: false });
+      });
+      break;
+    case 'gate':
+      void handleGate(
+        parsed.files,
+        parsed.since,
+        parsed.hook,
+        parsed.acceptCoverage,
+        reportGateCompleted,
+      ).then(() => {
+        // A stop hook's output is read by the agent, so it is a machine output mode.
+        writeCiHint({
+          automation: currentAutomationHint(process.env),
+          machineOutput: true === parsed.hook,
+        });
+      });
+      break;
+    case 'report':
+      void handleReport(parsed.session, parsed.hook);
+      break;
+    case 'context':
+      void handleContext(parsed.session);
+      break;
+    case 'update':
+      void handleUpdate();
+      break;
+    case 'rollback':
+      void handleRollback();
+      break;
+    case 'mcp':
+      void handleMcp(parsed);
+      break;
+    case '_daemon':
+      handleDaemonInner(parsed);
+      break;
+  }
+}
+
+/**
+ * True when this module is the process entry point. Resolves argv[1] through the realpath because
+ * package managers (notably pnpm) symlink `node_modules/<pkg>` into a store dir: the bin shim runs
+ * `node node_modules/@reticlehq/core/dist/cli.js` (the symlink) while ESM `import.meta.url` is the
+ * realpath. A plain string compare is false there, so `reticle <cmd>` would silently no-op.
+ */
+function isEntryPoint(): boolean {
+  const argv1 = process.argv[1];
+  if (argv1 === undefined) {
+    return false;
+  }
+  if (import.meta.url === pathToFileURL(argv1).href) {
+    return true;
+  }
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(argv1)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) {
+  main();
+}

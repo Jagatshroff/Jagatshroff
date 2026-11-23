@@ -1,0 +1,173 @@
+import { describe, it, expect } from 'vitest';
+import { EventType, type ReticleEvent } from '@reticlehq/core';
+import { evalSettled, evalConsole, matchValue } from './predicate/predicate-eval.js';
+
+function ev(type: EventType, data: Record<string, unknown>, t: number): ReticleEvent {
+  return { t, type, sessionId: 's', data };
+}
+
+describe('evalSettled — in-flight requests are not settled', () => {
+  it('is NOT settled while a request is in flight (NET_PENDING with no completion)', () => {
+    // Request started at t=100, never completed; DOM went quiet long ago.
+    const events = [ev(EventType.NET_PENDING, { id: 'r1', url: '/api/save' }, 100)];
+    const now = 100_000; // hours later — DOM is quiet, but the save is still flying
+    const r = evalSettled(events, { kind: 'settled', quietMs: 500 }, now);
+    expect(r.pass).toBe(false); // false-green guard: green must not mean "still saving"
+  });
+
+  it('counts a REUSED request id correctly — a retry that reuses an id stays in-flight', () => {
+    // Two NET_PENDING share id 'r1' (a retry reused it), only one completed. Set-membership marked the
+    // id "done" and hid the second still-flying request → premature settle. Per-id counting catches it.
+    const events = [
+      ev(EventType.NET_PENDING, { id: 'r1', url: '/api/save' }, 100),
+      ev(EventType.NET_REQUEST, { id: 'r1', url: '/api/save', status: 200 }, 200),
+      ev(EventType.NET_PENDING, { id: 'r1', url: '/api/save' }, 300), // retry, same id, not yet done
+    ];
+    const r = evalSettled(events, { kind: 'settled', quietMs: 500 }, 100_000);
+    expect(r.pass).toBe(false);
+    expect((r.evidence as { inFlight: number }).inFlight).toBe(1);
+  });
+
+  it('IS settled once the in-flight request completes and the page goes quiet', () => {
+    const events = [
+      ev(EventType.NET_PENDING, { id: 'r1', url: '/api/save' }, 100),
+      ev(EventType.NET_REQUEST, { id: 'r1', url: '/api/save', status: 200 }, 200),
+    ];
+    const now = 1000; // 800ms after completion, quietMs=500
+    const r = evalSettled(events, { kind: 'settled', quietMs: 500 }, now);
+    expect(r.pass).toBe(true);
+  });
+});
+
+/*
+ * A saved `net { count }` check gates on `settled` so a late duplicate request is counted. The quiet
+ * window also counted DOM attribute churn, so on a page with a running animation the check failed
+ * with "not settled: last activity (dom.attr) 56ms ago" when the machine was loaded — a flaky red
+ * on a check about requests. Seen as a merge-queue bench ejection on 2026-10-19.
+ */
+describe('evalSettled — a network-scoped settle ignores DOM churn', () => {
+  const churn = [
+    ev(EventType.NET_REQUEST, { id: 'r1', url: '/api/generate-script', status: 200 }, 100),
+    ev(EventType.DOM_ATTR, { target: 'spinner' }, 1944),
+  ];
+
+  it('passes once the network has been quiet, while the DOM still changes', () => {
+    expect(evalSettled(churn, { kind: 'settled', channel: 'network' }, 2000).pass).toBe(true);
+  });
+
+  it('still waits on the DOM when no scope is named', () => {
+    expect(evalSettled(churn, { kind: 'settled' }, 2000).pass).toBe(false);
+  });
+
+  it('still fails while a request is in flight', () => {
+    const flying = [...churn, ev(EventType.NET_PENDING, { id: 'r2', url: '/api/x' }, 1500)];
+    expect(evalSettled(flying, { kind: 'settled', channel: 'network' }, 9000).pass).toBe(false);
+  });
+
+  it('still waits for network quiet after the last request', () => {
+    const late = [ev(EventType.NET_REQUEST, { id: 'r3', url: '/api/x', status: 200 }, 1800)];
+    expect(evalSettled(late, { kind: 'settled', channel: 'network' }, 2000).pass).toBe(false);
+  });
+});
+
+describe('evalConsole — uncaptured levels do not false-pass', () => {
+  it('does NOT silently pass an `absent` assertion for an uncaptured level (trace)', () => {
+    // console.trace is not patched. An `absent: trace` assertion verifies nothing, so it must not
+    // report green.
+    const r = evalConsole([], { kind: 'console', level: 'trace', absent: true });
+    expect(r.pass).toBe(false);
+  });
+
+  it('still evaluates a captured level (log) normally', () => {
+    const withLog = [ev(EventType.CONSOLE_LOG, { text: 'hi' }, 10)];
+    expect(evalConsole(withLog, { kind: 'console', level: 'log' }).pass).toBe(true);
+    expect(evalConsole([], { kind: 'console', level: 'log', absent: true }).pass).toBe(true);
+  });
+});
+
+/*
+ * The SDK has patched console.info and console.debug since 2026-07, and reticle_observe shows them.
+ * The predicate still called them uncaptured: `level: "info"` was refused, and a message check with
+ * no level skipped info lines, so `{ contains: "X", absent: true }` passed while X was logged with
+ * console.info. That is a false green on an absence check.
+ */
+describe('evalConsole — info and debug are captured levels', () => {
+  const info = [ev(EventType.CONSOLE_INFO, { message: 'sync done' }, 10)];
+  const debug = [ev(EventType.CONSOLE_DEBUG, { message: 'cache warm' }, 10)];
+
+  it('finds a console.info line by level', () => {
+    expect(evalConsole(info, { kind: 'console', level: 'info', contains: 'sync done' }).pass).toBe(
+      true,
+    );
+    expect(
+      evalConsole(debug, { kind: 'console', level: 'debug', contains: 'cache warm' }).pass,
+    ).toBe(true);
+  });
+
+  it('fails an absence check for a message that was logged with console.info', () => {
+    expect(evalConsole(info, { kind: 'console', contains: 'sync done', absent: true }).pass).toBe(
+      false,
+    );
+    expect(evalConsole(info, { kind: 'console', level: 'info', absent: true }).pass).toBe(false);
+  });
+
+  it('keeps a clean-console check deaf to info and debug chatter', () => {
+    expect(evalConsole([...info, ...debug], { kind: 'console', absent: true }).pass).toBe(true);
+  });
+});
+
+describe('matchValue — an operator-less object does not vacuously match everything', () => {
+  it('an empty {} matches ONLY an equal literal, never any value (the fail-open false green)', () => {
+    // `{}` used to enter the operator branch, iterate zero operators, and return true — so `equals: {}`
+    // passed against a number, a string, even undefined. An assertion that asserts nothing is the
+    // exact false green the oracle exists to prevent.
+    expect(matchValue(42, {})).toBe(false);
+    expect(matchValue('x', {})).toBe(false);
+    expect(matchValue(undefined, {})).toBe(false);
+    expect(matchValue(null, {})).toBe(false);
+  });
+
+  it('a real operator still works, and a non-$ literal object compares by equality', () => {
+    expect(matchValue(5, { $gte: 3 })).toBe(true);
+    expect(matchValue(2, { $gte: 3 })).toBe(false);
+    // A non-operator object (no `$` key) is a literal — not a container that vacuously passes.
+    //
+    // Compared by VALUE. This line used to pin `false` with the note "strict eq, no deep-equal
+    // (unchanged behavior)", which was recording what the code did while a different false green was
+    // being fixed, not a claim that reference equality is right. It is not: the expected side is
+    // parsed from the agent's JSON and is a fresh object every time, so `equals` against any array or
+    // object was an assertion no state could ever satisfy. See match-value-structural.
+    expect(matchValue({ id: 1 }, { id: 1 })).toBe(true);
+    expect(matchValue({ id: 1 }, { id: 2 })).toBe(false);
+    expect(matchValue('*', '*') || matchValue('anything', '*')).toBe(true); // `*` presence unaffected
+  });
+});
+
+/*
+ * An attribute set to the value it already had changes nothing on the page. A page with a hidden
+ * input whose inline style was written again, unchanged, every 1-3 s never read as settled: the
+ * agent got "not settled: last activity (dom.attr)" on a page that had stopped (reported from the
+ * field). A write that changes the value is still activity.
+ */
+describe('evalSettled — an attribute written with the value it had is not activity', () => {
+  const quiet = { kind: 'settled', quietMs: 800 } as const;
+  const write = (value: string, old: string, t: number): ReticleEvent =>
+    ev(EventType.DOM_ATTR, { attr: 'style', value, old }, t);
+
+  it('is settled when the only recent writes leave the attribute as it was', () => {
+    const same = 'position: absolute; opacity: 0;';
+    const events = [
+      ev(EventType.DOM_ADDED, {}, 1_000),
+      write(same, same, 9_500),
+      write(same, same, 9_650),
+    ];
+    expect(evalSettled(events, quiet, 10_000).pass).toBe(true);
+  });
+
+  it('is not settled when a recent write changed the attribute', () => {
+    const events = [write('opacity: 1;', 'opacity: 0;', 9_500)];
+    const r = evalSettled(events, quiet, 10_000);
+    expect(r.pass).toBe(false);
+    expect(r.failureReason).toContain('dom.attr');
+  });
+});

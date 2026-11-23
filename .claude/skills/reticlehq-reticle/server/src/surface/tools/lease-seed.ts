@@ -1,0 +1,240 @@
+/**
+ * Seeded storage for a lease, and the errors a lease's navigation throws: what a caller may see of
+ * them without seeing the secrets it seeded. Split from lease-tools.ts, which crossed the line cap.
+ */
+import {
+  isLoopbackHostname,
+  REDACTED_VALUE,
+  scrubKnownSecrets,
+  type SeedStorage,
+} from '@reticlehq/core';
+
+function redactExactValue(text: string, value: string): string {
+  if (0 === value.length) return text;
+  const escaped = value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return text.replace(
+    new RegExp(`(^|[^a-zA-Z0-9])${escaped}(?=$|[^a-zA-Z0-9])`, 'g'),
+    `$1${REDACTED_VALUE}`,
+  );
+}
+
+/**
+ * Scrub known secret shapes and raw seedStorage values (cookies, localStorage, sessionStorage)
+ * from an error string before it reaches daemon logs, metrics, or MCP error responses.
+ */
+export function scrubSeedFromError(text: string, seed?: unknown): string {
+  let out = scrubKnownSecrets(text);
+  if (undefined !== seed && null !== seed && 'object' === typeof seed) {
+    const s = seed as Record<string, unknown>;
+    const cookies = s['cookies'];
+    if (undefined !== cookies && null !== cookies) {
+      if (Array.isArray(cookies)) {
+        for (const c of cookies) {
+          if (undefined !== c && null !== c && 'object' === typeof c) {
+            const val = (c as Record<string, unknown>)['value'];
+            if (undefined !== val && 'string' === typeof val) {
+              out = redactExactValue(out, val);
+            }
+          }
+        }
+      } else if ('object' === typeof cookies) {
+        for (const v of Object.values(cookies as Record<string, unknown>)) {
+          if ('string' === typeof v) {
+            out = redactExactValue(out, v);
+          }
+        }
+      }
+    }
+    const local = s['local'];
+    if (undefined !== local && null !== local && 'object' === typeof local) {
+      for (const v of Object.values(local as Record<string, unknown>)) {
+        if ('string' === typeof v) {
+          out = redactExactValue(out, v);
+        }
+      }
+    }
+    const session = s['session'];
+    if (undefined !== session && null !== session && 'object' === typeof session) {
+      for (const v of Object.values(session as Record<string, unknown>)) {
+        if ('string' === typeof v) {
+          out = redactExactValue(out, v);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** True for a Playwright `storageState()` export (`{ origins: [...] }`), not our seed shape. */
+export function looksLikeStorageStateExport(seed: unknown): boolean {
+  return Array.isArray((seed as { origins?: unknown } | null)?.origins);
+}
+
+/**
+ * Turn a raw navigation failure (Playwright's `page.goto: net::ERR_… at <url>\nCall log:…`, often
+ * with ANSI codes) into a short, clean reason — so the agent/user sees "is the app running?" instead
+ * of an internals-leaking wall of text.
+ */
+/** What {@link cleanNavError} answers for a navigation that ran out of time. */
+export const NAV_TIMED_OUT = 'navigation timed out';
+
+export function cleanNavError(err: unknown, seed?: SeedStorage): string {
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const msg = scrubSeedFromError(rawMsg, seed);
+  // Strip ANSI color codes (ESC[…m) Playwright emits — built via fromCharCode to keep the
+  // control character out of a regex literal (no-control-regex).
+  const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g');
+  const firstLine = (msg.split('\n')[0] ?? msg).replace(ansi, '');
+  const netCode = /net::[A-Z_]+/.exec(firstLine);
+  if (netCode !== null) return netCode[0];
+  if (/timeout/i.test(firstLine)) return NAV_TIMED_OUT;
+  return firstLine
+    .replace(/^page\.goto:\s*/, '')
+    .replace(/\s+at\s+https?:\/\/\S+.*$/, '')
+    .trim()
+    .slice(0, 100);
+}
+
+/** Chromium's certificate failures: `net::ERR_CERT_AUTHORITY_INVALID`, `ERR_CERT_DATE_INVALID`, … */
+const CERT_ERROR = /^net::ERR_CERT_/;
+
+/** What a lease whose navigation hit a certificate error tells the caller. */
+export const NAV_CERT_REFUSED =
+  'the browser refused its TLS certificate, which a self-signed or mkcert dev certificate gets. ' +
+  'If it is your dev server, acquire again with ignoreHTTPSErrors: true to accept it for this lease';
+
+/** The question a failed lease navigation asks, when nothing says the app is up. */
+export const NAV_FAILED_QUESTION = 'is the app running there?';
+
+/** What a lease navigation that ran out of time tells the caller to do. */
+export const NAV_TIMEOUT_ADVICE =
+  'If the app is running, a dev server compiling a route for the first time can take longer than ' +
+  'that: retry the acquire. If it is not running, start it first.';
+
+/**
+ * What a lease navigation that ran out of time tells the caller when the server accepted the
+ * connection: it is running and most likely compiling the route, so starting it again is wrong (#2005).
+ */
+export const NAV_COMPILING_ADVICE =
+  'The server accepted the connection, so it is running and is probably still compiling this ' +
+  'route: wait a few seconds, then acquire the lease again. Do not start another dev server.';
+
+/** Lead of the timeout sentence, before the budget ("within 30 s", or "in time" when unknown). */
+const NAV_TIMEOUT_LEAD = 'the page did not finish loading';
+const NAV_TIMEOUT_UNKNOWN_BUDGET = 'in time';
+
+/** Playwright's own wording for a navigation that ran out of time, with the budget it used. */
+const PLAYWRIGHT_TIMEOUT = /Timeout (\d+)ms exceeded/;
+
+/**
+ * The sentence for a lease whose first navigation failed.
+ *
+ * A timeout and a refusal are different stories and get different sentences. A refusal
+ * (`net::ERR_CONNECTION_REFUSED` and the like) means nothing is serving there, so asking whether the
+ * app is running is the right question. A timeout proves less — only that the page was not ready in
+ * time — and its most common cause is a dev server compiling a route for the first time, which
+ * routinely outlasts the navigation budget. Asking "is the app running?" there sends the agent
+ * hunting for a dev server that is up instead of retrying, so the timeout sentence names both
+ * cases and leads with the retry.
+ */
+export function navFailureMessage(
+  url: string,
+  err: unknown,
+  seed?: SeedStorage,
+  serverAccepted = false,
+): string {
+  const reason = cleanNavError(err, seed);
+  // A certificate the browser refused is not an app that is down: the server answered, with a cert
+  // no CA here vouches for (a self-signed or mkcert dev certificate). Asking "is the app running?"
+  // sent the caller to restart a dev server that was fine (#1255).
+  if (CERT_ERROR.test(reason)) return `could not open ${url} — ${NAV_CERT_REFUSED} (${reason})`;
+  if (NAV_TIMED_OUT !== reason) return `could not open ${url} — ${NAV_FAILED_QUESTION} (${reason})`;
+  const rawMsg = err instanceof Error ? err.message : String(err);
+  const budgetMs = PLAYWRIGHT_TIMEOUT.exec(rawMsg)?.[1];
+  const within =
+    budgetMs === undefined
+      ? NAV_TIMEOUT_UNKNOWN_BUDGET
+      : `within ${String(Number(budgetMs) / 1000)} s`;
+  const advice = serverAccepted ? NAV_COMPILING_ADVICE : NAV_TIMEOUT_ADVICE;
+  return `could not open ${url} — ${NAV_TIMEOUT_LEAD} ${within} (${reason}). ${advice}`;
+}
+
+/**
+ * Whether the server behind a timed-out lease navigation accepted a connection.
+ *
+ * Only asked after a timeout and only of a loopback URL: the port probe reaches `localhost`, so a
+ * remote host would be answered by whatever listens locally on the same port. Never rejects; any
+ * doubt is `false`, which keeps the generic timeout advice.
+ */
+export async function serverAcceptedAfterTimeout(
+  url: string,
+  err: unknown,
+  seed: SeedStorage | undefined,
+  portAccepts: ((port: number) => Promise<boolean>) | undefined,
+): Promise<boolean> {
+  if (portAccepts === undefined || NAV_TIMED_OUT !== cleanNavError(err, seed)) {
+    return false;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (!isLoopbackHostname(parsed.hostname)) {
+    return false;
+  }
+  const defaultPort = 'https:' === parsed.protocol ? 443 : 80;
+  const port = '' === parsed.port ? defaultPort : Number(parsed.port);
+  return portAccepts(port).catch(() => false);
+}
+
+/** Whether a path is a sign-in page, by its name: `/login`, `/signin`, `/auth/login` and similar. */
+export const isAuthPath = (pathname: string): boolean =>
+  /(?:^|\/)(?:login|signin|sign-in|auth\/login|auth\/signin|session\/new)(?:$|\/)/i.test(pathname);
+
+/**
+ * Determine if a required seedStorage application precondition failed.
+ *
+ * Checks strong signals:
+ * 1. HTTP 401/403 status on the initial navigation.
+ * 2. Cross-origin redirect when localStorage or sessionStorage was requested (skipped by origin-scoping).
+ * 3. Clear redirect to an authentication/login endpoint when the requested URL was not a login page.
+ *
+ * Normal app redirects (e.g. / → /dashboard) are valid and return undefined.
+ */
+export function evaluateSeedPrecondition(
+  requestedUrl: string,
+  actualUrl: string | undefined,
+  seed: SeedStorage,
+  navStatus?: number,
+): string | undefined {
+  if (401 === navStatus || 403 === navStatus) {
+    return `HTTP ${navStatus} returned on initial seeded navigation to ${requestedUrl}`;
+  }
+  if (actualUrl === undefined || '' === actualUrl.trim()) return undefined;
+
+  let reqParsed: URL | undefined;
+  let actParsed: URL | undefined;
+  try {
+    reqParsed = new URL(requestedUrl);
+    actParsed = new URL(actualUrl);
+  } catch {
+    return undefined;
+  }
+
+  // Cross-origin redirect when local or session storage was requested
+  const hasStorage =
+    (undefined !== seed.local && 0 < Object.keys(seed.local).length) ||
+    (undefined !== seed.session && 0 < Object.keys(seed.session).length);
+  if (hasStorage && reqParsed.origin !== actParsed.origin) {
+    return `seeded storage precondition not established: cross-origin redirect from ${reqParsed.origin} to ${actParsed.origin} skipped origin-scoped storage injection`;
+  }
+
+  // Clear redirect to an authentication/login endpoint when the requested URL was not a login page
+  if (!isAuthPath(reqParsed.pathname) && isAuthPath(actParsed.pathname)) {
+    return `seeded authentication precondition not established: redirected from ${reqParsed.pathname} to login page (${actParsed.pathname})`;
+  }
+
+  return undefined;
+}

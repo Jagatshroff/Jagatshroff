@@ -1,0 +1,469 @@
+/**
+ * Whether this machine is signed in, said the same way in every panel that shows it.
+ *
+ * One builder rather than three, because the interesting part is not the markup — it is the RULE,
+ * and a rule copied into three panels is a rule that will be right in two of them.
+ *
+ * ── THE RULE ────────────────────────────────────────────────────────────────────────────────────
+ * THREE states, not two. `signedIn: true`, `signedIn: false`, and ABSENT — which means UNKNOWN and
+ * renders nothing at all. An older daemon sends no `account` field, and a panel that read absence as
+ * "signed out" would show a paying user a Sign in button on every panel they open. That is the kind
+ * of nag that gets a dev-only HUD switched off for good, and switching it off costs them every
+ * verdict, not just the button. `core/src/artifacts/impact.ts` states this where the field is
+ * declared; this is where it has to be obeyed.
+ *
+ * ── NO IDENTITY BEYOND THE ORG ──────────────────────────────────────────────────────────────────
+ * The avatar is built from `org`, because `org` is all there is. `AccountState` carries
+ * `{ signedIn, org?, host? }` and deliberately no name, no email and no token: it is pushed into the
+ * DOM of the user's own app, where anything else running on that page can read it. Initials of a
+ * PERSON would mean putting a person's name there, and a nicer avatar is not worth adding the first
+ * leakable field to a payload that currently has none.
+ *
+ * ── WHY SIGN IN IS NOT A BUTTON THAT SIGNS YOU IN ───────────────────────────────────────────────
+ * A page cannot run a CLI, and signing in is a device flow in a terminal. So the control copies
+ * `reticle connect` rather than pretending to start something. A button that quietly does nothing is
+ * worse than a line of text, because the person waits for it.
+ */
+
+import { type AccountState, type HarnessConfig } from '@reticlehq/core';
+import { CreditKind } from '@reticlehq/core/page';
+import { TRIAL_OFFER } from '@reticlehq/core/hud';
+import { hiIconHtml, PRESENTER_ICON_SIZE, PresenterIcon } from './icons/presenter-icons.js';
+import { esc, isSafeDashboardUrl } from './chrome/presenter-safe-html.js';
+import { morphHtml } from './chrome/presenter-morph.js';
+
+/** Behaviour hooks. Attributes rather than classes: a class is styling, these are wiring. */
+export const ACCOUNT_ROOT_ATTR = 'data-reticle-account';
+export const ACCOUNT_SIGNIN_ATTR = 'data-reticle-account-signin';
+export const SYNC_BTN_ATTR = 'data-reticle-sync-now';
+/** The clickable trigger, and the menu it owns. */
+export const ACCOUNT_TRIGGER_ATTR = 'data-reticle-account-trigger';
+export const ACCOUNT_MENU_ATTR = 'data-reticle-account-menu';
+export const ACCOUNT_SIGNOUT_ATTR = 'data-reticle-account-signout';
+/** The header's way to the platform: opens this project's dashboard once linked. */
+export const TEAM_OPEN_ATTR = 'data-reticle-team-open';
+/** The same place before it is linked: signs in, or links this project when already signed in. */
+export const TEAM_SAVE_ATTR = 'data-reticle-team-save';
+/** Where the header's way to the platform is painted. */
+export const TEAM_SLOT_ATTR = 'data-reticle-team';
+
+/** What the header says about the platform. Quiet, one line, and never a modal. */
+export const TEAM_TEXT = {
+  OPEN: 'Open on dashboard ↗',
+  OPEN_TITLE: "This project's runs, kept for your team on the Reticle dashboard",
+  /** Signed in: they may be past the trial already, so it is not promised again. */
+  SAVE_LINK: 'Save runs for your team',
+  SAVE_TITLE: `Keep every run, flow and Harness result on a dashboard your team shares. On Reticle, ${TRIAL_OFFER}.`,
+} as const;
+
+export const ACCOUNT_TEXT = {
+  SIGNED_OUT: 'Sign in',
+  SIGNIN_TITLE: 'Sign in through your browser. Also copies `reticle connect`, for a terminal',
+  SIGNIN_COMMAND: 'reticle connect',
+  DASHBOARD_TITLE: 'Open this project on the dashboard',
+  /** "Now", not "sync" — the timer already syncs, this only stops somebody wondering when. */
+  SYNC_TITLE: 'Push to the dashboard now, instead of waiting for the next sync',
+  COPIED: 'Copied',
+  /** Shown as the avatar when signed in to an org with no printable name. */
+  AVATAR_FALLBACK: '•',
+  MENU_LABEL: 'Reticle account',
+  TRIGGER_TITLE: 'Your Reticle account',
+  SIGNED_IN_AS: 'Signed in',
+  DASHBOARD_ACTION: 'Open dashboard',
+  /** Linking is a terminal step for the same reason signing in is: only the CLI can write the file. */
+  LINK_HINT: 'Not linked — run `reticle connect` to keep a record on the dashboard',
+  LINK_COMMAND: 'reticle connect',
+  SIGNOUT_ACTION: 'Copy sign-out command',
+  SIGNOUT_TITLE: 'Copy `reticle logout` to run in your terminal',
+  SIGNOUT_COMMAND: 'reticle logout',
+  SIGNOUT_COPY_FAILED: 'Run reticle logout in terminal',
+  PROJECT_LABEL: 'Project',
+  HOST_LABEL: 'Host',
+  VERDICTS_LABEL: 'Verdicts',
+  DEFECTS_LABEL: 'Defects found',
+  PLAN_LABEL: 'Plan',
+  CREDITS_LABEL: 'Credits',
+  HARNESS_RUNS_LABEL: 'Harness runs',
+  MEMORY_LABEL: 'Memory',
+  ON_PLATFORM_LABEL: 'Runs on dashboard',
+} as const;
+
+/** How long the "Copied" label stays before the control says its own name again. */
+const ACCOUNT_COPIED_MS = 1200;
+
+/** What the menu reports about this project, beyond who is signed in. */
+export interface AccountDetails {
+  projectName?: string | undefined;
+  dashboardUrl?: string | undefined;
+  verdicts?: number | undefined;
+  defects?: number | undefined;
+  /** The platform's side, as the daemon last read it; each row is left out when it sent nothing. */
+  plan?: string | undefined;
+  credits?: string | undefined;
+  harnessRuns?: string | undefined;
+  memory?: string | undefined;
+  /** How many of this project's runs the dashboard holds. */
+  onPlatform?: string | undefined;
+}
+
+/**
+ * One or two letters for the avatar.
+ *
+ * Two words give two initials, one word gives one letter, and anything with no printable character
+ * falls back to a dot — an avatar with no glyph reads as a broken image, which is worse than a plain
+ * one. Upper-cased because an avatar is a mark, not a quotation.
+ */
+export function accountInitials(org: string | undefined): string {
+  const words = (org ?? '')
+    .trim()
+    .split(/[\s._-]+/)
+    .filter((word) => word.length > 0);
+  const letters = words
+    .slice(0, 2)
+    .map((word) => [...word][0] ?? '')
+    .join('');
+  return letters.length > 0 ? letters.toUpperCase() : ACCOUNT_TEXT.AVATAR_FALLBACK;
+}
+
+/**
+ * The account control: one trigger, one menu, the same markup on every surface that shows it.
+ *
+ * THREE STATES, and the third is the one that matters. `signedIn: true`, `signedIn: false`, and
+ * ABSENT -- which means UNKNOWN and renders nothing at all. An older daemon sends no `account` field,
+ * and a surface that read absence as "signed out" would offer a paying user a Sign in button on every
+ * panel they open.
+ *
+ * ONE BUILDER, THREE MOUNTS. The header, the settings panel and the impact report all call this, and
+ * they used to each style their own copy: three `.reticle-account` blocks that had drifted to
+ * `gap:4px`, `gap:6px` and `display:flex`, so the same control looked like three controls. The rules
+ * now live once, unscoped, in `presenter-account-styles.ts`.
+ *
+ * WHAT THE MENU IS FOR. An avatar alone answers "am I signed in" and nothing else. Somebody who has
+ * just run `reticle connect` wants to know WHICH account, on WHICH host, against WHICH project, and
+ * where the record went -- so the menu carries the identity, the project, the counts already on the
+ * wire, and the way through to the dashboard. Everything in it comes from the impact snapshot; none
+ * of it is fetched, because the HUD has no credential and must never acquire one.
+ *
+ * `offerSignIn` decides whether a surface may ASK. Off by default: the report panel already tells an
+ * unlinked user where their record stops, once, and its own tests call a second mention in the same
+ * panel a nag. Persistent chrome is the exception -- a capsule in the header is answering a question
+ * the user can see, not interrupting them.
+ */
+export function accountControlHtml(
+  account: AccountState | undefined,
+  details: AccountDetails = {},
+  offerSignIn = false,
+): string {
+  if (account === undefined) return '';
+  if (!account.signedIn) {
+    if (!offerSignIn) return '';
+    return `<div class="reticle-account" ${ACCOUNT_ROOT_ATTR}><button type="button" class="reticle-account-signin" ${ACCOUNT_SIGNIN_ATTR} title="${ACCOUNT_TEXT.SIGNIN_TITLE}" aria-label="${ACCOUNT_TEXT.SIGNIN_TITLE}">${ACCOUNT_TEXT.SIGNED_OUT}</button></div>`;
+  }
+  const org = account.org ?? '';
+  // The org's name is the avatar's accessible label: a screen reader announcing "AC" has said
+  // nothing, and the two letters exist only because a circle needs something drawn in it.
+  const label = org.length > 0 ? esc(org) : ACCOUNT_TEXT.SIGNED_IN_AS;
+  const avatar = `<span class="reticle-account-avatar" aria-hidden="true">${esc(accountInitials(account.org))}</span>`;
+  const trigger =
+    `<button type="button" class="reticle-account-trigger" ${ACCOUNT_TRIGGER_ATTR}` +
+    ` aria-haspopup="true" aria-expanded="false" title="${ACCOUNT_TEXT.TRIGGER_TITLE}"` +
+    ` aria-label="${ACCOUNT_TEXT.TRIGGER_TITLE}: ${label}">${avatar}</button>`;
+  return `<div class="reticle-account" ${ACCOUNT_ROOT_ATTR}>${trigger}${accountMenuHtml(account, details)}</div>`;
+}
+
+/** One `k: v` row, or nothing when there is no value — an empty row states a fact it does not have. */
+function detailRow(key: string, value: string | undefined): string {
+  if (value === undefined || 0 === value.length) return '';
+  return `<div class="reticle-account-row"><span class="reticle-account-k">${esc(key)}</span><span class="reticle-account-v" title="${esc(value)}">${esc(value)}</span></div>`;
+}
+
+/**
+ * The menu: who, where, and what has happened here.
+ *
+ * Hidden by BOTH `hidden` and `aria-hidden`, because the two are read by different things and a menu
+ * that is invisible to the eye and present to a screen reader is a worse bug than one that is simply
+ * shut.
+ *
+ * The email line is rendered only when the daemon actually sent one, which no cloud does yet. It sits
+ * in here rather than on the trigger deliberately: the trigger is always in the page, and a personal
+ * address belongs behind a click even on a dev-only overlay.
+ */
+function accountMenuHtml(account: AccountState, details: AccountDetails): string {
+  const org = account.org ?? '';
+  const identity =
+    `<div class="reticle-account-head">` +
+    `<span class="reticle-account-avatar reticle-account-avatar--lg" aria-hidden="true">${esc(accountInitials(account.org))}</span>` +
+    `<span class="reticle-account-who">` +
+    `<span class="reticle-account-org">${org.length > 0 ? esc(org) : ACCOUNT_TEXT.SIGNED_IN_AS}</span>` +
+    (account.email !== undefined && account.email.length > 0
+      ? `<span class="reticle-account-email" title="${esc(account.email)}">${esc(account.email)}</span>`
+      : // No email and no org: the line above already says "Signed in", and saying it twice says less.
+        org.length > 0
+        ? `<span class="reticle-account-email">${ACCOUNT_TEXT.SIGNED_IN_AS}</span>`
+        : '') +
+    `</span></div>`;
+
+  const rows =
+    detailRow(ACCOUNT_TEXT.HOST_LABEL, account.host) +
+    detailRow(ACCOUNT_TEXT.PROJECT_LABEL, details.projectName) +
+    detailRow(
+      ACCOUNT_TEXT.VERDICTS_LABEL,
+      details.verdicts !== undefined ? String(details.verdicts) : undefined,
+    ) +
+    detailRow(
+      ACCOUNT_TEXT.DEFECTS_LABEL,
+      details.defects !== undefined ? String(details.defects) : undefined,
+    ) +
+    detailRow(ACCOUNT_TEXT.ON_PLATFORM_LABEL, details.onPlatform) +
+    detailRow(ACCOUNT_TEXT.PLAN_LABEL, details.plan) +
+    detailRow(ACCOUNT_TEXT.CREDITS_LABEL, details.credits) +
+    detailRow(ACCOUNT_TEXT.HARNESS_RUNS_LABEL, details.harnessRuns) +
+    detailRow(ACCOUNT_TEXT.MEMORY_LABEL, details.memory);
+
+  const linked = details.dashboardUrl !== undefined && isSafeDashboardUrl(details.dashboardUrl);
+  const dashboard = linked
+    ? `<a class="reticle-account-action" data-reticle-account-dashboard href="${esc(details.dashboardUrl ?? '')}" target="_blank" rel="noreferrer noopener" title="${ACCOUNT_TEXT.DASHBOARD_TITLE}">${hiIconHtml(PresenterIcon.VIEW, PRESENTER_ICON_SIZE.HELP)}<span>${ACCOUNT_TEXT.DASHBOARD_ACTION}</span></a>`
+    : // Unlinked is a real and common state -- an account with a repo nobody has run `reticle connect`
+      // in -- and it gets the way forward rather than a link that 404s.
+      `<button type="button" class="reticle-account-action reticle-account-action--hint" ${ACCOUNT_SIGNIN_ATTR} data-reticle-copy="${ACCOUNT_TEXT.LINK_COMMAND}" title="${ACCOUNT_TEXT.LINK_HINT}"><span>${ACCOUNT_TEXT.LINK_HINT}</span></button>`;
+  const signOut = `<button type="button" class="reticle-account-action" ${ACCOUNT_SIGNOUT_ATTR} data-reticle-copy="${ACCOUNT_TEXT.SIGNOUT_COMMAND}" title="${ACCOUNT_TEXT.SIGNOUT_TITLE}"><span>${ACCOUNT_TEXT.SIGNOUT_ACTION}</span></button>`;
+
+  return (
+    `<div class="reticle-account-menu" ${ACCOUNT_MENU_ATTR} role="menu" aria-label="${ACCOUNT_TEXT.MENU_LABEL}" aria-hidden="true" hidden>` +
+    identity +
+    (rows.length > 0 ? `<div class="reticle-account-rows">${rows}</div>` : '') +
+    `<div class="reticle-account-actions">${dashboard}${signOut}</div>` +
+    `</div>`
+  );
+}
+
+const PLAN_NAME: Record<CreditKind, string> = {
+  [CreditKind.FREE]: 'Free',
+  [CreditKind.TRIAL]: 'Trial',
+  [CreditKind.PAID]: 'Pro',
+};
+const plural = (n: number, one: string, many: string): string =>
+  `${String(n)} ${1 === n ? one : many}`;
+
+/**
+ * The platform's side of the menu, from the config the daemon last read and its sync status. Each
+ * field is absent when the platform did not say it: an older platform shows no row, never a zero.
+ */
+export function platformDetails(
+  config: HarnessConfig | undefined,
+  sync: Readonly<Record<string, unknown>> | undefined,
+): Pick<AccountDetails, 'plan' | 'credits' | 'harnessRuns' | 'memory' | 'onPlatform'> {
+  const plan = config?.plan;
+  const onPlatform = sync?.['onPlatform'];
+  return {
+    ...(plan === undefined
+      ? {}
+      : {
+          plan: [
+            PLAN_NAME[plan.kind],
+            plan.daysLeft === undefined ? '' : `${plural(plan.daysLeft, 'day', 'days')} left`,
+            plan.seats === undefined ? '' : plural(plan.seats, 'seat', 'seats'),
+          ]
+            .filter((part) => part.length > 0)
+            .join(' · '),
+        }),
+    ...(config?.credits === undefined
+      ? {}
+      : {
+          credits: `${Math.max(0, config.credits.limit - config.credits.used).toLocaleString('en-US')} of ${config.credits.limit.toLocaleString('en-US')} left`,
+        }),
+    ...(config?.harnessRuns === undefined ? {} : { harnessRuns: String(config.harnessRuns) }),
+    ...(config?.memoryEntries === undefined
+      ? {}
+      : { memory: plural(config.memoryEntries, 'entry', 'entries') }),
+    ...('number' === typeof onPlatform ? { onPlatform: String(onPlatform) } : {}),
+  };
+}
+
+/**
+ * The header's one quiet way to the platform: "Open on dashboard" once this project is linked, else
+ * "Save runs for your team", which links this project. Nothing signed out (the rail asks) or while
+ * the account is unknown: an older daemon is not a prospect.
+ */
+export function teamLinkHtml(
+  account: AccountState | undefined,
+  dashboardUrl: string | undefined,
+): string {
+  // Signed out the rail under every page is the one sign-in ask: three at once was two too many.
+  if (account === undefined || !account.signedIn) return '';
+  if (dashboardUrl !== undefined && isSafeDashboardUrl(dashboardUrl))
+    return `<a ${TEAM_OPEN_ATTR} class="reticle-team-link" href="${esc(dashboardUrl)}" target="_blank" rel="noreferrer noopener" title="${esc(TEAM_TEXT.OPEN_TITLE)}">${TEAM_TEXT.OPEN}</a>`;
+  return `<button type="button" ${TEAM_SAVE_ATTR} class="reticle-team-link" title="${esc(TEAM_TEXT.SAVE_TITLE)}"><span>${TEAM_TEXT.SAVE_LINK}</span></button>`;
+}
+
+/**
+ * Paint an account control into its slot. Every snapshot push repaints it, and a replaced trigger
+ * shut the menu the person was reading: the markup is morphed in place, and an open menu stays open.
+ */
+export function paintAccountSlot(slot: HTMLElement, html: string): void {
+  const open = null !== slot.querySelector(`[${ACCOUNT_MENU_ATTR}]:not([hidden])`);
+  morphHtml(slot, html);
+  if (!open) return;
+  const menu = slot.querySelector(`[${ACCOUNT_MENU_ATTR}]`);
+  if (null === menu) return;
+  menu.removeAttribute('hidden');
+  menu.setAttribute('aria-hidden', 'false');
+  slot.querySelector(`[${ACCOUNT_TRIGGER_ATTR}]`)?.setAttribute('aria-expanded', 'true');
+}
+
+/**
+ * Kept as the old name, because three surfaces and their tests call it.
+ *
+ * @deprecated Use `accountControlHtml`, which takes the details the menu shows.
+ */
+export function accountCapsuleHtml(
+  account: AccountState | undefined,
+  dashboardUrl?: string,
+  offerSignIn = false,
+): string {
+  return accountControlHtml(account, { dashboardUrl }, offerSignIn);
+}
+
+/**
+ * The sync button, for a panel that shows a record worth pushing.
+ *
+ * Only when LINKED. Unlinked there is nowhere to push, and a button that reports success having
+ * sent nothing is the false green this product exists to refuse — in miniature, on its own HUD.
+ */
+export function syncButtonHtml(dashboardUrl: string | undefined): string {
+  if (dashboardUrl === undefined || !isSafeDashboardUrl(dashboardUrl)) return '';
+  return `<button type="button" class="reticle-sync-now" ${SYNC_BTN_ATTR} title="${ACCOUNT_TEXT.SYNC_TITLE}" aria-label="${ACCOUNT_TEXT.SYNC_TITLE}">${hiIconHtml(PresenterIcon.SYNC, PRESENTER_ICON_SIZE.HELP)}</button>`;
+}
+
+/**
+ * Wire every account control under `root`: open the menu, close it, copy a command.
+ *
+ * ONE listener set for all three surfaces, delegated from `root`, because the markup is re-rendered
+ * on every snapshot push. A listener bound to a button would be bound to a button that no longer
+ * exists the next time the daemon reports anything, which is the defect that makes a re-rendered
+ * control feel broken rather than look broken.
+ *
+ * Returns its own teardown. The caller owns an `AbortController` for everything else, and this hands
+ * back a function rather than taking a signal so it can be called from a panel that has none.
+ */
+export function mountAccountControl(root: HTMLElement, onSignIn?: () => void): () => void {
+  const controller = new AbortController();
+  const { signal } = controller;
+
+  const closeAll = (except?: Element): void => {
+    for (const menu of root.querySelectorAll(`[${ACCOUNT_MENU_ATTR}]`)) {
+      if (menu === except) continue;
+      menu.setAttribute('hidden', '');
+      menu.setAttribute('aria-hidden', 'true');
+    }
+    for (const trigger of root.querySelectorAll(`[${ACCOUNT_TRIGGER_ATTR}]`)) {
+      if (except !== undefined && trigger.parentElement === except.parentElement) continue;
+      trigger.setAttribute('aria-expanded', 'false');
+    }
+  };
+
+  /** Flash the control's own label, so the feedback is where the click was. */
+  const flashLabel = (el: HTMLElement, value: string): void => {
+    const label = el.querySelector('span') ?? el;
+    const previous = label.textContent;
+    label.textContent = value;
+    setTimeout(() => {
+      label.textContent = previous;
+    }, ACCOUNT_COPIED_MS);
+  };
+
+  /** Clipboard can be absent or denied in an embedded page; never make that failure look like success. */
+  const copyCommand = async (command: string, el: HTMLElement): Promise<void> => {
+    try {
+      if (navigator.clipboard === undefined) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(command);
+      flashLabel(el, ACCOUNT_TEXT.COPIED);
+    } catch {
+      flashLabel(
+        el,
+        command === ACCOUNT_TEXT.SIGNOUT_COMMAND
+          ? ACCOUNT_TEXT.SIGNOUT_COPY_FAILED
+          : `Run ${command} in terminal`,
+      );
+    }
+  };
+
+  root.addEventListener(
+    'click',
+    (event: Event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+
+      const trigger = target.closest(`[${ACCOUNT_TRIGGER_ATTR}]`);
+      if (trigger instanceof HTMLElement) {
+        event.preventDefault();
+        event.stopPropagation();
+        const menu = trigger.parentElement?.querySelector(`[${ACCOUNT_MENU_ATTR}]`);
+        if (!(menu instanceof HTMLElement)) return;
+        const wasOpen = !menu.hasAttribute('hidden');
+        closeAll();
+        if (wasOpen) return;
+        menu.removeAttribute('hidden');
+        menu.setAttribute('aria-hidden', 'false');
+        trigger.setAttribute('aria-expanded', 'true');
+        return;
+      }
+
+      // Link and logout write `~/.reticle`, which a page cannot do, so those controls copy the
+      // command rather than pretend to run it. Sign in (below) is the exception: the daemon starts
+      // the browser approval itself.
+      const copier = target.closest('[data-reticle-copy]');
+      if (copier instanceof HTMLElement) {
+        event.preventDefault();
+        event.stopPropagation();
+        const command = copier.getAttribute('data-reticle-copy') ?? '';
+        if (command.length > 0) void copyCommand(command, copier);
+        return;
+      }
+
+      // The bare Sign in control carries no `data-reticle-copy`, because it predates the menu and
+      // three surfaces plus their tests assert on its attribute.
+      // It asks the daemon to open the browser sign-in, and still copies `reticle connect`: the copy is
+      // the fallback for an older daemon that ignores the request, and costs nobody anything.
+      const signin = target.closest(`[${ACCOUNT_SIGNIN_ATTR}]`);
+      if (signin instanceof HTMLElement) {
+        event.preventDefault();
+        event.stopPropagation();
+        onSignIn?.();
+        void copyCommand(ACCOUNT_TEXT.SIGNIN_COMMAND, signin);
+        return;
+      }
+
+      // A click anywhere else inside the HUD, including on another panel, shuts an open menu.
+      closeAll();
+    },
+    { signal },
+  );
+
+  // On `document`, not `root`: a click on the page outside the HUD must close it too, and the HUD
+  // does not receive that event.
+  document.addEventListener(
+    'pointerdown',
+    (event: Event) => {
+      const target = event.target;
+      if (target instanceof Node && root.contains(target)) return;
+      closeAll();
+    },
+    { signal },
+  );
+
+  document.addEventListener(
+    'keydown',
+    (event: KeyboardEvent) => {
+      if ('Escape' !== event.key) return;
+      const open = root.querySelector(`[${ACCOUNT_MENU_ATTR}]:not([hidden])`);
+      if (null === open) return;
+      // Only when a menu is actually open, so Escape keeps its other meanings in the HUD.
+      event.stopPropagation();
+      closeAll();
+    },
+    { signal },
+  );
+
+  return () => controller.abort();
+}

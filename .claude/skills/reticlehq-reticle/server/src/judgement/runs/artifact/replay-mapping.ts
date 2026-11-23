@@ -1,0 +1,130 @@
+/**
+ * Pure mapping from a flow-replay outcome (the existing reticle_flow_verify machinery) into the
+ * verification-run artifact's per-flow shape. DRIFT and ERROR both collapse to FAIL — from a host's
+ * perspective a flow that drifted no longer behaves, so it must not read as green. The actionable
+ * "why" is lifted from the replay's decision envelope (or its error) into failureReason.
+ */
+
+import {
+  ReplayStatus,
+  RUN_RECORDING_MAX_BYTES,
+  RUN_STEP_RESULTS_MAX,
+  RUN_TEXT_MAX,
+  RunFlowStatus,
+  type Contradiction,
+  type FlowFile,
+  type FlowReplayResult,
+  type FlowStepResult,
+  type RunFlowResult,
+  type RunStepResult,
+} from '@reticlehq/core';
+import { SUCCESS_STEP_TOOL } from '@/language/flows/flow-success.js';
+
+/** OK → PASS; UNVERIFIABLE → SKIPPED; DRIFT/ERROR → FAIL (a healed flow is produced by the heal path, not plain replay). */
+export function runFlowStatusOf(status: ReplayStatus): RunFlowStatus {
+  if (status === ReplayStatus.OK) return RunFlowStatus.PASS;
+  if (status === ReplayStatus.UNVERIFIABLE) return RunFlowStatus.SKIPPED;
+  return RunFlowStatus.FAIL;
+}
+
+const clip = (text: string): string =>
+  text.length > RUN_TEXT_MAX ? `${text.slice(0, RUN_TEXT_MAX - 1)}…` : text;
+
+/** One step as synced: what it did, where, and whether it held. */
+/**
+ * A run step with how far a sequence got. Kept out of the shared run schema on purpose: that schema
+ * ships in the page SDK, where every byte counts, and only the CLI score in this same process reads
+ * the field. A schema reader strips it, which loses nothing it needs.
+ */
+export interface ScoredRunStep extends RunStepResult {
+  subSteps?: { passed: number; total: number };
+}
+
+function stepResultOf(step: FlowStepResult): ScoredRunStep {
+  return {
+    step: step.step,
+    anchor: clip(step.anchor),
+    ok: step.ok,
+    ...(step.page === undefined ? {} : { page: step.page }),
+    ...(step.endPage === undefined ? {} : { endPage: step.endPage }),
+    ...(step.consequence === undefined ? {} : { consequence: clip(step.consequence) }),
+    ...(step.error === undefined ? {} : { error: clip(step.error) }),
+    ...(step.drift === undefined ? {} : { drift: step.drift.reasonKind }),
+    ...(step.subSteps === undefined ? {} : { subSteps: step.subSteps }),
+  };
+}
+
+/**
+ * The flow as recorded, when it is small enough to travel — what lets a teammate replay this run
+ * from the cloud. Fill values were already redacted when the flow was saved.
+ */
+function recordingOf(flow: FlowFile): Pick<RunFlowResult, 'recording' | 'recordingOmitted'> {
+  const recording = {
+    ...(flow.startPath === undefined ? {} : { startPath: flow.startPath }),
+    steps: flow.steps,
+  };
+  return Buffer.byteLength(JSON.stringify(recording)) > RUN_RECORDING_MAX_BYTES
+    ? { recordingOmitted: true }
+    : { recording };
+}
+
+/** The first contradiction a replay recorded, on a step or across them. */
+function firstContradiction(replay: FlowReplayResult): Contradiction | undefined {
+  for (const step of replay.steps) {
+    const found = step.contradictions?.[0];
+    if (found !== undefined) return found;
+  }
+  return replay.crossStep?.[0];
+}
+
+/** Map one replay (plus its measured duration) into a RunFlowResult for the artifact's flows[]. */
+export function mapReplayToFlowResult(
+  replay: FlowReplayResult,
+  durationMs: number,
+  flow?: FlowFile,
+): RunFlowResult {
+  // A replay that could not start or complete returns UNVERIFIABLE (or carries an unverifiable caveat).
+  // Nothing was verified, so it is SKIPPED — which every reader of a run (the verdict, the gate)
+  // refuses to count as a pass.
+  // A pass whose channels disagreed is the suite's `unverifiable`, and the run says the same: the
+  // CLI printed "unverifiable" and exited 1 while the dashboard listed the run as Passed.
+  const disagreed = replay.status === ReplayStatus.OK ? firstContradiction(replay) : undefined;
+  const status =
+    replay.status === ReplayStatus.UNVERIFIABLE ||
+    replay.unverifiable !== undefined ||
+    disagreed !== undefined
+      ? RunFlowStatus.SKIPPED
+      : runFlowStatusOf(replay.status);
+  const failureReason =
+    replay.unverifiable !== undefined
+      ? replay.unverifiable.reason
+      : disagreed !== undefined
+        ? clip(
+            `a channel disagreed (${disagreed.kind}): ${disagreed.counter} — ${disagreed.detail}`,
+          )
+        : status === RunFlowStatus.FAIL
+          ? (replay.decision?.whatChanged ??
+            replay.decision?.summary ??
+            replay.error?.message ??
+            'flow failed')
+          : status === RunFlowStatus.SKIPPED
+            ? 'flow could not be graded'
+            : undefined;
+  // A flow with a success oracle gets a synthetic 'success' step appended by replay; surface its label
+  // as the run's `oracle` so the verdict counts this flow as consequence-backed (→ HIGH confidence),
+  // not a bare smoke click. Without this, an oracle-backed pass reads as MEDIUM and undersells itself.
+  const oracle = replay.steps.find((s) => s.tool === SUCCESS_STEP_TOOL)?.anchor;
+  return {
+    name: replay.name,
+    ...(flow?.template === undefined ? {} : { template: flow.template }),
+    status,
+    steps: replay.steps.length,
+    durationMs,
+    ...(oracle !== undefined ? { oracle } : {}),
+    ...(failureReason !== undefined ? { failureReason } : {}),
+    ...(0 === replay.steps.length
+      ? {}
+      : { stepResults: replay.steps.slice(0, RUN_STEP_RESULTS_MAX).map(stepResultOf) }),
+    ...(flow === undefined ? {} : recordingOf(flow)),
+  };
+}

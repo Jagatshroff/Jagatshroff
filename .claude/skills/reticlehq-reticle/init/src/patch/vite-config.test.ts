@@ -1,0 +1,533 @@
+import { describe, expect, it } from 'vitest';
+import {
+  DefineConfigSource,
+  newViteConfig,
+  patchViteConfig,
+  VitePatchKind,
+  VITE_IMPORT,
+} from './vite-config.js';
+
+const BASIC = `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+});
+`;
+
+describe('patchViteConfig', () => {
+  it('adds the import and the reticle plugin FIRST in the plugins array', () => {
+    const r = patchViteConfig(BASIC);
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain(VITE_IMPORT);
+    // Order is the invariant, not the argument list: the framework plugin must not transform an entry
+    // before this one has stamped it. `[^)]*` so options in the call cannot silently relax that.
+    expect(r.code).toMatch(/plugins:\s*\[reticle\([^)]*\),\s*react\(\)\]/);
+  });
+
+  it('places the import after the last existing import', () => {
+    const r = patchViteConfig(BASIC);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    const importIdx = r.code.indexOf(VITE_IMPORT);
+    const exportIdx = r.code.indexOf('export default');
+    expect(importIdx).toBeGreaterThan(0);
+    expect(importIdx).toBeLessThan(exportIdx);
+  });
+
+  it('is idempotent — already-patched configs are left alone', () => {
+    const r = patchViteConfig(BASIC);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(patchViteConfig(r.code).kind).toBe(VitePatchKind.ALREADY);
+  });
+
+  it('bakes a non-default port into the reticle() call', () => {
+    const r = patchViteConfig(BASIC, 5000);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code).toContain('port: 5000');
+  });
+
+  it('omits the port argument when the default port is in use', () => {
+    const r = patchViteConfig(BASIC);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    // Spaced to match the line it lands on: single-line arrays keep the space, multi-line ones
+    // would otherwise be left with trailing whitespace for a formatter to rewrite.
+    expect(r.code).toContain('reticle()');
+    expect(r.code).not.toContain('port:');
+  });
+
+  /**
+   * A config with no `plugins` key is a config we can still finish: the object literal is right
+   * there and adding the key is the same edit as extending the array. Bailing here sent a user who
+   * had only ever set `server.port` to a manual paste for a change we could make correctly.
+   */
+  it('adds a plugins array when defineConfig has none', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig({ server: { port: 3000 } });
+`);
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain(VITE_IMPORT);
+    expect(r.code).toContain('plugins: [reticle(');
+    // The existing config must survive intact.
+    expect(r.code).toContain('server: { port: 3000 }');
+  });
+
+  it('adds a plugins array to a multi-line defineConfig', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+
+export default defineConfig({
+  server: {
+    port: 3000,
+  },
+});
+`);
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('plugins: [reticle(');
+    expect(r.code).toContain('port: 3000');
+  });
+
+  it('adds a plugins array to a bare object export', () => {
+    const r = patchViteConfig('export default {};\n');
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('plugins: [reticle(');
+  });
+
+  it('still bails to manual when there is no config object to extend', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig(buildOptions());
+`);
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+
+  it('never adds a second `plugins` key when the list is built by a call', () => {
+    // A second key wins over the first, so the user's own plugins vanish and ours is the only one
+    // left, or the other way round. Either way init reported a wiring it did not make.
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig({ plugins: wrap(() => [react()]) });
+`);
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+    if (r.kind !== VitePatchKind.MANUAL) {
+      return;
+    }
+    expect(r.reason).toContain('reticle()');
+  });
+
+  it('never adds a second `plugins` key for a shorthand property', () => {
+    const r = patchViteConfig(`const plugins = [react()];
+export default defineConfig({ plugins });
+`);
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+
+  it('prepends the import when the config has none', () => {
+    const r = patchViteConfig('export default { plugins: [] };\n');
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code.startsWith(VITE_IMPORT)).toBe(true);
+  });
+});
+
+/**
+ * The patch lands in somebody's source file, so it has to look like something a person wrote. A
+ * trailing space before a newline is exactly what a formatter rewrites, turning a one-line install
+ * into a diff against the user's own style.
+ */
+describe('patchViteConfig — the edit reads like the file it lands in', () => {
+  /**
+   * The other half of the same rule, which never worked.
+   *
+   * MEASURED by running the shipped patcher over a real app's config: it wrote
+   * `plugins: [reticle(),react(), devApi()]` — no space, in the one place the file already showed
+   * its own style. `PLUGINS_ARRAY` has no capture group, so `String.replace` calls back with
+   * `(match, offset, source)`; the callback read those as `(match, _g, offset)`, so `offset` held
+   * the whole SOURCE STRING. `source[<string> + match.length]` is `undefined`, the "next character"
+   * was therefore always empty, and the separator was always ''. The comment above it described
+   * behaviour that had never once happened.
+   */
+  it('keeps the space a single-line plugins array already uses', () => {
+    const src = `import { defineConfig } from 'vite';\nexport default defineConfig({\n  plugins: [react(), devApi()],\n});\n`;
+    const r = patchViteConfig(src);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code).toContain('reticle(), react()');
+  });
+
+  it('leaves no trailing whitespace on the plugins line', () => {
+    const src = `import { defineConfig } from 'vite';\nexport default defineConfig({\n  plugins: [\n    react(),\n  ],\n});\n`;
+    const r = patchViteConfig(src);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    for (const line of r.code.split('\n')) {
+      expect(line, JSON.stringify(line)).toBe(line.replace(/\s+$/, ''));
+    }
+  });
+});
+
+/**
+ * The plugin call `init` writes carries body capture, because without it the one bug class Reticle
+ * exists to catch is unreachable on a default install.
+ *
+ * A 200 describes the transport, not the result. A write whose response body was never recorded
+ * grades `unknown / outcome_unread` — so a refund that posts rupees into a paise field, answers 200,
+ * and renders the amount the user typed rather than the amount the server returned, cannot be caught
+ * by the tool built to catch exactly that. Measured on a real app: an agent asked to verify a refund
+ * had to edit the app's own vite.config mid-task to see the payload, then tell its human to revert
+ * the edit.
+ *
+ * Written into the USER'S config rather than flipped as an SDK default, and that is the whole point.
+ * A body is the one part of a request that routinely carries personal data, and while the credential
+ * classes are redacted (tokens, cookies, card numbers, cvv, ssn) an address or an email is not. So
+ * the choice belongs where the user can see it, keep it, or delete it — not in a default that
+ * changes what an already-installed SDK records the next time it updates.
+ */
+describe('the plugin call init writes', () => {
+  // Body capture is OPT-IN as of #705. A healthcare workspace proxying authenticated API traffic
+  // through Vite ran `init` and found login tokens and patient payloads in the daemon's buffer on
+  // the first drive. The capability is worth having — without a body a 2xx write grades
+  // `outcome_unread` — but writing it into somebody's config is a decision about THEIR data, made
+  // by an agent running unattended, and the person who knows the data is sensitive is not there.
+  it('does not enable body capture unless it was asked for', () => {
+    const r = patchViteConfig('export default defineConfig({ plugins: [react()] });', 5000);
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).not.toContain('captureNetworkBodies');
+  });
+
+  it('writes it when the caller asked for it', () => {
+    const r = patchViteConfig('export default defineConfig({ plugins: [react()] });', 5000, true);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('captureNetworkBodies: true');
+  });
+
+  it('still carries the port alongside it', () => {
+    const r = patchViteConfig('export default defineConfig({ plugins: [react()] });', 5000);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('port: 5000');
+  });
+
+  // The default port needs no argument, so with capture off there is nothing to put in the braces.
+  // A bare `reticle()` is the right call there — `reticle({  })` is a formatter's problem and reads
+  // as though something was meant to be in it.
+  it('emits a bare reticle() when there is nothing to configure', () => {
+    const r = patchViteConfig('export default defineConfig({ plugins: [react()] });');
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('reticle()');
+    expect(r.code).not.toContain('captureNetworkBodies');
+  });
+
+  it('can still be asked for when there is no port to pass', () => {
+    const r = patchViteConfig(
+      'export default defineConfig({ plugins: [react()] });',
+      undefined,
+      true,
+    );
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('captureNetworkBodies: true');
+  });
+
+  it('bakes inject: false when the framework cannot use HTML injection', () => {
+    const r = patchViteConfig(BASIC, undefined, false, false);
+    expect(r.kind).toBe(VitePatchKind.APPLY);
+    if (r.kind !== VitePatchKind.APPLY) return;
+    expect(r.code).toContain('reticle({ inject: false })');
+  });
+});
+
+describe('source mapping off for a non-DOM React renderer', () => {
+  it('writes sourceMapping: false into the call', () => {
+    // Positional, and `inject` now sits between: the true/false pair either side of it is exactly
+    // the swap the options object inside `patchViteConfig` exists to prevent, and it is why these
+    // arguments are named in a comment rather than left as four bare booleans.
+    const r = patchViteConfig(BASIC, undefined, false, true, false);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code).toContain('reticle({ sourceMapping: false })');
+  });
+
+  it('keeps the port and the option together, in that order', () => {
+    const r = patchViteConfig(BASIC, 4400, false, true, false);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code).toContain('reticle({ port: 4400, sourceMapping: false })');
+  });
+
+  it('says nothing when the stamp is fine, which is the default', () => {
+    const r = patchViteConfig(BASIC, 4400);
+    if (r.kind !== VitePatchKind.APPLY) throw new Error('expected apply');
+    expect(r.code).not.toContain('sourceMapping');
+  });
+});
+
+/**
+ * Vite+ (#2134). `vp create` and `vp migrate` write the app's plugins as `lazyPlugins(() => [...])`,
+ * and a `lint` block whose own `plugins` key names oxlint plugins. Both configs below are what
+ * vite-plus 1.5.0 wrote, trimmed.
+ */
+describe('a Vite+ config', () => {
+  const VP_REACT = `import react from "@vitejs/plugin-react";
+import { defineConfig, lazyPlugins } from "vite-plus";
+
+export default defineConfig({
+  fmt: {},
+  lint: {
+    plugins: ["react", "typescript", "oxc"],
+    rules: { "react/only-export-components": ["warn", { allowConstantExport: true }] },
+  },
+  plugins: lazyPlugins(() => [react()]),
+});
+`;
+
+  const VP_LARAVEL = `import { defineConfig, lazyPlugins } from 'vite-plus';
+import laravel from 'laravel-vite-plugin';
+
+export default defineConfig({
+  staged: {
+    "*": "vp check --fix"
+  },
+  lint: {"jsPlugins":[{"name":"vite-plus","specifier":"vite-plus/oxlint-plugin"}]},
+  plugins: lazyPlugins(() => [
+      laravel({
+          input: ['resources/css/app.css', 'resources/js/app.js'],
+          refresh: true,
+      }),
+  ]),
+});
+`;
+
+  it('adds reticle() to the app plugins inside lazyPlugins, not to the lint plugins', () => {
+    const r = patchViteConfig(VP_REACT);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: lazyPlugins(() => [reticle(), react()])');
+    expect(r.code).toContain('plugins: ["react", "typescript", "oxc"]');
+  });
+
+  it('puts reticle() next to the Laravel plugin in a migrated Laravel config', () => {
+    const r = patchViteConfig(VP_LARAVEL);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toMatch(/lazyPlugins\(\(\) => \[reticle\(\),\n\s+laravel\(/);
+    expect(r.code).toContain(VITE_IMPORT);
+  });
+
+  it('takes an async lazyPlugins callback that returns an array literal', () => {
+    const r = patchViteConfig(
+      `import { defineConfig, lazyPlugins } from 'vite-plus';\n` +
+        `export default defineConfig({ plugins: lazyPlugins(async () => [vue()]) });\n`,
+    );
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('lazyPlugins(async () => [reticle(), vue()])');
+  });
+
+  it('adds the config its own plugins key when only the lint block has one', () => {
+    const r = patchViteConfig(
+      `import { defineConfig } from 'vite-plus';\n` +
+        `export default defineConfig({\n  lint: { plugins: ['oxc'] },\n});\n`,
+    );
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain("lint: { plugins: ['oxc'] }");
+    expect(r.code).toMatch(/defineConfig\(\{\n\s+plugins: \[reticle\(\)\],/);
+  });
+
+  it("leaves a hoisted lint block alone and extends the config literal's own list", () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite-plus';
+const lint = { plugins: ['oxc'] };
+export default defineConfig({ lint, plugins: [laravel()] });
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain("const lint = { plugins: ['oxc'] };");
+    expect(r.code).toContain('plugins: [reticle(), laravel()]');
+  });
+
+  it('does not take a commented-out plugins key above the config', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite-plus';
+// plugins: [legacy()]
+export default defineConfig({ plugins: [laravel()] });
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('// plugins: [legacy()]');
+    expect(r.code).toContain('plugins: [reticle(), laravel()]');
+  });
+
+  it('is not thrown off by a brace or a plugins key inside a string', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig({
+  define: { OPEN: '{', NOTE: "plugins: [x]" },
+  plugins: [react()],
+});
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+    expect(r.code.match(/^\s*plugins:/gm)).toHaveLength(1);
+  });
+
+  it.each([
+    'export default defineConfig(({ mode }) => ({ lint, plugins: [laravel()] }));',
+    'export default defineConfig(({ mode }) => {\n  return { lint, plugins: [laravel()] };\n});',
+  ])('leaves a hoisted lint block alone in a function config: %s', (exported) => {
+    const r = patchViteConfig(
+      `import { defineConfig } from 'vite-plus';\nconst lint = { plugins: ['oxc'] };\n${exported}\n`,
+    );
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain("const lint = { plugins: ['oxc'] };");
+    expect(r.code).toContain('plugins: [reticle(), laravel()]');
+  });
+
+  it.each([
+    'const config = defineConfig({ plugins: [react()] });\nexport default config;',
+    'const config = { plugins: [react()] };\nexport default defineConfig(config);',
+    'const config = defineConfig(({ mode }) => ({ plugins: [react()] }));\nexport default config;',
+    'const config: UserConfig = { plugins: [react()] };\nexport default config;',
+    'const $config = { plugins: [react()] };\nexport default $config;',
+  ])('patches a config declared under a name and exported by it: %s', (body) => {
+    const r = patchViteConfig(
+      `import { defineConfig } from 'vite';\nconst lint = { plugins: ['oxc'] };\n${body}\n`,
+    );
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain("const lint = { plugins: ['oxc'] };");
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+  });
+
+  it.each([
+    'export default defineConfig(({ mode }) => {\n  const x = { plugins: [legacy()] };\n  return { plugins: [react()] };\n});',
+    'export default defineConfig(async () => {\n  const x = { plugins: [legacy()] };\n  return ({ plugins: [react()] });\n});',
+    'export default defineConfig(function () {\n  const x = { plugins: [legacy()] };\n  return { ...x, plugins: [react()] };\n});',
+    'const config = defineConfig(({ mode }) => {\n  const x = { plugins: [legacy()] };\n  return { plugins: [react()] };\n});\nexport default config;',
+  ])('patches the list a config function returns, not one its body builds first: %s', (body) => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';\n${body}\n`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('const x = { plugins: [legacy()] };');
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+  });
+
+  it('does not count an object that an inline plugin hook returns', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig(() => {
+  return {
+    plugins: [react(), { name: 'x', config() { return { plugins: [] }; } }],
+  };
+});
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: [reticle(), react(),');
+    expect(r.code).toContain('return { plugins: [] };');
+  });
+
+  it('patches the list of a config the function builds under a name and returns', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig(({ mode }) => {
+  const config = { plugins: [react()] };
+  return config;
+});
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('const config = { plugins: [reticle(), react()] };');
+  });
+
+  it.each([
+    "export default defineConfig(({ command }) => {\n  if (command === 'serve') {\n    return { plugins: [react(), devOnly()] };\n  }\n  return { plugins: [react()] };\n});",
+    'export default defineConfig(() => {\n  const mk = () => ({ plugins: [a()] });\n  return { plugins: [react()] };\n});',
+    'export default defineConfig(() => {\n  const a = { plugins: [legacy()] };\n  const b = { plugins: [react()] };\n  return mergeConfig(a, b);\n});',
+  ])('leaves a manual step when two plugin lists compete in a config function: %s', (body) => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';\n${body}\n`);
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+
+  it('leaves a manual step when the returned config has no plugins list', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig(() => {
+  const x = { plugins: [legacy()] };
+  return { server: { port: 3000 } };
+});
+`);
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+
+  it('reads past a regex literal that holds a quote', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig({
+  resolve: { alias: [{ find: /^'x/, replacement: 'y' }] },
+  plugins: [react()],
+});
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+    expect(r.code.match(/^\s*plugins:/gm)).toHaveLength(1);
+  });
+
+  it('is a manual step, not a guess, when a string never closes', () => {
+    const r = patchViteConfig(
+      `import { defineConfig } from 'vite';\nexport default defineConfig({ base: 'oops, plugins: [react()] });\n`,
+    );
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+
+  it('still bails when lazyPlugins builds the list in a block body', () => {
+    const r = patchViteConfig(
+      `import { defineConfig, lazyPlugins } from 'vite-plus';\n` +
+        `export default defineConfig({ plugins: lazyPlugins(() => { return [vue()]; }) });\n`,
+    );
+    expect(r.kind).toBe(VitePatchKind.MANUAL);
+  });
+});
+
+describe('a nested plugins key in a plain Vite config', () => {
+  it('extends the top-level list, not a Rollup list that comes first', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig({
+  build: { rollupOptions: { plugins: [visualizer()] } },
+  plugins: [react()],
+});
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+    expect(r.code).toContain('rollupOptions: { plugins: [visualizer()] }');
+  });
+
+  it('keeps patching a config written as a function', () => {
+    const r = patchViteConfig(`import { defineConfig } from 'vite';
+export default defineConfig(({ mode }) => ({
+  plugins: [react()],
+}));
+`);
+    if (r.kind !== VitePatchKind.APPLY) {
+      throw new Error('expected apply');
+    }
+    expect(r.code).toContain('plugins: [reticle(), react()]');
+  });
+});
+
+describe('newViteConfig', () => {
+  it('imports defineConfig from vite-plus for a Vite+ app', () => {
+    const code = newViteConfig(undefined, false, true, true, DefineConfigSource.VITE_PLUS);
+    expect(code).toContain("import { defineConfig } from 'vite-plus';");
+  });
+
+  it('imports defineConfig from vite by default', () => {
+    expect(newViteConfig()).toContain("import { defineConfig } from 'vite';");
+  });
+});

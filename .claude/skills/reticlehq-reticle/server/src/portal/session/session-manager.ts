@@ -1,0 +1,1000 @@
+import {
+  NO_SESSION_CONNECTED_ERROR,
+  NO_SESSION_NAVIGATE_FIX,
+  originOf,
+  samePath,
+  type Checkout,
+} from '@reticlehq/core';
+import { notePendingNoSessionReason } from '@/telemetry/tool-refused.js';
+import type { NoSessionReason } from '@reticlehq/core/telemetry';
+import {
+  declareDrivenRedactionKeys,
+  forgetDrivenRedactionKeys,
+} from '@/portal/input/driven-redaction.js';
+import { Session, type SessionInfo } from './session.js';
+import { AttachmentHistory } from './presence/attachment-history.js';
+import type { NoSessionNextAction } from './no-session-next-action.js';
+import {
+  claimedSessionOf,
+  openedBeforeDeparture,
+  pickDocumentSuccessor,
+  type SessionIdentity,
+} from './session-successor.js';
+import {
+  SESSION_DISCONNECTED_REASON,
+  SESSION_PARKED_REASON,
+  sessionReplacedReason,
+} from './facts/session-replaced.js';
+import { isErrorDocument } from './session-info.js';
+import {
+  carryOnNewDocument,
+  departedNetworkOf,
+  type DepartedNetwork,
+} from './facts/departed-network.js';
+
+/** The two checkout facts a worktree-scoped resolve needs. */
+export interface CheckoutSource {
+  /** The git checkout of the agent making this call. */
+  caller: () => Checkout | undefined;
+  /** The git checkout whose dev server served this tab connection. */
+  ofTab: (tab: Tab) => Checkout | undefined;
+}
+
+/**
+ * The agent's active project, used to scope auto-selection. `projectId` is the stable build-stamped
+ * identity (authoritative when present); `url` is the app origin, a fallback hint for older SDKs that
+ * don't stamp a projectId. Both optional — an empty scope means "no project filter" (legacy behavior).
+ */
+interface ResolveScope {
+  projectId?: string;
+  url?: string;
+}
+
+/** Core's `originOf`, re-exported for this module's existing importers. */
+export { originOf };
+
+/**
+ * Narrow a session list to those belonging to the scoped project. With a `projectId` the match is by
+ * that stable id (origin ignored — it survives port swaps). With only a `url`, match by origin. With
+ * no scope, return the list unchanged (legacy single-/multi-session behavior).
+ */
+function scopeSessions(sessions: Session[], scope?: ResolveScope): Session[] {
+  if (scope === undefined) {
+    return sessions;
+  }
+  if (scope.projectId !== undefined) {
+    return sessions.filter((s) => s.projectId === scope.projectId);
+  }
+  const wantOrigin = originOf(scope.url);
+  if (wantOrigin !== undefined) {
+    return sessions.filter((s) => originOf(s.url) === wantOrigin);
+  }
+  return sessions;
+}
+
+/**
+ * Honest, scoped error when sessions exist but none match the agent's project.
+ *
+ * The daemon takes its default scope from the `.reticle.json` of whichever directory started it, so
+ * attaching from a second project — or another worktree of the SAME project — makes every tool
+ * refuse while `reticle_sessions` shows the tab sitting right there. The old message asked "is that
+ * app running with @reticlehq/core enabled?", which is the one thing that is definitely true, so the
+ * reader goes looking at their app instead of at the scope. Name what IS connected and how to
+ * target it: both facts are already in hand here.
+ */
+export function scopeMissError(connected: Session[], scope?: ResolveScope): string {
+  const who = scopeName(scope);
+  const anyUntagged = connected.some((s) => s.projectId === undefined);
+  const anyTagged = connected.some((s) => s.projectId !== undefined);
+  const how = whereConnected(anyUntagged, anyTagged);
+  const listed = connected
+    .map((s) =>
+      s.projectId !== undefined
+        ? `'${s.projectId}' (${s.url}, sessionId '${s.id}')`
+        : `(no projectId: the page's connect() carries none) (${s.url}, sessionId '${s.id}')`,
+    )
+    .join(', ');
+  const advice = anyUntagged
+    ? `Pass the sessionId above to target one, add a projectId to the app's connect() call or ` +
+      `.reticle.json, or restart the daemon from that app's directory.`
+    : `Pass the sessionId above to target one, or restart the daemon from that app's directory.`;
+  return (
+    `no browser session for ${who}, but ${String(connected.length)} session(s) ARE connected ${how}: ` +
+    `${listed}. The daemon scopes to the .reticle.json of the directory it was started in, so ` +
+    `this is a scope mismatch, not a dead app. ${advice}`
+  );
+}
+
+/** What the scope names, in the words of the refusal. */
+function scopeName(scope?: ResolveScope): string {
+  if (scope?.projectId !== undefined) {
+    return `project '${scope.projectId}'`;
+  }
+  if (scope?.url !== undefined) {
+    return `your app at ${scope.url}`;
+  }
+  return 'the active project';
+}
+
+/** Where the connected sessions are, given which of them carry a projectId. */
+function whereConnected(anyUntagged: boolean, anyTagged: boolean): string {
+  if (!anyUntagged) {
+    return 'under a different project';
+  }
+  if (!anyTagged) {
+    return 'with no projectId';
+  }
+  return 'under a different project or with no projectId';
+}
+
+/**
+ * A session's rank for auto-selection: lower is better.
+ *
+ * 0 = non-throttled (visible + recently-heard), 1 = throttled (hidden or stale heartbeat),
+ * 2 = an error document, 3 = attached but not answering commands. A wedged tab keeps streaming
+ * events, so recency RATES IT HIGHEST — it was beating a healthy sibling on the one signal scoring
+ * looked at, and every call auto-targeted the one tab guaranteed to time out. An error document (a
+ * dev server's 404 that still mounted the SDK) ranks below any working page, hidden or not: it is
+ * never the app the agent was asked about.
+ */
+function rankOf(session: Session): number {
+  if (session.unresponsive()) {
+    return 3;
+  }
+  if (isErrorDocument(session.page)) {
+    return 2;
+  }
+  if (session.throttled()) {
+    return 1;
+  }
+  return 0;
+}
+
+/**
+ * Owns the set of connected browser sessions and the smart auto-selection that resolves which one a
+ * tool targets when the agent omits an explicit sessionId. Extracted from session.ts so each file
+ * stays one cohesive unit (Session = one tab; SessionManager = the registry over all tabs).
+ */
+/** How many bridge-initiated closes to remember for diagnosis. */
+const MAX_REMEMBERED_CLOSURES = 5;
+
+/** What a refused hello said about itself: the page it was on and the project it claimed. */
+export interface RefusedPage {
+  readonly url?: string;
+  readonly projectId?: string;
+}
+
+/** One bridge-initiated close, with the page that was turned away when the hello named one. */
+export interface ClosureRecord {
+  readonly at: number;
+  readonly reason: string;
+  readonly page?: RefusedPage;
+}
+
+/**
+ * How many recently-departed session ids to remember for successor rebind.
+ *
+ * A full-document navigation HELLO's back under a new id while the agent still holds the old one.
+ * The tombstone is how `resolve(oldId)` finds the unique same-origin successor instead of refusing.
+ * Bounded so a long-lived daemon cannot accumulate one record per tab forever.
+ */
+const MAX_TOMBSTONES = 32;
+
+/** How a leased tab's id begins (`lease-tools.ts` mints them). */
+const LEASE_ID_PREFIX = 'lease-';
+
+export class SessionManager {
+  readonly #sessions = new Map<string, Session>();
+  /**
+   * Continuity per session, so a listing can answer "was this attached the whole time".
+   *
+   * Owned here because this is the one place that sees both halves — every add and every remove.
+   */
+  readonly #attachment = new AttachmentHistory();
+  /**
+   * Recently departed sessions, keyed by the id the agent still holds.
+   *
+   * Insertion order is LRU: the oldest is dropped when the cap is hit. A reconnect under the same
+   * id forgets its tombstone — the live session is the answer then.
+   */
+  readonly #tombstones = new Map<string, SessionIdentity>();
+  /** The tabs already open when each tombstoned session departed: siblings, never its successor. */
+  readonly #siblingsAtDeparture = new Map<string, ReadonlySet<string>>();
+  /**
+   * The network record each departed document made after the agent's last act, kept until the same
+   * tab's next document connects (#1944). Bounded with the tombstones. See departed-network.ts.
+   */
+  readonly #departedNetwork = new Map<string, DepartedNetwork>();
+  readonly #departed = new Map<string, Session>(); // beside its tombstone; see add() (#2302)
+  /**
+   * The active project's scope, set once from the daemon's .reticle.json. When a tool resolves a session
+   * without passing its own scope, this is applied — so auto-selection is project-scoped by default
+   * and a stray tab from another app is never picked, even on the no-sessionId path.
+   */
+  #defaultScope: ResolveScope | undefined;
+
+  /** Set the active project's default resolve scope (called once at daemon wiring). */
+  setDefaultScope(scope: ResolveScope | undefined): void {
+    this.#defaultScope = scope;
+  }
+
+  /** Where the calling agent's checkout and each tab's checkout come from. Unset: no worktree scope. */
+  #checkoutScope: CheckoutSource | undefined;
+
+  /** Scope id-less calls to the calling agent's own git worktree (called once at daemon wiring). */
+  setCheckoutScope(scope: CheckoutSource | undefined): void {
+    this.#checkoutScope = scope;
+  }
+
+  /**
+   * Told about every session that registers, so the fact outlives this process.
+   *
+   * Injected rather than done here: this class owns a registry, not the filesystem. Wired here
+   * because `add` is the ONE method every path that registers a session goes through — the same
+   * reasoning that put the redaction declaration below it.
+   */
+  #recordConnection: ((projectId: string | undefined) => void) | undefined;
+
+  setConnectionRecorder(record: ((projectId: string | undefined) => void) | undefined): void {
+    this.#recordConnection = record;
+  }
+
+  add(session: Session): Session | undefined {
+    this.#everConnected = true;
+    if (session.projectId !== undefined) {
+      this.#connectedProjects.add(session.projectId);
+    }
+    // Ordering, not lifetime: this is what makes a remembered refusal distinguishable from a live
+    // one. Here for the same reason `#everConnected` is — `add` is the one method every path that
+    // registers a session goes through.
+    this.#connectedSinceLastClosure = true;
+    this.#recordConnection?.(session.projectId);
+    const previous = this.#sessions.get(session.id);
+    this.#sessions.set(session.id, session);
+    // A reload closed the old socket before this hello: its handle and pending reads move here (#2302).
+    const departed = this.#departed.get(session.id);
+    departed?.succeededBy(session);
+    departed?.rejectAll(sessionReplacedReason(session.id, session.url), true);
+    this.#departed.delete(session.id);
+    // Who can SEE this session's HUD feed. Wired here because `add` is the one method every path
+    // that registers a session goes through, and read lazily so a tab that opens later still counts.
+    // Optional-call for the same reason `pushImpact` is one at the dispatch chokepoint: a test
+    // double is a partial Session, and wiring a courtesy channel must never break registration.
+    session.setViewers?.(() => this.#viewersFor(session));
+    // Publish what this app declared sensitive to the driven-path rule. Here rather than in the
+    // bridge because EVERY path that registers a session goes through this method, and a declaration
+    // that silently fails to register is a leak nothing would report.
+    declareDrivenRedactionKeys(session.id, session.redactKeys);
+    this.#attachment.attached(session.id);
+    this.#carryDepartedNetwork(session, previous);
+    this.#tombstones.delete(session.id);
+    this.#siblingsAtDeparture.delete(session.id);
+    return previous;
+  }
+
+  /**
+   * Give a new document the requests its tab's previous document made after the last act (#1944).
+   * `previous` is that document when its socket has not closed yet; else the record kept at removal.
+   */
+  #carryDepartedNetwork(session: Session, previous: Session | undefined): void {
+    const departed =
+      previous !== undefined && previous !== session
+        ? departedNetworkOf(previous)
+        : this.#departedNetwork.get(session.id);
+    this.#departedNetwork.delete(session.id);
+    if (departed !== undefined) {
+      carryOnNewDocument(session, departed);
+    }
+  }
+
+  /**
+   * The other tabs of the same app as `driven`.
+   *
+   * Scoped the same way auto-selection is: by the stable projectId when the driven tab stamped one,
+   * else by origin. A drive session is frequently a headless pooled context (see Session.#viewers),
+   * so without this the human's own tab is the one place the report never reaches.
+   */
+  #viewersFor(driven: Session): Session[] {
+    const scope: ResolveScope =
+      driven.projectId === undefined ? { url: driven.url } : { projectId: driven.projectId };
+    return scopeSessions([...this.#sessions.values()], scope).filter((s) => s !== driven);
+  }
+
+  /**
+   * Close a window's connection and refuse its id until the daemon restarts.
+   *
+   * Reported from a Tauri app whose hidden windows kept reconnecting: ending the session only ended
+   * the presenter, so the window came straight back. A reload keeps its id (sessionStorage), so the
+   * id is what stays parked; the 1008 close tells the SDK not to retry. Its tombstone goes too, so a
+   * call naming it is refused rather than handed a sibling window.
+   */
+  park(session: Session): void {
+    this.#parked.add(session.id);
+    session.disconnect(SESSION_PARKED_REASON);
+    this.remove(session);
+    this.#tombstones.delete(session.id);
+    this.#departedNetwork.delete(session.id);
+    this.#departed.delete(session.id);
+  }
+
+  isParked(sessionId: string): boolean {
+    return this.#parked.has(sessionId);
+  }
+
+  readonly #parked = new Set<string>();
+
+  remove(session: Session): boolean {
+    if (this.#sessions.get(session.id) !== session) {
+      return false;
+    }
+    session.rejectAll(SESSION_DISCONNECTED_REASON);
+    forgetDrivenRedactionKeys(session.id);
+    // Recorded, not forgotten: a session that comes back needs its gap measured, and a listing after
+    // the reconnect is exactly where that matters.
+    this.#attachment.detached(session.id);
+    this.#rememberTombstone(session);
+    // Kept only beside a tombstone, so the tombstone cap bounds it too.
+    const departedNetwork = this.#tombstones.has(session.id)
+      ? departedNetworkOf(session)
+      : undefined;
+    if (departedNetwork !== undefined) {
+      this.#departedNetwork.set(session.id, departedNetwork);
+    }
+    if (this.#tombstones.has(session.id)) {
+      this.#departed.set(session.id, session);
+    }
+    return this.#sessions.delete(session.id);
+  }
+
+  #rememberTombstone(session: Session): void {
+    const origin = originOf(session.url);
+    if (origin === undefined) {
+      return;
+    }
+    if (this.#tombstones.has(session.id)) {
+      this.#tombstones.delete(session.id);
+    }
+    this.#siblingsAtDeparture.set(
+      session.id,
+      new Set(
+        [...this.#sessions.values()]
+          .filter((s) => s !== session && openedBeforeDeparture(s, session))
+          .map((s) => s.id),
+      ),
+    );
+    const departedTo = session.departedTo();
+    this.#tombstones.set(session.id, {
+      id: session.id,
+      url: session.url,
+      ...(session.projectId === undefined ? {} : { projectId: session.projectId }),
+      // Where the tab was seen heading, kept off `url`: successor matching needs the old origin.
+      ...(departedTo === undefined ? {} : { departedTo }),
+    });
+    while (this.#tombstones.size > MAX_TOMBSTONES) {
+      const oldest = this.#tombstones.keys().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.#tombstones.delete(oldest);
+      this.#siblingsAtDeparture.delete(oldest);
+      this.#departedNetwork.delete(oldest);
+      this.#departed.delete(oldest);
+    }
+  }
+
+  #successorOf(sessionId: string): Session | undefined {
+    const departed = this.#tombstones.get(sessionId);
+    if (departed === undefined) {
+      return undefined;
+    }
+    const siblings = this.#siblingsAtDeparture.get(sessionId);
+    const picked = pickDocumentSuccessor(
+      this.all()
+        .filter((s) => true !== siblings?.has(s.id))
+        .map((s) => ({
+          id: s.id,
+          url: s.url,
+          ...(s.projectId === undefined ? {} : { projectId: s.projectId }),
+        })),
+      departed,
+    );
+    if (picked === undefined) {
+      return undefined;
+    }
+    return this.#sessions.get(picked.id);
+  }
+
+  get(sessionId: string): Session | undefined {
+    return this.#sessions.get(sessionId);
+  }
+
+  /** The id the same tab connected as after this session's page went away, if one has. */
+  successorId(sessionId: string): string | undefined {
+    return this.#successorOf(sessionId)?.id;
+  }
+
+  /**
+   * Did this id belong to a session that has since disconnected?
+   *
+   * `resolve` answers a departed id with its live SUCCESSOR, which is what keeps a reload working
+   * for everything that observes. A caller that is about to do something DESTRUCTIVE needs the
+   * other answer: whether the thing it named is still there. Ending a session it did not name is
+   * not a recoverable mistake (#983).
+   */
+  departed(sessionId: string): SessionIdentity | undefined {
+    return this.#tombstones.get(sessionId);
+  }
+
+  list(): SessionInfo[] {
+    // Only an agent whose repository has worktrees pays for the serving lookups.
+    const worktreeOf =
+      this.#checkoutScope?.caller() === undefined ? undefined : this.#checkoutScope.ofTab;
+    return [...this.#sessions.values()].map((s) => {
+      const info = s.info();
+      const attachment = this.#attachment.of(s.id);
+      const served = worktreeOf?.(s);
+      return {
+        ...info,
+        ...(attachment === undefined ? {} : { attachment }),
+        ...(true === served?.linked ? { worktree: describeCheckout(served) } : {}),
+      };
+    });
+  }
+
+  /** Continuity for one session — "has this been attached the whole time I am reasoning about?" */
+  attachmentOf(sessionId: string): ReturnType<AttachmentHistory['of']> {
+    return this.#attachment.of(sessionId);
+  }
+
+  /** Every connected session — used by the liveness reaper to sweep for idle/disconnected ones. */
+  all(): Session[] {
+    return [...this.#sessions.values()];
+  }
+
+  /**
+   * The connected sessions an id-less call may consider: the active project's, when one is set.
+   *
+   * The same set `resolve()` chooses from, so a caller that falls back from a refused resolution
+   * (an id-less yield) never reaches a tab the project scope would never have handed it.
+   */
+  inScope(): Session[] {
+    return scopeSessions(this.all(), this.#defaultScope);
+  }
+
+  count(): number {
+    return this.#sessions.size;
+  }
+
+  /**
+   * Resolve the target session. With an explicit id, returns it. With none and exactly
+   * one connected, returns that.
+   *
+   * With none and multiple connected, applies smart auto-selection:
+   * 1. Prefer non-throttled sessions (not hidden + recently heard from).
+   * 2. Within each tier, prefer lowest lastSeenMs (most recently active SDK heartbeat).
+   * 3. If two or more non-throttled sessions are within 1 s of each other, throw —
+   * genuinely ambiguous, agent must specify sessionId.
+   * 4. If ALL sessions are throttled (e.g. user is working in their editor on another
+   * desktop), skip the gap check and pick the freshest heartbeat. This lets the agent
+   * keep working in the background without requiring sessionId every time.
+   */
+  /**
+   * Why a session recently went away, when the bridge closed it rather than the tab.
+   *
+   * The bridge enforces a message-rate cap and closes the socket on breach with `1008 message rate
+   * exceeded` — a policy violation, so the SDK does not retry. The app keeps running and Reticle is
+   * blind from that moment. Measured on the bench app: 2600 requests fired in one tick disconnected
+   * the session permanently, and the only trace was a line in the PAGE console, which no agent reads.
+   *
+   * Without this the agent is told "no browser session connected — check your app is running with
+   * @reticlehq/browser enabled", which is precisely wrong: the app IS running and instrumented. It
+   * was hung up on. Keeping the last few reasons turns an unexplained disappearance into a fact.
+   */
+  readonly #recentClosures: ClosureRecord[] = [];
+
+  /**
+   * What the daemon knows about WHY nothing is connected, refreshed in the background.
+   *
+   * Measured: of the sessions that call any tool, half make exactly one call — usually
+   * reticle_sessions — and stop, because the answer they get names two things they cannot check and
+   * nothing they can do. The daemon can tell "no app is running" from "an app is running and never
+   * dialled us" from "one was connected and left", and each has a different fix. Optional so a
+   * bridge constructed without a daemon (every unit test) keeps the plain message.
+   */
+  #noSessionHint: (() => string | undefined) | undefined;
+  /**
+   * The CODE for the same diagnosis `#noSessionHint` renders as prose.
+   *
+   * Registered from the same `explainNoSession` call as the hint, so the two cannot describe
+   * different branches. See no-session-watch.ts.
+   */
+  #noSessionReason: (() => NoSessionReason | undefined) | undefined;
+  /**
+   * The same diagnosis with the differential left off: the lead and the next action, nothing else.
+   *
+   * Two renderings because there are two readers, and only one of them can spend the words. An
+   * agent about to burn a drive on a guess wants the ranked causes, the port-scan caveat and the
+   * lease offer. The person watching `reticle init` fail wants to know what is wrong and what to
+   * type, and was instead handed roughly five hundred words in one paragraph.
+   */
+  #noSessionLead: (() => string | undefined) | undefined;
+
+  /** Wire the diagnosis provider (daemon boot). Absent ⇒ the plain, static message. */
+  setNoSessionHint(hint: (() => string | undefined) | undefined): void {
+    this.#noSessionHint = hint;
+  }
+
+  /** Wire the short rendering. Registered from the same `explainNoSession` call as the hint. */
+  setNoSessionLead(lead: (() => string | undefined) | undefined): void {
+    this.#noSessionLead = lead;
+  }
+
+  /** The lead and the next action, for a surface a person reads. */
+  noSessionLead(): string | undefined {
+    return this.#noSessionLead?.();
+  }
+
+  /**
+   * The same diagnosis, for a caller that is ASKING about sessions rather than failing to get one.
+   *
+   * `reticle_sessions` is the first thing an agent reaches for and it returned a bare empty array —
+   * confidently, with nothing to act on. An agent cannot tell an empty list apart from a daemon that
+   * is down, an app with no SDK, or a tab that was closed, so it stops there. The diagnosis was
+   * already computed for the error path; this exposes it to the read path too.
+   */
+  noSessionHint(): string | undefined {
+    return this.#noSessionHint?.();
+  }
+
+  setNoSessionReason(reason: (() => NoSessionReason | undefined) | undefined): void {
+    this.#noSessionReason = reason;
+  }
+
+  noSessionReason(): NoSessionReason | undefined {
+    return this.#noSessionReason?.();
+  }
+
+  /**
+   * The same diagnosis with the prose taken out — one action kind and one literal command.
+   *
+   * Separate from the hint rather than folded into it because the two have different consumers and
+   * different lifetimes: `resolve` throws an Error, which can only ever carry a string, while
+   * `reticle_sessions` returns a structured payload an agent can branch on without parsing English.
+   */
+  #noSessionNextAction: (() => NoSessionNextAction | undefined) | undefined;
+
+  setNoSessionNextAction(next: (() => NoSessionNextAction | undefined) | undefined): void {
+    this.#noSessionNextAction = next;
+  }
+
+  noSessionNextAction(): NoSessionNextAction | undefined {
+    return this.#noSessionNextAction?.();
+  }
+
+  /** Whether any session has connected since this daemon booted — half the diagnosis. */
+  #everConnected = false;
+  /**
+   * Which projects have registered a session in this process.
+   *
+   * `#everConnected` is one bit for the whole daemon. A second project asking "has anything
+   * connected" was answered about the first. The set is the same fact, per project.
+   */
+  readonly #connectedProjects = new Set<string>();
+
+  everConnected(): boolean {
+    return this.#everConnected;
+  }
+
+  /** Whether a session for this project has registered since boot. An unknown id has not. */
+  everConnectedTo(projectId: string): boolean {
+    return this.#connectedProjects.has(projectId);
+  }
+
+  /**
+   * Record a bridge-initiated close so `resolve` can explain a session that vanished.
+   *
+   * `page` is what the refused hello said about itself, when it said anything. A refusal is the one
+   * piece of positive evidence the no-session diagnosis has, and "a page was refused" without WHICH
+   * page leaves the reader unable to tell their app from another project's tab on the same port.
+   */
+  noteClosure(reason: string, at: number, page?: RefusedPage | null): void {
+    this.#recentClosures.push({ at, reason, ...(page ? { page } : {}) });
+    if (this.#recentClosures.length > MAX_REMEMBERED_CLOSURES) {
+      this.#recentClosures.shift();
+    }
+    this.#connectedSinceLastClosure = false;
+  }
+
+  /** The most recent bridge-initiated close, if any. */
+  lastClosure(): ClosureRecord | undefined {
+    return this.#recentClosures[this.#recentClosures.length - 1];
+  }
+
+  /**
+   * Has a session registered since the most recent bridge-initiated close?
+   *
+   * The ordering fact, and the reason it has to exist: `lastClosure` records only the closes the
+   * BRIDGE initiated, so an ordinary disconnect never reaches it. A refusal at 10:00 followed by a
+   * good session at 10:05 and a closed tab at 10:10 leaves `lastClosure` still reading
+   * `AUTH_FAILED`, and a diagnosis that trusts it blames the token for a tab the human closed.
+   *
+   * This distinguishes a refusal that is the CURRENT state of the bridge from one the daemon merely
+   * remembers. A boolean rather than a timestamp because `add` is not given a clock, and the only
+   * question anybody asks of it is "did anything get in after that?".
+   */
+  #connectedSinceLastClosure = false;
+
+  connectedSinceLastClosure(): boolean {
+    return this.#connectedSinceLastClosure;
+  }
+
+  /**
+   * The id of the session that most recently went away, if any.
+   *
+   * Distinct from {@link lastClosure}, which only records closes the bridge itself initiated
+   * (handshake refusals, auth failures) — an ordinary disconnect never reaches it. This reads the
+   * tombstone ring `remove()` maintains, so it covers every departure.
+   *
+   * Read by the no-session diagnosis, which needs to say something about the session that actually
+   * vanished rather than about the daemon's lifetime history (#611).
+   */
+  lastDeparted(): string | undefined {
+    return this.lastKnown()?.id;
+  }
+
+  /**
+   * The session that most recently disappeared — id, last URL, project — or undefined.
+   *
+   * `lastDeparted` is the id alone, which is what lease-expiry attribution needs. This is the
+   * rest: a route that 500s tears the page down and the SDK never reconnects, and without the
+   * URL `reticle_sessions` is an empty list with no history (#808). Tombstones, not live rows:
+   * a connected tab is in `list()`, not here.
+   */
+  lastKnown(): SessionIdentity | undefined {
+    let last: SessionIdentity | undefined;
+    for (const record of this.#tombstones.values()) {
+      last = record;
+    }
+    return last;
+  }
+
+  /**
+   * The most recent departed session for one project.
+   *
+   * `lastKnown` is the newest tombstone of any project. A shared daemon that quoted it to every
+   * caller told the second project to reopen the first project's tab.
+   */
+  lastKnownFor(projectId: string): SessionIdentity | undefined {
+    let last: SessionIdentity | undefined;
+    for (const record of this.#tombstones.values()) {
+      if (record.projectId === projectId) {
+        last = record;
+      }
+    }
+    return last;
+  }
+
+  /** Every departed session's URL, oldest first. The port scan has to see all of them, not only the newest. */
+  tombstoneUrls(): readonly string[] {
+    return [...this.#tombstones.values()].map((record) => record.url);
+  }
+
+  /**
+   * A dead `sessionId`, answered with what the caller needs to recover — not with an errand.
+   *
+   * Reported from telemetry: one agent called `reticle_navigate` repeatedly against an id that was
+   * no longer connected. That single loop accounted for a large share of every tool error seen that
+   * day. The
+   * refusal said only `no connected session with id 'x'`, and the recovery hint told it to call
+   * `reticle_sessions` and retry — two extra round trips to learn something this method already
+   * knows at the moment it refuses. An agent charged two calls to recover will often just repeat the
+   * one it made.
+   *
+   * So: name the live ids inline, and when there are none say that instead, because "retry with a
+   * valid one" is advice nobody can act on when no valid one exists.
+   */
+  #unknownSessionError(sessionId: string): string {
+    const live = [...this.#sessions.values()];
+    if (0 === live.length) {
+      const known = this.lastKnown();
+      const where = undefined === known ? '' : ` Last seen on ${known.url}.`;
+      return (
+        `no connected session with id '${sessionId}', and no sessions are connected at all — so ` +
+        'there is no other id to retry with.' +
+        where +
+        ' The app is not dialling this daemon; call ' +
+        'reticle_sessions for the diagnosis rather than retrying this call.'
+      );
+    }
+    // A leased tab belongs to whoever holds the lease: naming it, and the page it is on, told one
+    // agent what every other agent on this daemon was doing. Only the app's own tabs are offered.
+    const own = live.filter((s) => claimedSessionOf(s.url) === undefined);
+    const ended = sessionId.startsWith(LEASE_ID_PREFIX)
+      ? ` Lease '${sessionId}' has ended (it expired or was released); lease a new tab to go on.`
+      : '';
+    if (0 === own.length) {
+      return (
+        `no connected session with id '${sessionId}'.${ended} ` +
+        'Omit sessionId to let Reticle scope to your project, or lease a tab of your own.'
+      );
+    }
+    const named = own.map((s) => `'${s.id}' (${s.url})`).join(', ');
+    return (
+      `no connected session with id '${sessionId}'.${ended} Your app's tabs: ${named}. ` +
+      'Retry with one of those, or omit sessionId entirely and let Reticle scope to your project.'
+    );
+  }
+
+  /**
+   * The sessions an id-less call may choose from: in the project scope, then in the caller's own
+   * checkout. Throws when those scopes leave nothing, or leave tabs of more than one project.
+   */
+  #candidates(scope?: ResolveScope): Session[] {
+    // Scope to the agent's active project FIRST, so a stray tab from another app/origin (e.g. a
+    // leftover dashboard on a different port) is structurally unselectable — it never enters the
+    // candidate set, no matter how recently it was heard from. This is the anti-cross-talk guard.
+    // An explicit per-call scope wins; otherwise the daemon's active-project default applies.
+    const effectiveScope = scope ?? this.#defaultScope;
+    const connected = [...this.#sessions.values()];
+    const inProject = scopeSessions(connected, effectiveScope);
+    // Then to the agent's own worktree: every worktree of a project declares the same projectId.
+    const byCheckout =
+      this.#checkoutScope === undefined
+        ? { sessions: inProject }
+        : scopeToCallerCheckout(inProject, this.#checkoutScope.caller(), this.#checkoutScope.ofTab);
+    if (byCheckout.refusal !== undefined) {
+      throw new Error(byCheckout.refusal);
+    }
+    const all = byCheckout.sessions;
+    if (0 === all.length) {
+      // Sessions exist, but none belong to the scoped project — never fall back to a foreign tab.
+      // ponytail: still a refusal, deliberately. Auto-targeting the only connected tab would be the
+      // friendlier 90% case and would also silently defeat the anti-cross-talk guard this scope
+      // exists to be. Naming the tab and its sessionId costs the agent one extra argument.
+      throw new Error(scopeMissError(connected, effectiveScope));
+    }
+
+    // Two projects and nothing to choose between them: refuse, BEFORE any scoring.
+    //
+    // Reported from the field: a call from `apps/next-app-router` was answered by a `rowy-*`
+    // session, and `act_and_wait` spent 16.9s returning `verified:'no'` about an app never under
+    // test — a confident false verdict, with a source pointer, about code the agent never touched.
+    //
+    // The recency rule in resolve() cannot prevent it. It asks "is one of these clearly fresher",
+    // which is the right question for two tabs of ONE app and the wrong question for two apps: the
+    // fresher tab of the wrong project is still the wrong project. The reported case had a clear
+    // winner, so the ambiguity check passed and the wrong app was selected.
+    //
+    // This sits ahead of scoring so freshness cannot rescue it. It only fires when nothing scoped
+    // the call — an explicit `sessionId` never reaches here, and an explicit or default scope has
+    // already narrowed `all` to one project by here. One session is one project, so it never fires.
+    const projects = new Set(all.map((s) => s.projectId).filter((p) => p !== undefined));
+    if (projects.size > 1) {
+      const listed = all
+        .filter((s) => s.projectId !== undefined)
+        .map((s) => `'${String(s.projectId)}' (${s.url}, sessionId '${s.id}')`)
+        .join(', ');
+      throw new Error(
+        `${String(projects.size)} different projects are connected and nothing says which one this ` +
+          `call is about: ${listed}. Pass sessionId to target one. Reticle refuses rather than ` +
+          'guessing here because picking the wrong app produces a confident verdict about code you ' +
+          'never touched — the daemon scopes to the directory it was started in, so running it above ' +
+          'several apps leaves it unable to tell them apart.',
+      );
+    }
+    return all;
+  }
+
+  resolve(sessionId?: string, scope?: ResolveScope): Session {
+    if (sessionId !== undefined) {
+      const found = this.#sessions.get(sessionId) ?? this.#successorOf(sessionId);
+      if (found === undefined) {
+        throw new Error(this.#unknownSessionError(sessionId));
+      }
+      found.markAgentActivity(); // liveness — a targeted tool keeps the session alive / revives it
+      return found;
+    }
+    if (0 === this.#sessions.size) {
+      const closure = this.lastClosure();
+      // A diagnosis beats a checklist: it names which of the three causes this actually is.
+      const hint = this.#noSessionHint?.();
+      // BOTH, when there are both — the two answer different questions and the pair is strictly
+      // more than either. This used to be an either/or, and a recorded refusal DISCARDED the whole
+      // diagnosis: the one case where the daemon has hard evidence about why nothing is connected
+      // was also the one case where it threw away everything else it had learned, including the
+      // port scan and the next action. The refusal leads, because it is the fact.
+      const refusal =
+        closure === undefined
+          ? ''
+          : ` NOTE: the bridge REFUSED or closed a connection recently — "${closure.reason}". The app is probably still running and trying to connect: it was turned away, and the SDK does not retry after a policy close. The reason above names the fix — do not go looking for a stopped dev server.`;
+      // Hand the branch code to the refusal that is about to be reported for this throw. The
+      // diagnosis is computed HERE and the refusal is classified from the message downstream, so
+      // without this every no-session refusal lands in one undifferentiated bucket (#615).
+      notePendingNoSessionReason(this.#noSessionReason?.());
+      throw new Error(`${hint ?? NO_SESSION_CONNECTED_ERROR}${refusal}${NO_SESSION_NAVIGATE_FIX}`);
+    }
+    const all = this.#candidates(scope);
+    if (1 === all.length) {
+      const [only] = all;
+      if (only === undefined) {
+        throw new Error('session lookup failed');
+      }
+      only.markAgentActivity();
+      return only;
+    }
+
+    // Multiple sessions: score each (lower = better candidate for auto-selection). See rankOf().
+    const scored = all.map((s) => ({ s, score: rankOf(s), ms: s.lastSeenMs() }));
+    const bestScore = Math.min(...scored.map((x) => x.score));
+    const candidates = scored.filter((x) => x.score === bestScore);
+
+    // Sort candidates by recency (ascending lastSeenMs = most recently active first).
+    candidates.sort((a, b) => a.ms - b.ms);
+    const [best, runnerUp] = candidates;
+
+    if (best === undefined) {
+      throw new Error('session lookup failed');
+    }
+
+    // Only auto-select if there is a clear winner.
+    //
+    // When at least one non-throttled (focused/visible) session exists, require a >1 s recency
+    // gap before committing — two tabs that both had recent heartbeats are genuinely ambiguous.
+    //
+    // When ALL candidates are throttled (e.g. the user switched to their editor on another
+    // desktop), the gap requirement is dropped: every session is already in "background" mode
+    // so we just pick the one with the freshest heartbeat and let the agent proceed. Requiring
+    // a gap here only produces spurious "ambiguous" errors while the user works elsewhere.
+    // Nothing healthy left to choose between (all throttled, or all wedged): drop the gap check.
+    const allThrottled = bestScore >= 1;
+    const RECENCY_GAP_MS = allThrottled ? 0 : 1_000;
+    const clearWinner = runnerUp === undefined || best.ms + RECENCY_GAP_MS < runnerUp.ms;
+
+    // Healthy tabs heartbeat on the same cadence, so the recency gap between two of them is noise.
+    // When exactly one has the window focus it is the one a human is looking at: tabs piled up one
+    // per `init` run, and every tool called without a sessionId was refused while one of them was
+    // plainly the tab in front. Only among healthy ones — focus says nothing about a wedged tab.
+    const focused = allThrottled ? [] : candidates.filter((x) => x.s.health().focused);
+    const [onlyFocused, secondFocused] = focused;
+    if (!clearWinner && onlyFocused !== undefined && secondFocused === undefined) {
+      onlyFocused.s.markAgentActivity();
+      return onlyFocused.s;
+    }
+
+    if (!clearWinner) {
+      // Ambiguous: list sessions with their health so the agent can choose.
+      const detail = all
+        .map(
+          (s) =>
+            `${s.id} (${s.throttled() ? 'throttled' : 'active'}, lastSeenMs=${s.lastSeenMs()})`,
+        )
+        .join(', ');
+      throw new Error(`multiple sessions connected — pass sessionId to target one: ${detail}`);
+    }
+
+    best.s.markAgentActivity();
+    return best.s;
+  }
+
+  /**
+   * Resolve the session for a call that only some sessions can serve.
+   *
+   * With no sessionId, resolve() chooses by health and recency alone. A lease that could resize the
+   * page lost to a focused tab that could not, and the call was refused (#1959). Here, when exactly
+   * one candidate can serve the call, that candidate is chosen.
+   */
+  async resolveServing(
+    sessionId: string | undefined,
+    canServe: (session: Session) => boolean | Promise<boolean>,
+  ): Promise<Session> {
+    // A named session, or none connected: resolve() already gives the answer and its refusals.
+    if (sessionId !== undefined || 0 === this.#sessions.size) {
+      return this.resolve(sessionId);
+    }
+
+    // The same candidates resolve() chooses from, so the project and checkout scopes still apply.
+    // canServe can ask a browser, so each answer is awaited in turn.
+    const serving: Session[] = [];
+    for (const candidate of this.#candidates()) {
+      if (await canServe(candidate)) {
+        serving.push(candidate);
+      }
+    }
+
+    // Exactly one can serve the call: there is nothing to guess.
+    const [onlyServing, secondServing] = serving;
+    if (onlyServing !== undefined && secondServing === undefined) {
+      onlyServing.markAgentActivity();
+      return onlyServing;
+    }
+
+    // None can serve: return the usual choice, so the tool gives its own refusal and its advice.
+    // Several can serve, and the usual choice cannot: choosing among them is a guess, so refuse
+    // and name them. canServe admits only the caller's own sessions, so no other agent's lease is
+    // named here.
+    const chosen = this.resolve();
+    if (0 < serving.length && !serving.includes(chosen)) {
+      const ids = serving.map((s) => `'${s.id}'`).join(', ');
+      throw new Error(
+        `no sessionId was given, and ${String(serving.length)} sessions can serve this call: ` +
+          `${ids}. Pass sessionId to choose one.`,
+      );
+    }
+    return chosen;
+  }
+}
+
+export interface Tab {
+  id: string;
+  url: string;
+}
+
+export interface CheckoutScope<S> {
+  sessions: S[];
+  /** Set when every tab is known to be served from another worktree of the agent's repository. */
+  refusal?: string;
+}
+
+/**
+ * Which of a project's tabs belong to the agent's own git checkout.
+ *
+ * Every worktree of a project declares the same projectId, so the project scope lets an agent in
+ * worktree A land on the tab worktree B serves. That tab runs B's code, and a verdict on it is about
+ * code agent A never touched. The agent's checkout comes from the directory its MCP proxy runs in;
+ * a tab's checkout comes from the dev server that served it.
+ *
+ * It narrows only on facts. A tab known to come from another worktree of the agent's repository is
+ * dropped. A tab whose checkout cannot be read stays, because it can be the agent's own.
+ */
+export function scopeToCallerCheckout<S extends Tab>(
+  sessions: readonly S[],
+  caller: Checkout | undefined,
+  checkoutOfTab: (tab: S) => Checkout | undefined,
+): CheckoutScope<S> {
+  if (caller === undefined) {
+    return { sessions: [...sessions] };
+  }
+  const placed = sessions.map((session) => ({ session, checkout: checkoutOfTab(session) }));
+  const mine = placed.filter((p) => isSame(p.checkout?.root, caller.root)).map((p) => p.session);
+  if (mine.length > 0) {
+    return { sessions: mine };
+  }
+  const siblings = placed.filter((p) => isSame(p.checkout?.commonDir, caller.commonDir));
+  if (siblings.length !== placed.length) {
+    return { sessions: placed.filter((p) => !siblings.includes(p)).map((p) => p.session) };
+  }
+  if (0 === siblings.length) {
+    return { sessions: [] };
+  }
+  // The caller is the folder the MCP proxy started in, not always where the agent works. Claude Code
+  // starts the proxy in the main checkout and then moves the agent into a linked worktree (#1916).
+  // So from the main checkout, one linked worktree that serves every tab is the agent's own: drive it.
+  // The tab names its `worktree`. Tabs of two worktrees, or a proxy in a linked worktree, stay refused.
+  const roots = new Set(siblings.map((p) => p.checkout?.root));
+  if (!caller.linked && 1 === roots.size && true === siblings[0]?.checkout?.linked) {
+    return { sessions: siblings.map((p) => p.session) };
+  }
+  const listed = siblings
+    .map((p) => `${describeCheckout(p.checkout)} (sessionId '${p.session.id}', ${p.session.url})`)
+    .join(', ');
+  return {
+    sessions: [],
+    refusal:
+      `every tab of this app is served from another worktree: ${listed}. This agent runs in ` +
+      `${describeCheckout(caller)}. A verdict on another worktree's tab is about code this agent ` +
+      'did not change. Start the dev server in this worktree, or pass sessionId to drive that tab ' +
+      'on purpose.',
+  };
+}
+
+const isSame = (a: string | undefined, b: string): boolean => a !== undefined && samePath(a, b);
+
+/** `/wt/a (branch feat/a)`, or the folder alone on a detached HEAD. */
+export function describeCheckout(checkout: Checkout | undefined): string {
+  if (checkout === undefined) {
+    return 'an unknown folder';
+  }
+  return checkout.branch === undefined
+    ? checkout.root
+    : `${checkout.root} (branch ${checkout.branch})`;
+}

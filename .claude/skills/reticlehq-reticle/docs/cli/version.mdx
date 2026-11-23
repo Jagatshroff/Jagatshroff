@@ -1,0 +1,40 @@
+---
+title: reticle version
+description: Print the version of the Reticle server that is actually executing.
+icon: tag
+---
+
+`reticle version` prints the running package version. It is the diagnostic to reach for when you need to know which build `npx` actually resolved, which is not always the one you expected.
+
+```bash
+npx @reticlehq/server version
+npx @reticlehq/server --version
+npx @reticlehq/server -v
+```
+
+All three are the same command. No flags.
+
+## What it prints
+
+The version, and nothing else, on stdout, so `V=$(reticle version)` works:
+
+```text
+3.8.0
+```
+
+## Exit codes
+
+Always `0`.
+
+## Worked example
+
+```bash
+V=$(npx @reticlehq/server version)
+echo "$V"
+```
+
+<Note>
+  The version here is the CLI's. A daemon that was already running keeps serving its own build until
+  it exits, so [`reticle doctor`](/cli/doctor) is the command that compares the two and names a
+  skew.
+</Note>

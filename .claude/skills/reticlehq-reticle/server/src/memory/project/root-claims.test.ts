@@ -1,0 +1,85 @@
+/**
+ * Leased sessions wrote wherever the resolver sent them — `~/.reticle/unmatched/<id>` for an app with
+ * no project id — so `reticle try`, a chat drive or a lease opened from a linked folder produced runs
+ * nothing linked or synced, and try's wait for its run timed out. A lease now carries the root of
+ * whoever opened it, and the session it registers writes there.
+ */
+import { mkdirSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { claimArtifactRoot, claimedArtifactRoot, dropArtifactRootClaim } from './root-claims.js';
+import { removeTempDirSync } from '@/machine/temp-dir.test-helpers.js';
+
+const ROOT = '/work/shop/.reticle';
+
+afterEach(() => {
+  dropArtifactRootClaim('lease-1');
+});
+
+describe('artifact root claims', () => {
+  it('gives the session registered under the lease id the claimed root', () => {
+    claimArtifactRoot('lease-1', ROOT);
+    expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBe(ROOT);
+  });
+
+  it('follows the lease marker on the url when the app named its own session', () => {
+    claimArtifactRoot('lease-1', ROOT);
+    expect(claimedArtifactRoot('app-own', 'http://localhost:3000/?__reticle_session=lease-1')).toBe(
+      ROOT,
+    );
+  });
+
+  it('claims nothing for a session no lease opened', () => {
+    claimArtifactRoot('lease-1', ROOT);
+    expect(claimedArtifactRoot('tab-9', 'http://localhost:3000/')).toBeUndefined();
+  });
+
+  it('refuses a relative root', () => {
+    expect(() => claimArtifactRoot('lease-1', 'relative/.reticle')).toThrow(/absolute/);
+  });
+
+  it('takes a project folder that holds a .reticle as that .reticle', () => {
+    const project = mkdtempSync(join(tmpdir(), 'reticle-root-'));
+    try {
+      mkdirSync(join(project, '.reticle'));
+      claimArtifactRoot('lease-1', project);
+      expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBe(
+        join(project, '.reticle'),
+      );
+    } finally {
+      removeTempDirSync(project);
+    }
+  });
+
+  it('takes an existing project folder with no .reticle yet as its future .reticle', () => {
+    const project = mkdtempSync(join(tmpdir(), 'reticle-root-'));
+    try {
+      claimArtifactRoot('lease-1', project);
+      expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBe(
+        join(project, '.reticle'),
+      );
+    } finally {
+      removeTempDirSync(project);
+    }
+  });
+
+  it('refuses a root that is nowhere on disk and names the path to pass', () => {
+    const base = mkdtempSync(join(tmpdir(), 'reticle-root-'));
+    const missing = join(base, 'worktree', 'shop');
+    try {
+      expect(() => claimArtifactRoot('lease-1', missing)).toThrow(
+        `Pass ${join(missing, '.reticle')}`,
+      );
+      expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBeUndefined();
+    } finally {
+      removeTempDirSync(base);
+    }
+  });
+
+  it('forgets the claim when the lease is released', () => {
+    claimArtifactRoot('lease-1', ROOT);
+    dropArtifactRootClaim('lease-1');
+    expect(claimedArtifactRoot('lease-1', 'http://localhost:3000/')).toBeUndefined();
+  });
+});

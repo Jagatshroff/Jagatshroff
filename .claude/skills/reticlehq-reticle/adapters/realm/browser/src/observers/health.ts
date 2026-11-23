@@ -1,0 +1,221 @@
+import {
+  BrowserBrand,
+  EventType,
+  HealthReason,
+  RETICLE_IPC_GLOBAL,
+  SESSION_HEALTH,
+} from '@reticlehq/core/page';
+import { nativeSetInterval } from '@/timers/native/native-timers.js';
+import type { Emit, Teardown } from './types.js';
+
+/**
+ * Which shell this page runs in. Reported with health because it is what makes a timeout
+ * diagnosable: an occluded WKWebView is SUSPENDED by macOS, so the session stays connected while
+ * every command times out — and a URL cannot tell a Tauri dev server from a plain localhost app, so
+ * the runtime has to come from the page itself.
+ */
+function detectRuntime(): 'electron' | 'tauri' | 'web' {
+  const w = window as unknown as Record<string, unknown>;
+  if (w['__TAURI_INTERNALS__'] !== undefined || w['__TAURI__'] !== undefined) return 'tauri';
+  if (navigator.userAgent.includes('Electron') || w[RETICLE_IPC_GLOBAL] !== undefined)
+    return 'electron';
+  return 'web';
+}
+
+/**
+ * The rendering engine, coarse on purpose. Three buckets — never the UA string itself, which is
+ * high-cardinality and semi-identifying. Order matters: every Chromium UA also contains "Safari", and
+ * Gecko is the only engine that reports a real `Gecko/` build token.
+ */
+function detectEngine(): 'blink' | 'gecko' | 'webkit' {
+  const ua = navigator.userAgent;
+  if (/Chrome|Chromium|Edg\//.test(ua)) return 'blink';
+  if (/Gecko\/|Firefox/.test(ua)) return 'gecko';
+  return 'webkit';
+}
+
+/**
+ * Brand names as the Chromium family and the UA string spell them, mapped to our closed vocabulary.
+ * Matched on the WHOLE lowercased name, never a substring: brand strings are attacker-influenced
+ * free text, and a substring rule is how "Search Browser" becomes `arc`.
+ */
+const BRAND_BY_NAME: Readonly<Record<string, BrowserBrand>> = {
+  'google chrome': BrowserBrand.CHROME,
+  chrome: BrowserBrand.CHROME,
+  'microsoft edge': BrowserBrand.EDGE,
+  edge: BrowserBrand.EDGE,
+  brave: BrowserBrand.BRAVE,
+  opera: BrowserBrand.OPERA,
+  arc: BrowserBrand.ARC,
+  dia: BrowserBrand.DIA,
+  firefox: BrowserBrand.FIREFOX,
+  safari: BrowserBrand.SAFARI,
+};
+
+/** Chromium's own filler entries: the greased `Not_A Brand` (spelt differently every release) and the generic engine name. */
+function isFiller(name: string): boolean {
+  return 'chromium' === name || (name.includes('not') && name.includes('brand'));
+}
+
+/**
+ * The brand, from `navigator.userAgentData.brands` where it exists and the UA string where it does
+ * not (Firefox and Safari expose no userAgentData at all). Every fork claims `Google Chrome`
+ * alongside its own entry, so a non-Chrome match always wins; a Chromium that names nothing but
+ * filler is `other`, because calling it Chrome would be a guess.
+ *
+ * Never throws — a desktop webview may expose a `userAgentData` of any shape, and health reporting
+ * must survive it.
+ */
+function detectBrand(): BrowserBrand {
+  try {
+    const nav = navigator as Navigator & { userAgentData?: { brands?: unknown } };
+    const brands = nav.userAgentData?.brands;
+    if (Array.isArray(brands)) {
+      let chrome: BrowserBrand | undefined;
+      for (const entry of brands as { brand?: unknown }[]) {
+        const name = 'string' === typeof entry?.brand ? entry.brand.toLowerCase() : '';
+        if ('' === name || isFiller(name)) continue;
+        const known = BRAND_BY_NAME[name];
+        if (known === undefined) continue;
+        if (BrowserBrand.CHROME === known) chrome = known;
+        else return known;
+      }
+      return chrome ?? BrowserBrand.OTHER;
+    }
+  } catch {
+    /* a health report must never depend on an exotic userAgentData */
+  }
+  const ua = navigator.userAgent;
+  if (/Edg\//.test(ua)) return BrowserBrand.EDGE;
+  if (/OPR\/|Opera/.test(ua)) return BrowserBrand.OPERA;
+  if (/Firefox/.test(ua)) return BrowserBrand.FIREFOX;
+  if (/Chrome|Chromium/.test(ua)) return BrowserBrand.CHROME;
+  if (/Safari/.test(ua)) return BrowserBrand.SAFARI;
+  return BrowserBrand.OTHER;
+}
+
+/**
+ * The page's own fetch, bound when this module loads — before the network observer wraps it — so the
+ * status probe below never shows up as a request the app made.
+ */
+const pageFetch: typeof fetch | undefined =
+  'undefined' !== typeof window && 'function' === typeof window.fetch
+    ? window.fetch.bind(window)
+    : undefined;
+
+/** Tauri's own name for the window this page is in (`main`, `setup`…); undefined anywhere else. */
+function tauriWindowLabel(): string | undefined {
+  const internals = (window as unknown as Record<string, unknown>)['__TAURI_INTERNALS__'] as
+    { metadata?: { currentWindow?: { label?: unknown } } } | undefined;
+  const label = internals?.metadata?.currentWindow?.label;
+  return 'string' === typeof label && label.length > 0 ? label : undefined;
+}
+
+/**
+ * The HTTP status this document was served with, so a 404 page is never mistaken for the app.
+ *
+ * Reported from a Tauri app whose two hidden windows loaded a dev server's 404 page — which still
+ * mounted the SDK — and were the only sessions listed. The browser's navigation entry says the
+ * status where it can; WKWebView never does, so a desktop page asks once with a HEAD.
+ */
+function navigationStatus(): number | undefined {
+  try {
+    const [entry] = performance.getEntriesByType('navigation') as { responseStatus?: number }[];
+    const known = entry?.responseStatus;
+    return 'number' === typeof known && known > 0 ? known : undefined;
+  } catch {
+    return undefined; // no navigation timing here: fall through to asking
+  }
+}
+
+async function documentStatus(runtime: string): Promise<number | undefined> {
+  const known = navigationStatus();
+  if (known !== undefined) return known;
+  try {
+    if ('web' === runtime || pageFetch === undefined || !/^https?:$/.test(location.protocol)) {
+      return undefined;
+    }
+    return (await pageFetch(location.href, { method: 'HEAD', cache: 'no-store' })).status;
+  } catch {
+    return undefined; // a status we cannot read is simply not reported
+  }
+}
+
+/**
+ * An Electron window's label: Electron has no name for a window, so the app gives one where it
+ * registers the window for capture (`installReticleCapture(win, { label })`) and the preload asks.
+ */
+async function electronWindowLabel(): Promise<string | undefined> {
+  const channel = (window as unknown as Record<string, unknown>)[RETICLE_IPC_GLOBAL] as
+    { windowLabel?: () => Promise<unknown> } | undefined;
+  if ('function' !== typeof channel?.windowLabel) return undefined;
+  try {
+    const label = await channel.windowLabel();
+    return 'string' === typeof label && label.length > 0 ? label : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function snapshotHealth(windowLabel: string | undefined): {
+  hidden: boolean;
+  focused: boolean;
+  runtime: string;
+  engine: string;
+  brand: BrowserBrand;
+  windowLabel?: string;
+} {
+  return {
+    hidden: 'hidden' === document.visibilityState,
+    focused: document.hasFocus(),
+    runtime: detectRuntime(),
+    engine: detectEngine(),
+    brand: detectBrand(),
+    ...(windowLabel === undefined ? {} : { windowLabel }),
+  };
+}
+
+/**
+ * Report page visibility/focus immediately on change + a lightweight native heartbeat.
+ * Lets the bridge know whether the tab is foregrounded so the agent never drives a throttled
+ * tab blind. Uses a native (pre-bound) timer so a frozen app clock (reticle_clock) never stalls it.
+ */
+export function installHealth(emit: Emit): Teardown {
+  const ac = new AbortController();
+  const { signal } = ac;
+
+  let status: number | undefined;
+  let label = tauriWindowLabel();
+  const report = (reason: HealthReason): void => {
+    emit(EventType.PAGE_HEALTH, {
+      ...snapshotHealth(label),
+      ...(status === undefined ? {} : { documentStatus: status }),
+      reason,
+    });
+  };
+
+  document.addEventListener('visibilitychange', () => report(HealthReason.VISIBILITY), { signal });
+  window.addEventListener('focus', () => report(HealthReason.FOCUS), { signal });
+  window.addEventListener('blur', () => report(HealthReason.BLUR), { signal });
+
+  report(HealthReason.INITIAL); // baseline so the server knows state before the first change
+  // Both asked once, and reported as soon as they are known: selection reads them on connect.
+  void Promise.all([
+    documentStatus(detectRuntime()),
+    label === undefined ? electronWindowLabel() : Promise.resolve(label),
+  ]).then(([known, named]) => {
+    if (signal.aborted || (known === undefined && named === label)) return;
+    status = known;
+    label = named;
+    report(HealthReason.HEARTBEAT);
+  });
+  const stopHeartbeat = nativeSetInterval(
+    () => report(HealthReason.HEARTBEAT),
+    SESSION_HEALTH.HEARTBEAT_MS,
+  );
+
+  return () => {
+    stopHeartbeat();
+    ac.abort();
+  };
+}

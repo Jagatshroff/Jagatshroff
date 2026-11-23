@@ -1,0 +1,163 @@
+import { describe, expect, it } from 'vitest';
+import { EventType, ReticleCommand, SessionState } from '@reticlehq/core';
+import { RECONCILE_TOOLS } from './reconcile-tools.js';
+import { ReticleTool } from '@reticlehq/core';
+import type { ToolDeps } from './tools.js';
+import type { Session } from '@/portal/session/session.js';
+import type { SessionManager } from '@/portal/session/session-manager.js';
+
+const RESPONSE = {
+  type: EventType.NET_REQUEST,
+  data: {
+    url: '/api/settlements',
+    responseBody: JSON.stringify([
+      { id: 'stl_1', status: 'on_hold' },
+      { id: 'stl_2', status: 'paid' },
+    ]),
+  },
+};
+
+/** A session whose snapshot answers per scope, so a cut page can be scripted branch by branch. */
+function reconcileDeps(pages: Record<string, unknown>): ToolDeps {
+  const session = {
+    id: 's1',
+    queryEvents: () => Promise.resolve([RESPONSE]),
+    command: (name: string, args: Record<string, unknown>) =>
+      Promise.resolve({
+        kind: 'command_result',
+        id: 'x',
+        ok: true,
+        result:
+          name === ReticleCommand.SNAPSHOT
+            ? (pages['string' === typeof args['scope'] ? args['scope'] : ''] ?? { tree: '' })
+            : {},
+      }),
+    getState: () => SessionState.ACTIVE,
+    drainInbox: () => [],
+  } as unknown as Session;
+  const sessions = { resolve: () => session } as unknown as SessionManager;
+  return { sessions } as unknown as ToolDeps;
+}
+
+function reconcileTool() {
+  const t = RECONCILE_TOOLS.find((x) => x.name === ReticleTool.RECONCILE);
+  if (t === undefined) throw new Error('no reticle_reconcile tool');
+  return t;
+}
+
+/**
+ * "Nothing on screen contradicts them" is a NEGATIVE conclusion, and it used to be drawn over a
+ * snapshot that may have stopped at its node cap. The row that disagreed could simply have been past
+ * the cut, and nothing in the answer said so.
+ */
+describe('reconcile refuses to call a page clean it could not read', () => {
+  it('reports a clean comparison over a page that was read whole', async () => {
+    const r = (await reconcileTool().handler(
+      reconcileDeps({
+        '': { tree: '- text "stl_1 on hold"\n- text "stl_2 paid"', truncated: false },
+      }),
+      {},
+    )) as { mismatches: unknown[]; note?: string };
+    expect(r.mismatches).toEqual([]);
+    expect(r.note).toContain('nothing on screen contradicts');
+  });
+
+  it('finishes a cut page by re-reading its branches, then reports on the whole tree', async () => {
+    const r = (await reconcileTool().handler(
+      reconcileDeps({
+        // Cut BEFORE the row that agrees: read alone, this prefix reports a mismatch that is not real.
+        '': { tree: '- text "stl_2 paid"', truncated: true, unread: ['e2'] },
+        e2: { tree: '- text "stl_1 on hold"', truncated: false },
+      }),
+      {},
+    )) as { mismatches: unknown[]; note?: string };
+    expect(r.mismatches).toEqual([]);
+    expect(r.note).toContain('nothing on screen contradicts');
+  });
+
+  it('throws rather than returning an empty comparison over a page it could not finish', async () => {
+    await expect(
+      reconcileTool().handler(
+        reconcileDeps({
+          '': {
+            tree: '- text "irrelevant"',
+            truncated: true,
+            unread: ['e2'],
+            unreadOverflow: true,
+          },
+        }),
+        {},
+      ),
+    ).rejects.toThrow(/could not be read/i);
+  });
+
+  it('still reports a mismatch it FOUND in a page it could not finish', async () => {
+    const r = (await reconcileTool().handler(
+      reconcileDeps({
+        // Both rows named on the page, and the on-hold one rendered "paid": the misrendering.
+        '': {
+          tree: '- text "stl_1 paid"\n- text "stl_2 paid"',
+          truncated: true,
+          unread: ['e2'],
+          unreadOverflow: true,
+        },
+      }),
+      {},
+    )) as { mismatches: unknown[] };
+    expect(r.mismatches.length).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * reticle#1545: on a dashboard whose cards hold native selects with hundreds of options, the whole
+ * page cut past the read budget and reconcile refused. The part the API feeds was small.
+ */
+describe('reconcile with a scope', () => {
+  /** The whole page names 500 unread option branches; the scoped strip reads complete. */
+  const DASHBOARD = {
+    '': {
+      tree: '- combobox "Region"',
+      truncated: true,
+      unread: Array.from({ length: 500 }, (_, i) => `opt${String(i)}`),
+    },
+    '#status': { tree: '- text "stl_1 on hold"\n- text "stl_2 paid"', truncated: false },
+  };
+
+  it('refuses the whole page that a 500-option select cuts past the read budget', async () => {
+    await expect(reconcileTool().handler(reconcileDeps(DASHBOARD), {})).rejects.toThrow(
+      /could not be read completely/i,
+    );
+  });
+
+  it('compares against the scoped subtree only, and completes there', async () => {
+    const r = (await reconcileTool().handler(reconcileDeps(DASHBOARD), {
+      scope: '#status',
+    })) as { mismatches: unknown[]; note?: string };
+    expect(r.mismatches).toEqual([]);
+    expect(r.note).toContain('nothing on screen contradicts');
+  });
+
+  it('still finds a misrendering inside the scope', async () => {
+    const r = (await reconcileTool().handler(
+      reconcileDeps({
+        ...DASHBOARD,
+        '#status': { tree: '- text "stl_1 paid"\n- text "stl_2 paid"', truncated: false },
+      }),
+      { scope: '#status' },
+    )) as { mismatches: unknown[] };
+    expect(r.mismatches.length).toBeGreaterThan(0);
+  });
+
+  it('refuses a scope that matches no element instead of calling it clean', async () => {
+    await expect(
+      reconcileTool().handler(
+        reconcileDeps({ '#nope': { tree: '', truncated: false, scopeMissing: true } }),
+        { scope: '#nope' },
+      ),
+    ).rejects.toThrow(/#nope/);
+  });
+
+  it('names the scope in the refusal when a whole-page read cannot finish', async () => {
+    await expect(reconcileTool().handler(reconcileDeps(DASHBOARD), {})).rejects.toThrow(/scope/);
+  });
+});

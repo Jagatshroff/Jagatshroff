@@ -1,0 +1,174 @@
+import { describe, expect, it, vi } from 'vitest';
+import { ActionType } from '@reticlehq/core';
+import type { Session } from '@/portal/session/session.js';
+import { resolveActTarget } from './act-target.js';
+import { ROLE_TEXT_FIND_OPENING } from '@/surface/tools/read/query-shape.js';
+
+/**
+ * A global press is a document key. Requiring a ref forced an extra snapshot just to name an
+ * element the keystroke is not about, and pressing against body/document was refused the same way.
+ *
+ * The QUERY must not run on this path: there is nothing to look up, and a lookup that fails would
+ * turn "dismiss the dialog" into a locator miss.
+ */
+function sessionThatMustNotBeQueried(): {
+  session: Session;
+  command: ReturnType<typeof vi.fn>;
+} {
+  const command = vi.fn(() => {
+    throw new Error('a global press must not query the page for a target');
+  });
+  return { session: { command } as unknown as Session, command };
+}
+
+describe('resolveActTarget — a document-key press needs no locator', () => {
+  it('accepts Escape with neither ref nor target, and does not query', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    const r = await resolveActTarget(session, {
+      action: ActionType.PRESS,
+      args: { text: 'Escape' },
+    });
+    expect(r).toEqual({ kind: 'global', ref: '' });
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('accepts Tab, and a modifier shortcut, the same way', async () => {
+    const { session } = sessionThatMustNotBeQueried();
+    expect(
+      await resolveActTarget(session, { action: ActionType.PRESS, args: { text: 'Tab' } }),
+    ).toEqual({ kind: 'global', ref: '' });
+    expect(
+      await resolveActTarget(session, {
+        action: ActionType.PRESS,
+        args: { text: 'k', modifiers: ['Meta'] },
+      }),
+    ).toEqual({ kind: 'global', ref: '' });
+  });
+
+  it('still honours an explicit ref on a global key — a press aimed at a control keeps one', async () => {
+    const { session } = sessionThatMustNotBeQueried();
+    const r = await resolveActTarget(session, {
+      ref: 'e12',
+      action: ActionType.PRESS,
+      args: { text: 'Escape' },
+    });
+    expect(r).toEqual({ kind: 'ref', ref: 'e12' });
+  });
+
+  it('still refuses a click, a default Enter, and a letter, when nothing was named', async () => {
+    const { session } = sessionThatMustNotBeQueried();
+    for (const args of [
+      { action: ActionType.CLICK },
+      { action: ActionType.PRESS, args: { text: 'Enter' } },
+      { action: ActionType.PRESS, args: {} },
+      { action: ActionType.PRESS, args: { text: 'a' } },
+    ]) {
+      const r = await resolveActTarget(session, args);
+      expect(r.kind, JSON.stringify(args)).toBe('error');
+      if ('error' !== r.kind) return;
+      expect(r.message).toMatch(/`ref`/);
+      expect(r.message).toMatch(/`target`/);
+      expect(r.message, 'names the exception so the next call can omit the locator').toMatch(
+        /Escape/,
+      );
+    }
+  });
+});
+
+/**
+ * `ref: "find:aria-label=Open menu"` was never a ref, and it was refused as STALE — "refs are
+ * invalidated whenever the DOM re-renders" — so the agent re-queried and retried the same mistake.
+ * A string without the minted shape is refused here, before the page is asked anything.
+ */
+describe('resolveActTarget — a ref Reticle never issued', () => {
+  it.each(['find:aria-label=Open menu', 'e', 'E12', 'e12x', '#submit', 'ref-3'])(
+    'refuses %j at the boundary, names target, and does not query',
+    async (ref) => {
+      const { session, command } = sessionThatMustNotBeQueried();
+      const r = await resolveActTarget(session, { ref, action: ActionType.CLICK });
+      expect(r.kind).toBe('error');
+      const message = 'error' === r.kind ? r.message : '';
+      expect(message).toBe(
+        `${JSON.stringify(ref)} is not a ref Reticle issued; refs look like e12. To address an ` +
+          'element by what it shows, pass target: { label }, { role, name }, { text } or { testid }.',
+      );
+      expect(command).not.toHaveBeenCalled();
+    },
+  );
+
+  it('passes a minted-shape ref through untouched — a genuinely stale one is the page’s to refuse', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    expect(await resolveActTarget(session, { ref: 'e12', action: ActionType.CLICK })).toEqual({
+      kind: 'ref',
+      ref: 'e12',
+    });
+    expect(command).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * An agent took a look, then passed the ref it got as a string target: `{ target: "e7" }`. The
+ * string was read as a query that names nothing, so the page was searched for nothing and the answer
+ * was "target matched no element ... widen the query". The agent took the ref for stale, and tried
+ * a CSS selector, which got the same answer.
+ */
+describe('resolveActTarget — a string target', () => {
+  it('takes a ref given as the target as that ref, and does not query', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    expect(await resolveActTarget(session, { target: 'e7', action: ActionType.CLICK })).toEqual({
+      kind: 'ref',
+      ref: 'e7',
+    });
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('refuses `text` on a role target, and does not search the page (#2326)', async () => {
+    for (const target of [
+      { role: 'button', text: 'Save' },
+      { by: 'role', value: 'button', text: 'Save' },
+    ]) {
+      const { session, command } = sessionThatMustNotBeQueried();
+      const r = await resolveActTarget(session, { target, action: ActionType.CLICK });
+      expect(r.kind).toBe('error');
+      expect('error' === r.kind ? r.message : '').toContain(ROLE_TEXT_FIND_OPENING);
+      expect(command).not.toHaveBeenCalled();
+    }
+  });
+
+  it('refuses a target that names nothing to find, and does not search the page', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    const r = await resolveActTarget(session, {
+      target: 'button.counter:first-child',
+      action: ActionType.CLICK,
+    });
+    expect(r.kind).toBe('error');
+    expect('error' === r.kind ? r.message : '').toContain('Nothing was searched');
+    expect(command).not.toHaveBeenCalled();
+  });
+});
+
+/*
+ * An agent's step target matched two elements. The refusal said to pass an explicit ref, so the
+ * agent passed `{ target: { ref: "e2401" } }`. The object was read as a query with no field, and the
+ * step failed with "Nothing was searched". It cost the agent two more calls.
+ */
+describe('resolveActTarget — a ref inside the target object', () => {
+  it('takes { ref } as that ref, and does not query', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    expect(
+      await resolveActTarget(session, { target: { ref: 'e2401' }, action: ActionType.CLICK }),
+    ).toEqual({ kind: 'ref', ref: 'e2401' });
+    expect(command).not.toHaveBeenCalled();
+  });
+
+  it('refuses a ref Reticle never issued, the same as a top-level ref', async () => {
+    const { session, command } = sessionThatMustNotBeQueried();
+    const r = await resolveActTarget(session, {
+      target: { ref: '#submit' },
+      action: ActionType.CLICK,
+    });
+    expect(r.kind).toBe('error');
+    expect('error' === r.kind ? r.message : '').toContain('is not a ref Reticle issued');
+    expect(command).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,595 @@
+import { ContradictionKind, EventType, MUTATING_METHODS, type ReticleEvent } from '@reticlehq/core';
+import type { OwnContradiction } from './contradiction-types.js';
+
+/**
+ * A write that returned OK and quietly did not apply part of what it was asked to.
+ *
+ * Measured on a desktop preferences write: the request asked for `{density:'compact', locale:'fr'}`,
+ * the response echoed `{"ok":true,"saved":{"density":"compact","locale":"en"}}`, the UI said
+ * "Preferences saved", and every channel agreed. `locale` was silently discarded. Nothing above the
+ * payload can see this — the status is 200, the body reports no failure, the UI advanced, the page
+ * settled. It is a false green with the evidence already in hand.
+ *
+ * The shape is ordinary in real backends: a field not in the UPDATE statement, a schema that strips
+ * unknown keys, a PATCH that honours a subset, an enum that falls back to a default.
+ *
+ * ## Why this is narrow on purpose
+ *
+ * Servers legitimately transform what they echo — trimming, lower-casing, rounding, canonicalising,
+ * filling defaults, assigning ids and timestamps. A rule that flagged every echoed field that differs
+ * would fire on healthy APIs constantly, and a contradiction kind that cries wolf gets filtered out
+ * by the agents reading it, taking the true positives with it. So:
+ *
+ *  - only requests that are WRITES are considered. Reported from the field: a lookup that sends its
+ *    key in the body (`POST /get-branding` with `{workspace_id}`) and gets a record back was graded
+ *    as a half-applied write. The gate was on the RESPONSE being a success and never on the REQUEST
+ *    being a write, so every successful call carrying a body read as a save — and the same key name
+ *    legitimately means different things on the two sides of a request/response pair;
+ *  - identity keys (`id`, `*_id`) and create sentinels (`0`, `""`, `null`) are not compared. A
+ *    create that sends `sub_category_id: 0` and gets back `19314` assigned the row; two id spaces
+ *    that share a field name were never expected to match. Both used to fire on every healthy POST;
+ *  - only keys the request actually SENT are considered;
+ *  - only scalars, since deep structural diffing is where the false positives live;
+ *  - values are compared NORMALISED (trimmed, case-folded, numbers as numbers, ISO-8601 instants
+ *    as instants), so `FR` vs `fr`, `1` vs `1.0` and `.000Z` vs `Z` stay silent while `fr` vs `en`
+ *    speaks;
+ *  - server-stamped audit columns (`updated_at` and its spellings) are not compared;
+ *  - if the key appears anywhere in the response carrying the requested value, it is treated as
+ *    applied — an envelope that echoes both the old and the new value is not a dropped write;
+ *  - the response must look like a restatement of the request before any key is compared. Reported
+ *    from the field: a command bus POSTed `{command:'chat.send', ...}` and the server answered with
+ *    the current viewer snapshot. The message arrived over the socket and rendered. `id` in the
+ *    snapshot meant the viewer, `id` in the request meant the message, and this kind fired. A
+ *    snapshot that shares a key name is not an echo. A discriminator the request carries that the
+ *    response does not, or a fat body that shares one coincidental key, is skipped. The existing
+ *    single-value / not-echoed-at-all guards still trade false negatives away — this narrows on
+ *    shape, not on value types.
+ *
+ * The residue after those filters is a field the caller set, the server echoed back, and the echoed
+ * value is a genuinely different value. That is worth one line of an agent's attention.
+ */
+
+/** Bodies larger than this are skipped — a diff over a huge payload is neither cheap nor legible. */
+const MAX_ECHO_KEYS = 200;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return 'object' === typeof value && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Any JSON value, not just an object. An HTTP write sends an object; an IPC call sends its ARGUMENT
+ * LIST, so `savePrefs({locale})` arrives as `[{"locale":"fr"}]`. Requiring a top-level object here
+ * silently excluded every desktop write from this check — the exact platform the finding came from.
+ */
+function parse(raw: unknown): unknown {
+  if (typeof raw !== 'string' || 0 === raw.length) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * An ISO-8601 date-time that names one instant: it carries a time AND a zone (`Z` or `±hh:mm`).
+ * A bare date or a zone-less local time is not an instant and is compared as text.
+ */
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/i;
+
+/**
+ * Two spellings of one instant — `…:00.000Z`, `…:00Z`, `…+05:30` — are the same value. Servers
+ * re-serialise timestamps through their own date type, so precision and zone spelling are
+ * formatting, not a dropped write.
+ */
+function normalizeString(value: string): string {
+  const trimmed = value.trim();
+  if (ISO_INSTANT.test(trimmed)) {
+    const instant = Date.parse(trimmed);
+    if (Number.isFinite(instant)) {
+      return new Date(instant).toISOString().toLowerCase();
+    }
+  }
+  if (PLAIN_DECIMAL.test(trimmed)) {
+    return canonicalDecimal(trimmed);
+  }
+  if (PHONE_LIKE.test(trimmed) && MIN_PHONE_DIGITS <= trimmed.replace(/\D/g, '').length) {
+    return trimmed.replace(PHONE_SEPARATORS, '');
+  }
+  return trimmed.toLowerCase();
+}
+
+/** A decimal written in plain digits: `18.5`, `-0.50`, `2`. No exponent and no thousands separator. */
+const PLAIN_DECIMAL = /^-?\d+(?:\.\d+)?$/;
+
+/**
+ * The same decimal in one spelling: trailing zeros of the fraction go, so a fixed-point column that
+ * echoes `18.500` for `18.5` is the same value (#1646). Done on the text, never through `Number`,
+ * so two long ids that differ past the 15th digit stay different. Leading zeros stay: a ZIP code
+ * `02134` stored as `2134` lost data.
+ */
+function canonicalDecimal(text: string): string {
+  if (!text.includes('.')) {
+    return text;
+  }
+  return text.replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/** Digits with the separators a phone number is written with, and an optional leading `+`. */
+const PHONE_LIKE = /^\+?[\d\s().-]+$/;
+const PHONE_SEPARATORS = /[\s().-]/g;
+/** Fewer digits than this is a short code (`12-34`), where a separator can carry meaning. */
+const MIN_PHONE_DIGITS = 7;
+
+/** Comparable form of a scalar. Non-scalars return undefined and are never compared. */
+function normalize(value: unknown): string | undefined {
+  if ('string' === typeof value) {
+    return normalizeString(value);
+  }
+  if ('number' === typeof value) {
+    return Number.isFinite(value) ? canonicalDecimal(String(value)) : undefined;
+  }
+  if ('boolean' === typeof value) {
+    return String(value);
+  }
+  return undefined;
+}
+
+/**
+ * Values that mean "server, you decide", not a field the caller asked to persist. A create that
+ * sends `0` for the new row's id, or an empty string the backend fills in, is the usual REST shape
+ * — not a dropped write.
+ */
+function isSentinelValue(value: unknown): boolean {
+  return 0 === value || '' === value || null === value;
+}
+
+/**
+ * Keys that name an identity, not a persisted attribute. The server assigns these (create returns a
+ * new id; a public id and an internal row id share a field name). Comparing them as echoes is how
+ * this kind fired on every healthy POST-create and poisoned later asserts in the same window.
+ */
+function isIdentityKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return 'id' === lower || lower.endsWith('_id');
+}
+
+/**
+ * Keys that name an optimistic-concurrency token, not a persisted attribute. A compare-and-set
+ * write sends the version it read and expects the server to bump it — the changed value in the
+ * response is the proof the write applied, not evidence the write was ignored, the same way a
+ * create's assigned `id` is not a dropped field.
+ */
+function isVersionKey(key: string): boolean {
+  const lower = key.toLowerCase();
+  return (
+    'version' === lower ||
+    '_version' === lower ||
+    'etag' === lower ||
+    'rev' === lower ||
+    'revision' === lower ||
+    'concurrencystamp' === lower
+  );
+}
+
+const WHOLE_NUMBER = /^\d+$/;
+const VERSION_WORD = 'version';
+/** The Mongoose document version key. */
+const MONGOOSE_VERSION_KEY = '__v';
+
+/**
+ * A lock counter under another name: a key whose last word is `version` (`lock_version`,
+ * `lockVersion`, `rowVersion`) or `__v`. The name alone does not make it a token, because
+ * `targetVersion: "1.4"` is a field the caller sets. So it is a token only when the request and the
+ * echo are whole numbers and the echo is larger.
+ */
+function isBumpedLockCounter(
+  key: string,
+  wanted: ReadonlySet<string>,
+  echoed: ReadonlySet<string> | undefined,
+): boolean {
+  if (MONGOOSE_VERSION_KEY !== key && keyWords(key).at(-1) !== VERSION_WORD) {
+    return false;
+  }
+  const [want] = [...wanted];
+  if (want === undefined || echoed === undefined || 0 === echoed.size) {
+    return false;
+  }
+  if (!WHOLE_NUMBER.test(want)) {
+    return false;
+  }
+  return [...echoed].every((got) => WHOLE_NUMBER.test(got) && Number(got) > Number(want));
+}
+
+/**
+ * Audit columns the server stamps with its own clock on every write. A client that sends one back
+ * (a PATCH of the whole record it read) is not asking for that value to be kept, and the changed
+ * value in the response is the proof the write applied — the same reasoning as a version token.
+ */
+const AUDIT_TIMESTAMP_KEYS: ReadonlySet<string> = new Set([
+  'updated_at',
+  'updatedat',
+  'modified_at',
+  'modifiedat',
+  'last_modified',
+  'lastmodified',
+]);
+
+function isAuditTimestampKey(key: string): boolean {
+  return AUDIT_TIMESTAMP_KEYS.has(key.toLowerCase());
+}
+
+/**
+ * A word of a key that names a value computed FROM the record: a content hash, a digest, a checksum
+ * (#1522). A new record has a new one, so a different value is not a dropped write, the same way a
+ * create's assigned `id` is not. Matched on whole words of the key (`contentHash`, `content_sha256`),
+ * never as a substring, so `shape`, `shared` and `hashtag` are still compared.
+ */
+const CONTENT_DIGEST_WORD = /^(?:hash|sha\d*|md5|checksum|digest|crc\d*)$/;
+
+/** The lowercase words of a key: split at `_`, `-`, `.` and at a lower-to-upper camelCase step. */
+function keyWords(key: string): string[] {
+  return key
+    .replace(/([a-z\d])([A-Z])/g, '$1_$2')
+    .toLowerCase()
+    .split(/[^a-z\d]+/)
+    .filter((word) => 0 < word.length);
+}
+
+function isContentDigestKey(key: string): boolean {
+  return keyWords(key).some((word) => CONTENT_DIGEST_WORD.test(word));
+}
+
+/** An optional algorithm label, as in `sha256:ab12...`. */
+const DIGEST_ALGORITHM_PREFIX = /^[a-z]+\d*:/i;
+/** Hex digits, at least one a letter: a run of only digits is a number, not a digest. */
+const HEX_DIGEST = /^(?=[0-9a-f]*[a-f])[0-9a-f]{8,}$/i;
+/** Base64 or base64url. Long, and with a digit, because `everyday` is valid base64 too. */
+const BASE64_DIGEST = /^(?=[a-z+/_-]*\d)[a-z\d+/_-]{16,}={0,2}$/i;
+
+/**
+ * Does a value look computed from content? The key name alone does not say: `digest` and `hash` are
+ * also settings words (`weeklyDigest: true`, `email_digest: 'daily'`, `hashRouting: false`), and
+ * those are fields a server can ignore.
+ */
+function looksLikeDigest(value: string): boolean {
+  const body = value.replace(DIGEST_ALGORITHM_PREFIX, '');
+  return HEX_DIGEST.test(body) || BASE64_DIGEST.test(body);
+}
+
+/** A content hash: the key names one AND the requested value is one. */
+function isContentDigest(key: string, wanted: ReadonlySet<string>): boolean {
+  const [want] = [...wanted];
+  return want !== undefined && isContentDigestKey(key) && looksLikeDigest(want);
+}
+
+/**
+ * How many compared keys must ALL disagree before the response can be read as a different record.
+ *
+ * One disagreeing key alone stays a finding, because that is the archetype this kind exists for
+ * (`{qty: 5}` answered with `{qty: 3}`). See `isNewRecord` for the rest of the rule.
+ */
+const NEW_RECORD_MIN_KEYS = 2;
+
+/** Methods that change THE record named in the URL. Their answer is never a different record. */
+const UPDATE_METHODS: ReadonlySet<string> = new Set(['PUT', 'PATCH']);
+
+/**
+ * Is this response a DIFFERENT record of the same type, rather than an ignored write (#1522)?
+ *
+ * "Every compared key differs" alone is also the worst case of this finding: a server that ignored
+ * the whole write (`PATCH {name, email}` answered with the old name and the old email). So the
+ * response has to be clearly a new record. It is never one for an update (PUT, PATCH) or an
+ * addressed write, and it is one only when it carries an identity, an id or a content hash, that
+ * differs from the one the request sent: a derive endpoint answers with a new artifact's own hash.
+ */
+function isNewRecord(
+  method: string,
+  addressed: boolean,
+  asked: Map<string, Set<string>>,
+  echoed: Map<string, Set<string>>,
+): boolean {
+  if (addressed || UPDATE_METHODS.has(method.toUpperCase())) {
+    return false;
+  }
+  for (const [key, wanted] of asked) {
+    if (1 !== wanted.size || !(isIdentityKey(key) || isContentDigest(key, wanted))) {
+      continue;
+    }
+    const values = echoed.get(key);
+    const [want] = [...wanted];
+    if (values !== undefined && want !== undefined && !values.has(want)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Every scalar value the response carries for each key, at any depth.
+ *
+ * Depth matters because the echo is usually nested — `{ok:true, saved:{...}}`, `{data:{...}}`,
+ * `{result:{...}}` — and demanding the same path as the request would miss nearly every real API.
+ * Collecting ALL values for a key is what makes the "echoes both old and new" case safe.
+ */
+function scalarsByKey(
+  body: unknown,
+  into: Map<string, Set<string>> = new Map(),
+  depth = 0,
+  omitSentinels = false,
+): Map<string, Set<string>> {
+  if (depth > 6 || into.size > MAX_ECHO_KEYS) {
+    return into;
+  }
+  if (Array.isArray(body)) {
+    for (const item of body) {
+      scalarsByKey(item, into, depth + 1, omitSentinels);
+    }
+    return into;
+  }
+  if (!isRecord(body)) {
+    return into;
+  }
+  for (const [key, value] of Object.entries(body)) {
+    if (omitSentinels && isSentinelValue(value)) {
+      continue;
+    }
+    const scalar = normalize(value);
+    if (scalar === undefined) {
+      scalarsByKey(value, into, depth + 1, omitSentinels);
+      continue;
+    }
+    const seen = into.get(key) ?? new Set<string>();
+    seen.add(scalar);
+    into.set(key, seen);
+  }
+  return into;
+}
+
+/** A boolean as the bit MySQL and SQLite store it as, and many APIs echo. */
+const BOOLEAN_AS_BIT: Readonly<Record<string, string>> = { true: '1', false: '0' };
+
+/** Did the response echo `want`? A boolean echoed as its stored bit (`false` → `0`) is the same value. */
+function echoedAs(want: string, values: ReadonlySet<string>): boolean {
+  const bit = BOOLEAN_AS_BIT[want];
+  return values.has(want) || (bit !== undefined && values.has(bit));
+}
+
+const OK_MIN = 200;
+const OK_MAX = 300;
+
+/**
+ * Body keys that name the operation rather than a field being persisted. A command bus puts one of
+ * these on the request; a snapshot of the current viewer does not echo it. Their absence on the
+ * response is the cheapest honest signal that the body is not a restatement of the write.
+ */
+const EchoDiscriminator = {
+  COMMAND: 'command',
+  ACTION: 'action',
+  OP: 'op',
+  PROCEDURE: 'procedure',
+} as const;
+
+/**
+ * A response carrying this many times more scalar keys than the request, overlapping on fewer than
+ * `MIN_SHARED_KEYS`, is a snapshot that happened to reuse a name — not an echo of the write.
+ */
+/**
+ * The two halves of an ADDRESSED write: a key that NAMES the field to set, and a generic container
+ * holding the value to set it to — `{"slot":"_dim","value":"3D"}`, `{"field":"locale","value":"fr"}`.
+ *
+ * A container key cannot be compared across documents by name. `value` in the request means "the
+ * value of the field named by `slot`"; `value` in the response means "the value of whichever field
+ * this node belongs to", and a document holding many addressed fields holds many `value` nodes. The
+ * flat by-key comparison below therefore measures the request's value against an unrelated sibling
+ * field's value, which is not evidence about the target field at all.
+ *
+ * That produced a FALSE RED on a passing assertion: the request asked
+ * `{"slot":"_dim","value":"3D"}`; the server applied it (`brief.dim: "3D"`, and the interview
+ * advanced from `{kind:"question"}` to `{kind:"geometry", payload:{dim:"3D"}}`); and this kind
+ * reported "asked 3d, got cfd", where `cfd` is `brief.slots._family.value` — a different slot,
+ * set earlier in the same interview. The next call on the same endpoint DID mirror into
+ * `slots.<slot>.value` and passed clean, so the kind misfires exactly when a server persists an
+ * addressed field somewhere other than a mirror named after it. That is a normal API shape.
+ *
+ * Cost of getting this wrong: a manufactured red is worse than a missed one here. Reticle's whole
+ * proposition is that an agent must not talk itself past a red; a heuristic that invents them
+ * teaches, inside a single session, that a `contradicted` verdict may be noise worth arguing with.
+ *
+ * The addressing key itself is still compared. If the server echoes a DIFFERENT `slot` than the one
+ * requested, that is a genuine dropped write and this file should say so.
+ */
+const ADDRESSING_KEYS: ReadonlySet<string> = new Set(['slot', 'field', 'key', 'path', 'property']);
+const CONTAINER_KEYS: ReadonlySet<string> = new Set(['value', 'val', 'newvalue']);
+
+/** True when the request says "set the field named X" rather than carrying the fields themselves. */
+function isAddressedWrite(asked: Map<string, Set<string>>): boolean {
+  let addressed = false;
+  let container = false;
+  for (const key of asked.keys()) {
+    const lower = key.toLowerCase();
+    if (ADDRESSING_KEYS.has(lower)) {
+      addressed = true;
+    }
+    if (CONTAINER_KEYS.has(lower)) {
+      container = true;
+    }
+  }
+  return addressed && container;
+}
+
+const SNAPSHOT_KEY_RATIO = 3;
+const MIN_SHARED_KEYS = 2;
+
+/**
+ * True when the response looks like a restatement of the request, so overlapping key names can be
+ * read as an echo rather than a coincidence.
+ *
+ * Half the request's comparable keys must appear in the response. That keeps a partial echo
+ * (`{density, locale}` answered with only `locale`) in scope, and drops a three-field command whose
+ * snapshot shares one name. A request that names an operation the response does not repeat is not
+ * an echo at all, regardless of any other overlap.
+ */
+function responseRestatesRequest(
+  asked: Map<string, Set<string>>,
+  echoed: Map<string, Set<string>>,
+): boolean {
+  const comparable: string[] = [];
+  for (const [key, wanted] of asked) {
+    if (1 === wanted.size) {
+      comparable.push(key);
+    }
+  }
+  if (0 === comparable.length) {
+    return false;
+  }
+
+  let present = 0;
+  for (const key of comparable) {
+    if (echoed.has(key)) {
+      present += 1;
+    }
+  }
+
+  let requestHasDiscriminator = false;
+  let responseHasDiscriminator = false;
+  for (const key of Object.values(EchoDiscriminator)) {
+    if (asked.has(key)) {
+      requestHasDiscriminator = true;
+    }
+    if (echoed.has(key)) {
+      responseHasDiscriminator = true;
+    }
+  }
+  if (requestHasDiscriminator && !responseHasDiscriminator) {
+    return false;
+  }
+
+  if (echoed.size > comparable.length * SNAPSHOT_KEY_RATIO && present < MIN_SHARED_KEYS) {
+    return false;
+  }
+
+  return present * 2 >= comparable.length;
+}
+
+/**
+ * Contradictions for writes whose response echoes a different value than the request asked for.
+ *
+ * `actionSince` is the attribution floor `findContradictions` already keeps — the event time the
+ * action that opened this window was dispatched. A finding about a request that had already settled
+ * before the agent acted otherwise reads as a verdict on the change it just made.
+ */
+export function findEchoMismatches(
+  events: readonly ReticleEvent[],
+  actionSince?: number,
+): OwnContradiction[] {
+  const found: OwnContradiction[] = [];
+  for (const event of events) {
+    if (event.type !== EventType.NET_REQUEST) {
+      continue;
+    }
+    // `MUTATING_METHODS` is the one definition of "is this a write" in the codebase — the same list
+    // `contradictions.ts`'s `isMutating` reads. A read has no fields to half-apply.
+    //
+    // KNOWN LIMIT, stated because it is easy to read this fix as bigger than it is: POST is in that
+    // list, so a lookup that POSTs its key and gets a record back — the shape actually reported —
+    // still reaches the comparison below. Method is the only signal available here, and a read-shaped
+    // POST is genuinely indistinguishable from a write by method alone.
+    //
+    // The tempting next step is to skip a pair whose JSON types disagree (a string key sent, a number
+    // echoed). Deliberately not taken: that also silences `{"qty":"5"}` answered with `3`, which is a
+    // real dropped write. A false negative here is a missed bug in someone's app, and that is not a
+    // trade this file makes to quieten a false positive.
+    const method = 'string' === typeof event.data['method'] ? event.data['method'] : '';
+    if (!MUTATING_METHODS.includes(method.toUpperCase())) {
+      continue;
+    }
+    // IPC reports `ok` rather than a status; HTTP reports a status. Either must say success — a write
+    // that already failed is a different (and louder) finding than one that half-applied.
+    const status = event.data['status'];
+    const httpOk = 'number' === typeof status && status >= OK_MIN && status < OK_MAX;
+    if (!httpOk && event.data['ok'] !== true) {
+      continue;
+    }
+
+    const request = parse(event.data['requestBody']);
+    const response = parse(event.data['responseBody']);
+    if (request === undefined || response === undefined) {
+      continue;
+    }
+
+    const echoed = scalarsByKey(response);
+    const asked = scalarsByKey(request, new Map(), 0, true);
+    if (!responseRestatesRequest(asked, echoed)) {
+      continue;
+    }
+    // See ADDRESSING_KEYS: on an addressed write the container key names nothing on its own, so
+    // comparing it by name across the two documents compares two different fields.
+    const addressed = isAddressedWrite(asked);
+    const dropped: string[] = [];
+    let compared = 0;
+    for (const [key, wanted] of asked) {
+      if (addressed && CONTAINER_KEYS.has(key.toLowerCase())) {
+        continue;
+      }
+      // More than one requested value for a key (a before/after pair, a list of items) makes "what
+      // was asked for" ambiguous, and a guess here is exactly how this kind would earn a reputation
+      // for crying wolf.
+      if (wanted.size !== 1) {
+        continue;
+      }
+      if (isIdentityKey(key)) {
+        continue;
+      }
+      if (isVersionKey(key)) {
+        continue;
+      }
+      if (isAuditTimestampKey(key)) {
+        continue;
+      }
+      if (isContentDigest(key, wanted)) {
+        continue;
+      }
+      const values = echoed.get(key);
+      if (isBumpedLockCounter(key, wanted, values)) {
+        continue;
+      }
+      // Not echoed at all = no evidence either way. Only a key the server chose to report back can
+      // contradict the request, and silence is not a contradiction.
+      if (values === undefined || 0 === values.size) {
+        continue;
+      }
+      compared += 1;
+      const [want] = [...wanted];
+      if (want !== undefined && !echoedAs(want, values)) {
+        dropped.push(`${key}: asked ${want}, got ${[...values].join('/')}`);
+      }
+    }
+    if (0 === dropped.length) {
+      continue;
+    }
+    // Nothing the response shares with the request came back as sent, AND it names a different
+    // identity: a different record, not a half-applied write. See isNewRecord.
+    if (
+      compared >= NEW_RECORD_MIN_KEYS &&
+      dropped.length === compared &&
+      isNewRecord(method, addressed, asked, echoed)
+    ) {
+      continue;
+    }
+
+    const url = 'string' === typeof event.data['url'] ? event.data['url'] : '';
+    const attribution =
+      actionSince !== undefined && event.t < actionSince
+        ? ' — this request completed before the action being verified, so the finding is not about that change'
+        : '';
+    found.push({
+      kind: ContradictionKind.WRITE_FIELD_IGNORED,
+      claim: 'the write returned success and the page treated it as saved',
+      counter: `its own echo shows ${String(dropped.length)} field(s) that differ from the request — ${dropped.join('; ')}`,
+      detail: `${method} ${url} — the server answered OK and returned a different value than it was asked to set${attribution}`,
+    });
+  }
+  return found;
+}

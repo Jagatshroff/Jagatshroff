@@ -1,0 +1,995 @@
+/**
+ * BrowserPool — one headless browser, many cheap isolated contexts.
+ *
+ * The "10 agents test 10 flows" scenario does NOT mean 10 Chromiums (each ~hundreds of MB). It means
+ * ONE launched browser and N `newContext` calls (each ~a few MB, fully isolated cookies/storage).
+ * The pool owns that single browser, hands out per-flow leases, caps concurrency so a machine is
+ * never overwhelmed (over-cap acquires queue FIFO), and transparently relaunches if the browser dies.
+ *
+ * The browser is injected via a `Launcher` so all lifecycle logic is testable without real Chromium;
+ * the thin Playwright adapter that satisfies these interfaces lives separately.
+ */
+
+import { LEASE_CLOSE_TIMEOUT_MS, unreachableUrlIn } from '@reticlehq/core';
+import { log } from '@/log.js';
+import { closeLeaseTab, LEASE_CLOSE_TIMED_OUT, settledWithin } from './bounded-close.js';
+import { seedStorageInto, targetOriginOf } from './storage-seed.js';
+import { installLeaseMarker, leaseMarkerOf } from './lease-marker-stamp.js';
+import {
+  grantLeasePermissions,
+  grantLocalNetworkAccess,
+  readNotificationPermission,
+  widenLeaseCsp,
+} from './context-permissions.js';
+import type {
+  InitScriptHandle,
+  Launcher,
+  PooledBrowser,
+  PooledContext,
+  PooledCoverage,
+  PooledMockRule,
+  ScreenshotOptions,
+} from './pool-contract.js';
+import type { RealInputArgs, RealInputResult } from '@/portal/input/real-input.js';
+import { readViewport, type LeaseMedia } from './lease-emulation.js';
+import { injectReaderInto } from './zero-install.js';
+import { stepPage, type DeterminismStep } from './determinism.js';
+export type {
+  InitScriptHandle,
+  Launcher,
+  PooledBrowser,
+  PooledContext,
+  PooledCookie,
+  PooledDialog,
+  PooledMockRule,
+  PooledPage,
+  PooledPageError,
+} from './pool-contract.js';
+import {
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_NAV_TIMEOUT_MS,
+  INIT_SCRIPT_UNSUPPORTED,
+  MAX_REMEMBERED_REAPED_LEASES,
+  NO_HEADED_BROWSER,
+  ORPHANED_LEASE_GRACE_MS,
+  navStatusOf,
+  pageLoading,
+  PoolAtCapacityError,
+  type AcquireOptions,
+  type ActiveLease,
+  type BrowserPoolOptions,
+  type BrowserSlot,
+  type Lease,
+} from './pool-lease.js';
+import {
+  listenForPageErrors,
+  reportLeaseClosed,
+  type LeasePageErrorHooks,
+} from './lease-page-error.js';
+export {
+  DEFAULT_LEASE_TTL_MS,
+  NO_HEADED_BROWSER,
+  ORPHANED_LEASE_GRACE_MS,
+  PoolAtCapacityError,
+} from './pool-lease.js';
+export type { Lease } from './pool-lease.js';
+
+/**
+ * Owns a headless browser (and, when asked, a headed one) and leases isolated contexts out of them,
+ * capped at `maxContexts` across both.
+ * Not exported as a singleton — the daemon owns one instance.
+ */
+export class BrowserPool {
+  readonly #max: number;
+  readonly #genId: () => string;
+  readonly #now: () => number;
+  readonly #ttl: number;
+  readonly #zeroInstall: ((url: string) => string | undefined) | undefined;
+  readonly #daemonOrigin: string | undefined;
+  readonly #pageErrorHooks: LeasePageErrorHooks | undefined;
+  readonly #navTimeout: number;
+
+  readonly #headless: BrowserSlot;
+  readonly #headed: BrowserSlot;
+  #closed = false;
+  /** Leases reclaimed for going stale — see reapedLeaseCount(). */
+  #reapedLeases = 0;
+  /**
+   * The session ids of recently reaped leases, most recent last.
+   *
+   * The count above answers "has anything ever aged out", which is not a
+   * question any caller actually has: it latches true for the life of the
+   * daemon (#611). The ids answer the question the no-session diagnosis is
+   * really asking — was THIS session a lease that aged out — so a closed
+   * human tab is no longer blamed on an expired lease forever after.
+   *
+   * Bounded because a long-lived daemon reaps unboundedly many.
+   */
+  readonly #reapedLeaseIds: string[] = [];
+  readonly #active = new Map<string, ActiveLease>();
+  /** Registered-session-id → lease id, for apps that keep their own session name. See `alias`. */
+  readonly #aliases = new Map<string, string>();
+  /**
+   * Slots claimed-or-active — the real concurrency gate. Incremented SYNCHRONOUSLY the instant an
+   * acquire passes the cap check, BEFORE the async context creation, so a burst of concurrent
+   * acquires (the "10 agents at once" case) can't all slip through the gate before any has been
+   * recorded. `#active.size` only reflects fully-created leases; `#occupied` also counts in-flight
+   * ones, and is what the cap is enforced against.
+   */
+  #occupied = 0;
+  /** FIFO of acquires waiting for a slot; each resolves when one frees. */
+  readonly #waiters: Array<() => void> = [];
+
+  constructor(launch: Launcher, opts: BrowserPoolOptions) {
+    if (opts.maxContexts < 1) {
+      throw new Error('maxContexts must be >= 1');
+    }
+    this.#headless = { launch, headed: false };
+    this.#headed = { launch: opts.launchHeaded, headed: true };
+    this.#max = opts.maxContexts;
+    this.#genId = opts.genSessionId;
+    this.#now = opts.now ?? ((): number => Date.now());
+    this.#ttl = opts.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS;
+    this.#navTimeout = opts.navTimeoutMs ?? DEFAULT_NAV_TIMEOUT_MS;
+    this.#zeroInstall = opts.zeroInstallScript;
+    this.#daemonOrigin = opts.daemonOrigin;
+    this.#pageErrorHooks = opts;
+  }
+
+  /** The TTL configured for leases — how long an untouched lease lives before the reaper reclaims it. */
+  leaseTtlMs(): number {
+    return this.#ttl;
+  }
+
+  /** Max simultaneous leases — the ceiling the parallel suite sizes its concurrency to. */
+  capacity(): number {
+    return this.#max;
+  }
+
+  activeCount(): number {
+    return this.#active.size;
+  }
+
+  /** Acquires waiting for a free slot. */
+  queuedCount(): number {
+    return this.#waiters.length;
+  }
+
+  /** The sessionIds of every currently leased context — used to report/group leased sessions. */
+  leasedSessionIds(): string[] {
+    return [...this.#active.keys()];
+  }
+
+  /**
+   * The public session id of an active lease on this origin that `owner` took, if there is one.
+   *
+   * The lease TOOL reuses that id instead of minting a second context: a second acquire on the same
+   * origin used to leave both tabs connected and poison default session resolution (#600). Only the
+   * caller that took the lease gets it back: handing it to whoever asked put two agents in one tab,
+   * each one's verdicts resting on the other's actions (#1226). A caller with no owner cannot be told
+   * apart from another, so it always gets its own. The pool's own `acquire` still mints.
+   *
+   * Prefers the alias the agent was given, when the app registered under its own name.
+   */
+  leaseIdOnOrigin(origin: string, owner: string | undefined): string | undefined {
+    if (owner === undefined) {
+      return undefined;
+    }
+    for (const [leaseId, lease] of this.#active) {
+      if (
+        lease.owner !== owner ||
+        !URL.canParse(lease.url) ||
+        new URL(lease.url).origin !== origin
+      ) {
+        continue;
+      }
+      for (const [alias, id] of this.#aliases) {
+        if (id === leaseId) {
+          return alias;
+        }
+      }
+      return leaseId;
+    }
+    return undefined;
+  }
+
+  /**
+   * Release a lease by its sessionId (closes the context, frees the slot). No-op if unknown.
+   *
+   * Resolves an alias first, because the agent releases with the id it was GIVEN, which for an app
+   * that named its own session is not the id the pool navigated with. Releasing by that name used to
+   * be a silent no-op that left the slot held until the reaper took it.
+   */
+  release(sessionId: string): Promise<void> {
+    return this.#release(this.#leaseIdOf(sessionId));
+  }
+
+  /**
+   * Record that a lease is also known by the name the APP registered.
+   *
+   * Leases are keyed by the id the pool navigated with, and the SDK normally adopts that id off the
+   * URL so the two agree. An app that passes an explicit `session` to `connect()` keeps its own name
+   * instead, which is legitimate, and the lease tool then hands the agent THAT name because it is the
+   * one it has to drive with. Every later touch and release arrives under it.
+   *
+   * Without this the touches hit nothing, the lease ages out despite continuous activity, and the
+   * reaper closes the context mid-flow — the failure in #157, where a session died on the very call
+   * that would have read a computed value.
+   */
+  alias(registeredId: string, leaseId: string): void {
+    if (registeredId === leaseId) {
+      return;
+    }
+    if (!this.#active.has(leaseId)) {
+      return;
+    }
+    this.#aliases.set(registeredId, leaseId);
+  }
+
+  /**
+   * The lease this id refers to: itself, or whatever it is an alias for.
+   *
+   * EVERY AGENT-FACING LOOKUP MUST GO THROUGH THIS. A leased page runs the SDK, which dials and
+   * registers under its OWN session id, so the id `reticle_sessions` shows an agent is routinely the
+   * alias rather than the lease key. Four capabilities used the raw map instead — screenshots,
+   * hover, network mocks and the dial-failure diagnostic — and every one of them refused for a
+   * lease that was alive and working, addressed by the only id the agent had been given.
+   *
+   * `reticle_network_mock` is where that surfaced: it reported `no-cdp-provider` in every
+   * configuration a reporter could reach, including after `reticle drive`, and the recommendation it
+   * printed ("start with `reticle drive <url>`") could not fix it because the provider was never the
+   * problem. Their conclusion was that error-path verification was impossible without shipping
+   * failure-injection code inside the application — which is exactly what an external mock exists to
+   * avoid.
+   *
+   * `acquire` and `#release` are the two exceptions and must stay raw: the first is registering the
+   * lease key itself before any alias can exist, and the second must delete that key rather than
+   * whatever it points at.
+   */
+  #leaseIdOf(sessionId: string): string {
+    return this.#active.has(sessionId) ? sessionId : (this.#aliases.get(sessionId) ?? sessionId);
+  }
+
+  /**
+   * Whether `sessionId` is a live lease that `owner` may let go of: one it took, or one taken by a
+   * caller with no id, which cannot be told apart from it. Another agent's lease is never this
+   * caller's to close (#1226).
+   */
+  heldBy(sessionId: string, owner: string | undefined): boolean {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    return lease !== undefined && (lease.owner === undefined || lease.owner === owner);
+  }
+
+  /** Mark a lease as still in use (called on agent activity) so the reaper doesn't reclaim it. */
+  touch(sessionId: string): void {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined) {
+      return;
+    }
+    lease.touchedAt = this.#now();
+    delete lease.detachedAt;
+  }
+
+  /**
+   * The MCP connection `owner` closed. Its leases go after {@link ORPHANED_LEASE_GRACE_MS} unless it
+   * touches them again: a reconnect is a new owner, so nothing else would ever hand them back, and
+   * each one held a browser window open for the full TTL.
+   */
+  detachOwner(owner: string): void {
+    const now = this.#now();
+    for (const lease of this.#active.values()) {
+      if (lease.owner === owner) {
+        lease.detachedAt = now;
+      }
+    }
+  }
+
+  /**
+   * The MCP connection `owner` came back: a proxy that reconnects keeps its id. Its leases stop
+   * their grace, because the owner they wait for is here again.
+   */
+  reattachOwner(owner: string): void {
+    for (const lease of this.#active.values()) {
+      if (lease.owner === owner) {
+        delete lease.detachedAt;
+      }
+    }
+  }
+
+  /**
+   * Reclaim leases untouched for longer than the TTL — a hung/crashed agent never holds a slot
+   * forever. Returns the released sessionIds. This is the fault-tolerance backstop for the pool.
+   */
+  /**
+   * Capture a leased page, or undefined when this session is not a lease or cannot be captured.
+   *
+   * A lease IS a real browser page, so the pixels were always available — the visual tools simply had
+   * no route to them and answered "no provider" for every context an agent can actually get. That
+   * made visual regression impossible on exactly the isolated contexts the pool exists to hand out.
+   *
+   * Touches the lease like any other tool call, so capturing keeps it alive rather than letting the
+   * reaper take it out from under a diff.
+   */
+  async screenshotLease(
+    sessionId: string,
+    opts: ScreenshotOptions = {},
+  ): Promise<Uint8Array | undefined> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined || lease.page.screenshot === undefined) {
+      return undefined;
+    }
+    this.touch(sessionId);
+    delete lease.captureError;
+    try {
+      return await lease.page.screenshot(opts);
+    } catch (error) {
+      // A capture that fails is not a broken lease. Keep the reason and leave the lease usable,
+      // so the screenshot error says why the browser capture failed.
+      lease.captureError = error instanceof Error ? error.message : String(error);
+      return undefined;
+    }
+  }
+
+  /** The reason {@link screenshotLease} last failed for this session, if it did. */
+  leaseCaptureError(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.captureError;
+  }
+
+  /** The URL a lease was opened on — the one that carries its Reticle identity. */
+  leaseUrl(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.url;
+  }
+
+  /**
+   * Navigate a leased page through the browser. For a lease whose page has no SDK to take the
+   * command — a navigate to an image left the lease unreachable, and the next navigate answered "no
+   * connected session". False when this is not a lease or the page would not go.
+   */
+  async gotoLease(sessionId: string, url: string, timeoutMs?: number): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.goto(url, timeoutMs === undefined ? {} : { timeoutMs });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Move the real pointer on a leased page, or false when this session is not a lease or cannot
+   * hover. Same optional-capability contract as screenshotLease: absence must read as "could not
+   * hover", never as a successful dispatch of a synthetic mouseover.
+   *
+   * Touches the lease like any other tool call, so hovering keeps it alive.
+   */
+  async hoverLease(sessionId: string, x: number, y: number): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined || lease.page.hover === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.hover(x, y);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Reload a lease with the browser cache ignored, or false when this is not a lease or its page cannot. */
+  async hardReloadLease(sessionId: string): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease?.page.reloadIgnoringCache === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.reloadIgnoringCache();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Set a live lease's media features, or false when this is not a lease or its page cannot. */
+  async emulateLease(sessionId: string, media: LeaseMedia): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease?.page.emulateMedia === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.emulateMedia(media);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Whether this lease's page is still loading. False for a non-lease, or a page that cannot say. */
+  async leaseLoading(sessionId: string): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined) {
+      return false;
+    }
+    return pageLoading(lease.page).catch(() => false);
+  }
+
+  /** Whether this session is a lease whose page has a real keyboard. */
+  hasKeyboard(sessionId: string): boolean {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.page.press !== undefined;
+  }
+
+  /**
+   * Press a key with the leased page's real keyboard, or undefined when this session is not a lease
+   * or its page has no keyboard. A throw is the caller's to read: a key that went down and did not
+   * come up must not be answered with a second, synthetic press.
+   */
+  async pressLease(sessionId: string, args: RealInputArgs): Promise<RealInputResult | undefined> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease?.page.press === undefined) {
+      return undefined;
+    }
+    this.touch(sessionId);
+    return lease.page.press(args);
+  }
+
+  /**
+   * Install network mocks on a leased page, or false when this session is not a lease or cannot
+   * intercept. Same optional-capability contract as screenshotLease: absence must read as "could not
+   * mock", never as a stub that applied to nothing.
+   *
+   * Touches the lease like any other tool call, so mocking keeps it alive.
+   */
+  /**
+   * Resize a leased page's viewport, or report that this page cannot be resized.
+   *
+   * Alias-resolved like every other agent-facing capability — see `#leaseIdOf`.
+   *
+   * Touches the lease like any other tool call, so resizing keeps it alive.
+   */
+  async setViewportLease(
+    sessionId: string,
+    size: { width: number; height: number },
+  ): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined || lease.page.setViewport === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.setViewport(size);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The size a leased page reports for itself, or undefined when it cannot be read. */
+  async viewportOfLease(sessionId: string): Promise<{ width: number; height: number } | undefined> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    return lease === undefined ? undefined : readViewport(lease.page);
+  }
+
+  async setMocksLease(sessionId: string, rules: readonly PooledMockRule[]): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined || lease.page.installMocks === undefined) {
+      return false;
+    }
+    this.touch(sessionId);
+    try {
+      await lease.page.installMocks(rules);
+      // Mocks registered later are asked first, and one that lets a request through would skip
+      // the production guard. Re-asserting the guard puts it back in front.
+      if (lease.guard !== undefined) {
+        await lease.page.guardRequests?.(lease.guard);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Step a deterministic lease's clock by `frames` frames; undefined when it is not one. */
+  stepLease(sessionId: string, frames: number): Promise<DeterminismStep | undefined> {
+    const page = this.#active.get(this.#leaseIdOf(sessionId))?.page;
+    this.touch(sessionId);
+    return page === undefined ? Promise.resolve(undefined) : stepPage(page, frames);
+  }
+
+  /** The JS coverage of a lease's page, or undefined when this is not a lease or cannot measure. */
+  coverageOf(sessionId: string): PooledCoverage | undefined {
+    this.touch(sessionId);
+    return this.#active.get(this.#leaseIdOf(sessionId))?.page.jsCoverage;
+  }
+
+  /** Guard a leased page's requests, or false when this is not a lease or its page cannot. */
+  async guardLease(
+    sessionId: string,
+    decide: (method: string, url: string) => string | undefined,
+  ): Promise<boolean> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    if (lease === undefined || lease.page.guardRequests === undefined) {
+      return false;
+    }
+    await lease.page.guardRequests(decide);
+    lease.guard = decide;
+    return true;
+  }
+
+  /** What a lease was granted when it opened, or undefined for a session that is not a lease. */
+  permissionsOf(sessionId: string): readonly string[] | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.permissions;
+  }
+
+  /**
+   * Whether this lease's page runs a caller-supplied init script — a stub of the bindings a desktop
+   * shell injects. Alias-resolved like every agent-facing lookup, and false for any session that is
+   * not a lease with a stub, so a verdict can say when it was measured against a fake shell.
+   */
+  stubInstalled(sessionId: string): boolean {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.hostStub !== undefined;
+  }
+
+  /**
+   * The init script this lease installed, or undefined when it runs none. Alias-resolved like
+   * `stubInstalled`. The lease tool compares it to the script a caller asks for: the same text means
+   * the held tab already is what was asked for, so it is reused rather than released and remade.
+   */
+  hostStubScript(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.hostStubScript;
+  }
+
+  /**
+   * What the leased page's `Notification.permission` says, or undefined when it cannot be asked.
+   *
+   * Read back rather than inferred from the grant, because the headless shell answers `denied`
+   * after a notifications grant — see context-permissions.ts. Bounded, so a page that never answers
+   * reads as "could not ask" instead of holding the caller.
+   */
+  async notificationPermission(sessionId: string): Promise<string | undefined> {
+    const lease = this.#active.get(this.#leaseIdOf(sessionId));
+    return lease === undefined ? undefined : readNotificationPermission(lease.page);
+  }
+
+  async sweepExpired(): Promise<string[]> {
+    const now = this.#now();
+    const expired = [...this.#active.entries()]
+      .filter(
+        ([, lease]) =>
+          now - lease.touchedAt > this.#ttl ||
+          (lease.detachedAt !== undefined && now - lease.detachedAt >= ORPHANED_LEASE_GRACE_MS),
+      )
+      .map(([sessionId]) => sessionId);
+    for (const sessionId of expired) {
+      await this.#release(sessionId);
+    }
+    this.#reapedLeases += expired.length;
+    for (const sessionId of expired) {
+      this.#reapedLeaseIds.push(sessionId);
+      if (this.#reapedLeaseIds.length > MAX_REMEMBERED_REAPED_LEASES) {
+        this.#reapedLeaseIds.shift();
+      }
+    }
+    return expired;
+  }
+
+  /**
+   * How many leases this pool has reclaimed for going stale.
+   *
+   * Kept for reporting. NOT a basis for diagnosis: it is a lifetime total that never resets, so
+   * `count > 0` latches true forever after the first reap. Ask `wasReapedLease` instead, which
+   * answers about a specific session.
+   */
+  reapedLeaseCount(): number {
+    return this.#reapedLeases;
+  }
+
+  /**
+   * Did THIS session id belong to a lease this pool aged out?
+   *
+   * The question the no-session diagnosis actually has. It used to ask `reapedLeaseCount() > 0`,
+   * which meant that once any lease had ever aged out, every closed human tab for the rest of the
+   * daemon's life was reported as an expired lease — and the recovery that followed
+   * (`reticle_lease {acquire}`) would open an unauthenticated headless context and lose the app
+   * session (#611).
+   *
+   * Only the last {@link MAX_REMEMBERED_REAPED_LEASES} are remembered, so this answers `false` for
+   * a lease reaped long enough ago that thousands have followed. That direction is the safe one:
+   * it falls back to the generic "the tab was closed" wording rather than inventing a lease.
+   */
+  wasReapedLease(sessionId: string): boolean {
+    return this.#reapedLeaseIds.includes(sessionId);
+  }
+
+  /**
+   * Lease an isolated context, navigate it to `url`, and return a handle. If the pool is at capacity,
+   * waits FIFO until a slot frees (or until `signal` aborts, if provided), unless `whenFull` is
+   * `'refuse'`: then it throws {@link PoolAtCapacityError} at once and claims nothing.
+   */
+  async acquire(url: string, opts: AcquireOptions = {}): Promise<Lease> {
+    if (this.#closed) {
+      throw new Error('browser pool is shut down');
+    }
+    const slot = true === opts.headed ? this.#headed : this.#headless;
+    // Refused before a slot is claimed, so a refusal never holds one.
+    if (slot.launch === undefined) {
+      throw new Error(NO_HEADED_BROWSER);
+    }
+    // #waitForSlot claims the slot synchronously (bumps #occupied) before returning, so the cap holds
+    // even when many acquires race through the gate in the same tick. A refusing acquire claims the
+    // same way, or claims nothing and says so.
+    if ('refuse' === opts.whenFull) {
+      if (!this.#tryClaim()) {
+        throw new PoolAtCapacityError(this.#max);
+      }
+    } else {
+      await this.#waitForSlot(opts.signal);
+    }
+    const sessionId = opts.sessionId ?? this.#genId();
+    let context: PooledContext | undefined;
+    let pending: string | undefined;
+    let pendingDialogMessage: string | undefined;
+    try {
+      const browser = await this.#ensureBrowser(slot);
+      const contextOpts = {
+        ...(true === opts.ignoreHTTPSErrors ? { ignoreHTTPSErrors: true } : {}),
+        ...(true === opts.jsCoverage ? { jsCoverage: true } : {}),
+        ...opts.emulate,
+      };
+      context = await browser.newContext(
+        0 < Object.keys(contextOpts).length ? contextOpts : undefined,
+      );
+      if (opts.permissions !== undefined) {
+        await grantLeasePermissions(context, opts.permissions, url);
+      }
+      await grantLocalNetworkAccess(context, url);
+      const csp = await widenLeaseCsp(context, url, this.#daemonOrigin);
+      const page = await context.newPage();
+      // A desktop-shell stub must exist before the app's first module: added before goto, and kept.
+      let hostStub: InitScriptHandle | undefined;
+      if (opts.initScript !== undefined) {
+        const added = await page.addInitScript?.(opts.initScript);
+        if (added === undefined || 'function' !== typeof added.dispose) {
+          throw new Error(INIT_SCRIPT_UNSUPPORTED);
+        }
+        hostStub = added;
+      }
+      // Per-page crash isolation: if THIS renderer dies, reclaim only this lease — the shared browser
+      // and every other agent's context keep running. (A full browser death is handled by #onCrash.)
+      page.onCrash(() => {
+        void this.#release(sessionId);
+      });
+      // Listen BEFORE goto: the SDK's connect attempt races the navigation's own resolution, and a
+      // listener attached afterwards misses the first failures — the only ones logged before the
+      // retry backoff stretches out.
+      page.onConsole?.((text) => {
+        const dialled = unreachableUrlIn(text);
+        if (dialled === undefined) {
+          return;
+        }
+        const active = this.#active.get(sessionId);
+        if (active !== undefined) {
+          active.dialFailureUrl = dialled;
+        } else {
+          pending = dialled;
+        } // logged during goto, before the lease is registered below
+      });
+      // Listen before goto, as onConsole does: a dialog in an onload handler is dismissed too. The SDK
+      // answers a dialog from its own input first; the hook records this "no" for the verdict (#1350).
+      page.onDialog?.((dialog) => {
+        const active = this.#active.get(sessionId);
+        if (active !== undefined) {
+          active.lastDialogMessage = dialog.message;
+        } else {
+          pendingDialogMessage = dialog.message;
+        }
+        void dialog.dismiss();
+        this.#pageErrorHooks?.onDialog?.(sessionId, dialog);
+      });
+      // Listener on BEFORE goto — an import-time throw lands during it (#1966).
+      await listenForPageErrors(page, sessionId, this.#pageErrorHooks);
+      const marker = leaseMarkerOf(url);
+      if (marker?.session === sessionId) {
+        await installLeaseMarker(page, sessionId, targetOriginOf(url), marker.project);
+      }
+      let seedHandle: InitScriptHandle | undefined;
+      let checkSeedError: (() => void) | undefined;
+      if (opts.seedStorage !== undefined) {
+        const seedResult = await seedStorageInto(context, page, url, opts.seedStorage);
+        seedHandle = seedResult?.handle;
+        checkSeedError = seedResult?.checkError;
+      }
+      let navRes: unknown;
+      try {
+        navRes = await page.goto(url, { timeoutMs: this.#navTimeout });
+        checkSeedError?.();
+      } finally {
+        if (seedHandle !== undefined) {
+          await seedHandle.dispose().catch(() => undefined);
+        }
+      }
+      // The browser can crash WHILE goto is resolving; #onCrash then clears #active and zeroes
+      // #occupied. Registering the lease now would resurrect a dead entry against a crashed browser with
+      // the slot count out of sync (drifting below #active.size, eventually exceeding the cap). If we're
+      // no longer the live browser, bail — the catch below closes the context and returns the slot.
+      if (slot.browser !== browser) {
+        throw new Error('browser crashed during navigation');
+      }
+      // Foreground it: a page opened beside other tabs can start hidden (#1351). Best-effort — a tab
+      // that stays hidden is reported by name at the lease, which failing here would lose.
+      await page.bringToFront?.().catch(() => undefined);
+      const navStatus = navStatusOf(navRes);
+      this.#active.set(sessionId, {
+        headed: slot.headed,
+        context,
+        page,
+        url,
+        ...(opts.owner === undefined ? {} : { owner: opts.owner }),
+        touchedAt: this.#now(),
+        permissions: opts.permissions ?? [],
+        ignoresHTTPSErrors: true === opts.ignoreHTTPSErrors,
+        csp,
+        ...(pending === undefined ? {} : { dialFailureUrl: pending }),
+        ...(pendingDialogMessage === undefined ? {} : { lastDialogMessage: pendingDialogMessage }),
+        ...(hostStub === undefined || opts.initScript === undefined
+          ? {}
+          : { hostStub, hostStubScript: opts.initScript }),
+      });
+      return {
+        sessionId,
+        url,
+        ...(navStatus !== undefined ? { navStatus } : {}),
+        release: () => this.#release(sessionId),
+        injectReader: () => injectReaderInto(page, this.#zeroInstall?.(url)),
+        isLoading: () => pageLoading(page),
+      };
+    } catch (err) {
+      // Setup failed after we claimed the slot — give it back so a queued acquire isn't stuck, and
+      // close the half-open context.
+      if (context !== undefined) {
+        await settledWithin(context.close(), LEASE_CLOSE_TIMEOUT_MS);
+      }
+      this.#releaseSlot();
+      throw err;
+    }
+  }
+
+  /**
+   * The websocket address this lease's page reported it could not reach, if it reported one.
+   *
+   * Undefined means the page said nothing — never that it dialled the right place.
+   */
+  dialFailureUrl(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.dialFailureUrl;
+  }
+
+  /**
+   * The message of the most recent native dialog (`confirm`/`alert`/`prompt`) auto-dismissed on this
+   * lease, if any. Diagnostic only — the dialog itself is already gone by the time this is readable.
+   */
+  lastDialogMessage(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.lastDialogMessage;
+  }
+
+  /** Close every context and the browser. Pending waiters are rejected (the pool is terminal now). */
+  async shutdown(): Promise<void> {
+    this.#closed = true; // set first so any woken waiter rejects instead of relaunching a browser
+    const contexts = [...this.#active.values()].map((a) => a.context);
+    this.#active.clear();
+    this.#occupied = 0;
+    await Promise.all(contexts.map((c) => c.close().catch(() => undefined)));
+    // If a launch is in flight, await it so we can close the resulting browser — otherwise it
+    // resolves after shutdown returns and the Chromium process is orphaned (hundreds of MB leaked).
+    for (const slot of [this.#headless, this.#headed]) {
+      const inflight = slot.launching;
+      if (inflight !== undefined) {
+        const launched = await inflight.catch(() => undefined);
+        if (launched !== undefined && launched !== slot.browser) {
+          await launched.close().catch(() => undefined);
+        }
+      }
+      const browser = slot.browser;
+      slot.browser = undefined;
+      if (browser !== undefined) {
+        await browser.close().catch(() => undefined);
+      }
+    }
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter();
+    }
+  }
+
+  async #release(sessionId: string): Promise<void> {
+    const lease = this.#active.get(sessionId);
+    if (lease === undefined) {
+      return;
+    } // already released or lost to a crash
+    this.#active.delete(sessionId);
+    reportLeaseClosed(this.#pageErrorHooks, sessionId);
+    // Drop any alias pointing here, or the map grows for the life of the daemon and a later lease
+    // reusing that registered name would resolve to a context that is already closed.
+    for (const [registered, leaseId] of this.#aliases) {
+      if (leaseId === sessionId) {
+        this.#aliases.delete(registered);
+      }
+    }
+    // Bounded: a close that never returned held the slot and kept the tab open after the agent left.
+    const closed = await closeLeaseTab(lease, LEASE_CLOSE_TIMEOUT_MS);
+    this.#releaseSlot();
+    if (!closed) {
+      await this.#dropWedgedBrowser(sessionId, lease.headed);
+    }
+    await this.#closeIfIdle();
+  }
+
+  /** Close the browser of a tab that did not close in time, unless another lease still uses it. */
+  async #dropWedgedBrowser(sessionId: string, headed: boolean): Promise<void> {
+    const slot = headed ? this.#headed : this.#headless;
+    const shared = [...this.#active.values()].some((other) => other.headed === headed);
+    const browser = slot.browser;
+    const drop = !shared && browser !== undefined && slot.launching === undefined;
+    log(LEASE_CLOSE_TIMED_OUT, { lease: sessionId, browserClosed: drop });
+    if (!drop) {
+      return;
+    }
+    slot.browser = undefined;
+    await settledWithin(browser.close(), LEASE_CLOSE_TIMEOUT_MS);
+  }
+
+  /**
+   * Close the browsers once nothing holds or waits for a lease. An idle Chromium kept its memory
+   * until the daemon itself went idle. Every acquire claims a slot before it touches a browser, so
+   * nothing occupied means no acquire is between launching a browser and using it.
+   */
+  async #closeIfIdle(): Promise<void> {
+    if (this.#active.size > 0 || this.#occupied > 0 || this.#waiters.length > 0) {
+      return;
+    }
+    for (const slot of [this.#headless, this.#headed]) {
+      const browser = slot.browser;
+      if (browser === undefined || slot.launching !== undefined) {
+        continue;
+      }
+      slot.browser = undefined;
+      await settledWithin(browser.close(), LEASE_CLOSE_TIMEOUT_MS);
+    }
+  }
+
+  /** Synchronously claim a slot if under the cap. Returns true on success (caller proceeds). */
+  #tryClaim(): boolean {
+    if (this.#occupied < this.#max) {
+      this.#occupied += 1;
+      return true;
+    }
+    return false;
+  }
+
+  #waitForSlot(signal?: AbortSignal): Promise<void> {
+    if (this.#tryClaim()) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const onFree = (): void => {
+        // The pool shut down while we waited → reject rather than relaunch a browser.
+        if (this.#closed) {
+          if (signal !== undefined) {
+            signal.removeEventListener('abort', onAbort);
+          }
+          reject(new Error('browser pool is shut down'));
+          return;
+        }
+        // Claim the freed slot; if another woken waiter beat us to it, re-queue.
+        if (this.#tryClaim()) {
+          if (signal !== undefined) {
+            signal.removeEventListener('abort', onAbort);
+          }
+          resolve();
+        } else {
+          this.#waiters.push(onFree);
+        }
+      };
+      const onAbort = (): void => {
+        const i = this.#waiters.indexOf(onFree);
+        if (i >= 0) {
+          this.#waiters.splice(i, 1);
+        }
+        reject(new Error('acquire aborted'));
+      };
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          reject(new Error('acquire aborted'));
+          return;
+        }
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      this.#waiters.push(onFree);
+    });
+  }
+
+  /** Give back one occupied slot and hand it to the next waiter (which re-claims it synchronously). */
+  #releaseSlot(): void {
+    if (this.#occupied > 0) {
+      this.#occupied -= 1;
+    }
+    const next = this.#waiters.shift();
+    if (next !== undefined) {
+      next();
+    }
+  }
+
+  async #ensureBrowser(slot: BrowserSlot): Promise<PooledBrowser> {
+    if (this.#closed) {
+      throw new Error('browser pool is shut down');
+    }
+    if (slot.browser !== undefined && slot.browser.isConnected()) {
+      return slot.browser;
+    }
+    const launch = slot.launch;
+    if (launch === undefined) {
+      throw new Error(NO_HEADED_BROWSER);
+    }
+    // De-dupe concurrent launches: the first acquire to find no browser starts one; the rest await it.
+    if (slot.launching === undefined) {
+      // The in-flight promise MUST be cleared on failure as well as success. It used to be cleared only
+      // in the success callback, so the first failed launch — Chromium not downloaded, a transient
+      // EAGAIN — left a permanently rejected promise here, and every subsequent acquire for the daemon's
+      // lifetime re-returned that same stale rejection. Running `npx playwright install` did not help;
+      // only restarting the daemon did. A retry must be allowed to actually retry.
+      slot.launching = launch()
+        .then((b) => {
+          b.onDisconnected(() => this.#onCrash(slot, b));
+          slot.browser = b;
+          return b;
+        })
+        .finally(() => {
+          slot.launching = undefined;
+        });
+    }
+    return slot.launching;
+  }
+
+  /**
+   * A browser process died: drop the leases it held (they're invalid) and clear its slot so the next
+   * acquire of that kind relaunches it. The other browser's leases live on.
+   */
+  #onCrash(slot: BrowserSlot, crashed: PooledBrowser): void {
+    if (slot.browser !== crashed) {
+      return;
+    } // a stale handler from a prior browser
+    slot.browser = undefined;
+    let freed = 0;
+    for (const [id, lease] of this.#active) {
+      if (lease.headed !== slot.headed) {
+        continue;
+      }
+      this.#active.delete(id);
+      freed += 1;
+    }
+    // A lease mid-acquire on the dead browser holds a slot too; it frees it in its own catch. When
+    // every lease belonged to this browser, nothing else can be holding one.
+    this.#occupied = 0 === this.#active.size ? 0 : Math.max(0, this.#occupied - freed);
+    for (const waiter of this.#waiters.splice(0)) {
+      waiter();
+    } // let them re-claim + relaunch
+  }
+
+  /** The origin added to this lease's page CSP `connect-src`, or undefined if none was (#2016). */
+  cspWidenedFor(sessionId: string): string | undefined {
+    return this.#active.get(this.#leaseIdOf(sessionId))?.csp.widenedFor;
+  }
+
+  /** Whether this lease's context skips certificate checks. A context cannot change it later. */
+  ignoresHTTPSErrors(sessionId: string): boolean {
+    return true === this.#active.get(this.#leaseIdOf(sessionId))?.ignoresHTTPSErrors;
+  }
+
+  /** Whether this lease lives in the headed browser. */
+  isHeaded(sessionId: string): boolean {
+    return true === this.#active.get(this.#leaseIdOf(sessionId))?.headed;
+  }
+}

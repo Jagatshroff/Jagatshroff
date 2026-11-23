@@ -1,0 +1,941 @@
+/**
+ * Pure assembly of the `reticle init` action plan. Given the detection result and the relevant file
+ * contents, produce an ordered list of steps — each marked apply / manual / already / skip. The
+ * runner performs the `write` side-effects; this module decides *what* should happen.
+ */
+
+import {
+  claudeAddCommand,
+  claudeProjectMcpJson,
+  claudeRemoveUserCommand,
+  claudeStaleEntryNote,
+  codexAddCommand,
+  mcpManual,
+} from '@/register/mcp.js';
+import { codexNamesOurServer } from '@/register/codex-toml.js';
+import {
+  mergeClientConfig,
+  ClientMergeStatus,
+  clientSnippet,
+  clientSpec,
+  CLAUDE_PROJECT_CONFIG,
+  CLAUDE_PROJECT_SPEC,
+  McpClient,
+  type ClientSpec,
+} from '@/register/mcp-clients.js';
+import {
+  CLAUDE_COMMAND_PATH,
+  CURSOR_COMMAND_PATH,
+  SLASH_COMMAND_BODY,
+  SLASH_COMMAND_SIGNATURE,
+} from '@/register/slash-command.js';
+import {
+  mergeMarkedInstruction,
+  reticleMdFile,
+  cursorRuleFile,
+  AgentRuleStatus,
+  CLAUDE_MD_PATH,
+  markedBlock,
+  AGENTS_MD_PATH,
+  RETICLE_MD_PATH,
+  CURSOR_RULE_PATH,
+} from '@/project/agent-rules.js';
+import { cspStep } from '@/diagnose/csp-step.js';
+import { HTML_INDEX_PATH } from '@/patch/static-page.js';
+import { frameworkSteps } from './framework-adapter.js';
+import { installStep } from './framework-adapter.js';
+import { MCP_TARGET, StepStatus, type Step, type Plan, type PlanInput } from './plan-types.js';
+export {
+  DEPS_TARGET,
+  MCP_TARGET,
+  StepStatus,
+  type Step,
+  type Plan,
+  type PlanInput,
+} from './plan-types.js';
+import { join } from 'node:path';
+import { reticleConfigContent } from '@/patch/snippets.js';
+import { configWithInstallSource } from '@/project/install-source-config.js';
+import { portMoveDetail, retargetConfigPort } from './port-steps.js';
+import {
+  containerisedStep,
+  uiLibraryStep,
+  webGlCanvasStep,
+  windowsMcpNoteStep,
+} from './notices.js';
+import {
+  existingConfigProblem,
+  projectIdOf,
+  RETICLE_CONFIG_FILE,
+} from '@/detect/existing-config.js';
+import { CLAUDE_SETTINGS_PATH, claudeSettingsSteps, promptHookSteps } from './stop-hook-step.js';
+import {
+  PRETTIERIGNORE_PATH,
+  RETICLE_IGNORE_ENTRY,
+  ignoresReticle,
+  withReticleIgnored,
+} from '@/patch/prettier-ignore.js';
+
+// Re-exported: it moved to the module that reads it, and every existing importer says `plan.js`.
+export { RETICLE_CONFIG_FILE };
+export { frameworkPackages } from './framework-adapter.js';
+
+/**
+ * Where the agent-facing files go, which is not always where the app is.
+ *
+ * Reported from the field (#318): a repo with its app at `src/admin` got `.claude/commands/reticle.md`
+ * written into the app directory, while the human's agent session runs at the repo root — so
+ * `/reticle` did not exist for them at all until they copied it up by hand. The rule and command
+ * files are read by the AGENT, so they belong where the agent stands; the app files stay with the
+ * app. The two are the same directory in a single-package repo, which is why this went unnoticed.
+ */
+function agentFile(input: PlanInput, relPath: string): string {
+  const root = input.agentFileRoot;
+  return root === undefined || 0 === root.length ? relPath : join(root, relPath);
+}
+
+const CLAUDE_MCP_TITLE = 'MCP server (Claude, global)';
+
+/**
+ * The Reticle plugin brings its own `reticle` server. A user-scope entry next to it gives Claude
+ * Code two servers with the same tools, so none is added. An old one is named, not removed.
+ */
+function claudePluginStep(input: PlanInput): Step {
+  if (true === input.claudeUserEntry) {
+    return {
+      title: CLAUDE_MCP_TITLE,
+      target: MCP_TARGET,
+      status: StepStatus.MANUAL,
+      detail: `the Reticle plugin is active and a user-scope reticle server is registered too, so Claude Code has two. Remove the user-scope one: ${claudeRemoveUserCommand()}`,
+    };
+  }
+  return {
+    title: CLAUDE_MCP_TITLE,
+    target: MCP_TARGET,
+    status: StepStatus.ALREADY,
+    detail:
+      'the Reticle plugin is active and gives Claude Code its server; no user-scope entry added',
+  };
+}
+
+/**
+ * The floating npx entry, kept and named. A NOTICE after the Claude Code step, so the step that
+ * decides the closing hint still reads ALREADY.
+ */
+function claudeFloatingSteps(input: PlanInput): Step[] {
+  if (true !== input.claudeUserEntryFloating) {
+    return [];
+  }
+  return [
+    {
+      title: 'Old MCP entry (Claude, global)',
+      target: MCP_TARGET,
+      status: StepStatus.NOTICE,
+      detail: claudeStaleEntryNote(input.mcpLauncher),
+    },
+  ];
+}
+
+function claudeMcpStep(input: PlanInput): Step | null {
+  if (true === input.claudePlugin) {
+    return claudePluginStep(input);
+  }
+  if (!input.claudeCli) {
+    return null;
+  }
+  if (input.mcpExists) {
+    return {
+      title: CLAUDE_MCP_TITLE,
+      target: MCP_TARGET,
+      status: StepStatus.ALREADY,
+      detail: 'reticle already registered (install once, used by every project)',
+    };
+  }
+  const cmd = claudeAddCommand(input.mcpLauncher);
+  return {
+    title: CLAUDE_MCP_TITLE,
+    target: MCP_TARGET,
+    status: StepStatus.APPLY,
+    detail: 'register reticle globally for all projects',
+    exec: { command: cmd.command, args: cmd.args, fallback: cmd.display },
+  };
+}
+
+/**
+ * One step per OTHER detected client.
+ *
+ * The shapes differ enough that a shared "write mcp.json" would be wrong for three of them — see
+ * mcp-clients.ts. What is shared is the DECISION: already-correct is left alone, a file we cannot
+ * parse is reported with a paste-able block rather than overwritten, and everything else is written.
+ */
+function otherClientSteps(input: PlanInput): Step[] {
+  return (input.detectedClients ?? []).map((detected) => {
+    const spec = clientSpec(detected.id);
+    return (
+      codexCliStep(spec, detected.configPath, detected.existing, input) ??
+      clientStep(spec, detected.configPath, detected.existing, input.mcpLauncher)
+    );
+  });
+}
+
+/**
+ * Codex, registered through its own CLI instead of a printed block (#1238).
+ *
+ * `mergeClientConfig` answers MANUAL for TOML, since we never edit it blind. `codex mcp add` does
+ * the editing, so with the binary on PATH nothing is left for a human. It REPLACES an entry of the
+ * same name and exits 0, so this answers only when the config names no `reticle` server at all, in
+ * any shape. An entry somebody wrote — a local build, a `url` — falls through to `clientStep`, which
+ * leaves it alone (ALREADY) or hands over the block (MANUAL), exactly as before.
+ */
+function codexCliStep(
+  spec: ClientSpec,
+  configPath: string,
+  existing: string | null,
+  input: PlanInput,
+): Step | null {
+  if (McpClient.CODEX !== spec.id || true !== input.codexCli) {
+    return null;
+  }
+  if (codexNamesOurServer(existing, spec.serversKey)) {
+    return null;
+  }
+  const cmd = codexAddCommand(input.mcpLauncher);
+  return {
+    title: `MCP server (${spec.label})`,
+    target: configPath,
+    status: StepStatus.APPLY,
+    detail: `register reticle with ${spec.label} (${cmd.display})`,
+    exec: { command: cmd.command, args: cmd.args, fallback: cmd.display },
+  };
+}
+
+/** One client's step: already-correct is left alone, an unparseable file gets a paste-able block. */
+function clientStep(
+  spec: ClientSpec,
+  configPath: string,
+  existing: string | null,
+  launcher?: string,
+): Step {
+  const merged = mergeClientConfig(spec, existing, launcher);
+  const title = `MCP server (${spec.label})`;
+  if (merged.status === ClientMergeStatus.ALREADY) {
+    return {
+      title,
+      target: configPath,
+      status: StepStatus.ALREADY,
+      detail: `reticle already registered with ${spec.label}`,
+    };
+  }
+  if (merged.status === ClientMergeStatus.MANUAL) {
+    // Either the file did not parse, or the format is one we refuse to edit blind (TOML). Both
+    // end the same way: say so, and hand over the exact block.
+    return {
+      title,
+      target: configPath,
+      status: StepStatus.MANUAL,
+      detail: `add this to ${configPath} by hand:\n${clientSnippet(spec, launcher)}`,
+    };
+  }
+  return {
+    title,
+    target: configPath,
+    status: StepStatus.APPLY,
+    detail: `register reticle with ${spec.label}`,
+    write: { path: configPath, content: merged.content },
+  };
+}
+
+/**
+ * Claude Code's project `.mcp.json`, written only when `init` runs inside Claude Code with no CLI on
+ * PATH (a VS Code extension session). There the reporter had to write this file by hand (#1071,
+ * #1078); anywhere else a `.mcp.json` is a file in somebody's repo for a client they may not use, so
+ * they get the notice instead.
+ */
+function claudeProjectStep(input: PlanInput): Step | null {
+  if (input.claudeCli || true !== input.insideClaudeCode || true === input.claudePlugin) {
+    return null;
+  }
+  const path = agentFile(input, CLAUDE_PROJECT_CONFIG);
+  return clientStep(
+    CLAUDE_PROJECT_SPEC,
+    path,
+    input.claudeProjectConfig ?? null,
+    input.mcpLauncher,
+  );
+}
+
+/** One global registration per detected agent (Claude + Cursor). Falls back to a manual note. */
+function mcpSteps(input: PlanInput): Step[] {
+  if (!input.options.mcp) {
+    return [
+      {
+        title: 'MCP server (global)',
+        target: MCP_TARGET,
+        status: StepStatus.SKIP,
+        // Names everything it turns off. `--no-mcp` reads like "skip one step" and skips three: the
+        // registration, the agent rule files, and the /reticle command. A gate running with this flag
+        // therefore covers far less than its name suggests, which is worth saying out loud.
+        detail:
+          '--no-mcp — also skips the agent rule files (CLAUDE.md / AGENTS.md / .cursor) and the /reticle command',
+      },
+    ];
+  }
+  // Claude and Cursor first (they have their own registration paths), then every other detected
+  // client. A machine with Cursor AND Windsurf gets both — registering only the first one found is
+  // how a user ends up with Reticle in the editor they were not using.
+  const claudeProject = claudeProjectStep(input);
+  const steps = [
+    ...stepsForAgents(input, (a) => a.mcpStep),
+    ...claudeFloatingSteps(input),
+    ...(null === claudeProject ? [] : [claudeProject]),
+    ...otherClientSteps(input),
+  ];
+  if (0 === steps.length) {
+    // No agent detected. mcpManual already carries the Windows cmd fallback — do not append it again.
+    return [
+      {
+        title: 'MCP server (global)',
+        target: MCP_TARGET,
+        status: StepStatus.MANUAL,
+        detail: mcpManual(input.mcpLauncher),
+      },
+    ];
+  }
+  /*
+   * Claude Code never leaves the plan without a word (#1071).
+   *
+   * It is the only client detected by CLI-on-PATH rather than by its config, so inside a Claude Code
+   * VS Code extension session — where `claude` is not on PATH — it reads as absent while the user is
+   * sitting in it. `claudeMcpStep` then returned null, and the manual fallback below only fires when
+   * NO agent at all was found. With Gemini and Codex present, Claude Code vanished from the plan
+   * entirely and nothing said so. A step that disappears is exactly what the install gate's baseline
+   * diff exists to catch, and the plan is the one artifact a person reads to learn what init did.
+   *
+   * Only when something else WAS found. With nothing found, the generic note below already says how
+   * to register, so nothing has silently vanished — and leaving that path untouched keeps every
+   * pristine scaffold in the install baseline reading exactly as it did.
+   */
+  if (
+    !input.claudeCli &&
+    true !== input.claudePlugin &&
+    null === claudeProject &&
+    steps.length > 0
+  ) {
+    steps.push({
+      title: CLAUDE_MCP_TITLE,
+      target: MCP_TARGET,
+      // NOTICE, not MANUAL. Nothing here FAILED and the reader may not use Claude Code at all, so
+      // this is something to know rather than work owed — and the install gate asserts zero `⚠`,
+      // which would turn an informational line into a gate failure on any machine that happens to
+      // have another agent's config. A notice prints in full exactly like a manual step.
+      status: StepStatus.NOTICE,
+      detail: `no \`claude\` on PATH, so it could not be registered from here. Inside a Claude Code VS Code extension session the CLI is genuinely absent while the editor is not — add ${claudeProjectMcpJson(input.mcpLauncher)}`,
+    });
+  }
+  const windowsNote = windowsMcpNoteStep(input);
+  if (windowsNote !== null) {
+    steps.push(windowsNote);
+  }
+  return steps;
+}
+
+const SLASH_COMMAND_TITLE = 'The /reticle command';
+
+/**
+ * Nothing to do for this command file: it already holds the CURRENT body, or it is not ours at all.
+ *
+ * Gating on mere existence froze the command at whatever release wrote it. Rewriting anything found
+ * there would be worse — a human may have claimed `/reticle` for their own prompt — so a file without
+ * our signature is left exactly as it is.
+ */
+function commandIsSettled(content: string | null | undefined): boolean {
+  if (null === content || content === undefined) {
+    return false;
+  }
+  return content === SLASH_COMMAND_BODY || !content.includes(SLASH_COMMAND_SIGNATURE);
+}
+
+/**
+ * `/reticle` — the entry point SKILL.md promises in three places and nothing ever created, so it
+ * silently did nothing in every tool.
+ *
+ * CURRENT, not merely present — same reason as the Cursor rule: a command file frozen at whatever
+ * release created it is a command that can never be improved for anyone who already ran init. The
+ * whole file is Reticle's, so a stale one is rewritten.
+ */
+function commandStepFor(
+  path: string,
+  present: boolean,
+  content: string | null | undefined,
+): Step | null {
+  if (!present) {
+    return null;
+  }
+  return commandIsSettled(content)
+    ? {
+        title: SLASH_COMMAND_TITLE,
+        target: path,
+        status: StepStatus.ALREADY,
+        detail: 'command already exists',
+      }
+    : {
+        title: SLASH_COMMAND_TITLE,
+        target: path,
+        status: StepStatus.APPLY,
+        detail: 'type /reticle to verify one flow in the browser',
+        write: { path, content: SLASH_COMMAND_BODY },
+      };
+}
+
+function claudeCommandStep(input: PlanInput): Step | null {
+  return commandStepFor(
+    agentFile(input, CLAUDE_COMMAND_PATH),
+    input.claudeCli,
+    input.claudeCommandContent,
+  );
+}
+
+function cursorCommandStep(input: PlanInput): Step | null {
+  const cursorGlobal = (input.detectedClients ?? []).some((c) => c.id === McpClient.CURSOR);
+  const present = true === input.cursorProjectPresent || (cursorGlobal && !input.claudeCli);
+  return commandStepFor(agentFile(input, CURSOR_COMMAND_PATH), present, input.cursorCommandContent);
+}
+
+const AGENT_RULE_TITLE = 'Agent verification rule';
+const AGENT_RULE_DETAIL = 'teach the agent to verify features with Reticle after building them';
+
+/**
+ * What this step is about to do to a file somebody else already writes in.
+ *
+ * Creating an instruction file and APPENDING to an existing one are different acts, and the plan
+ * said the same sentence for both. Reported from the field on a monorepo audit: `init` appended 68
+ * lines to `CLAUDE.md` — the repo's binding agent contract, the file every agent there reads first —
+ * described only as "teach the agent to verify features with Reticle after building them". The
+ * reporter reverted the whole install.
+ *
+ * `--dry-run` already exists, so the consent mechanism was never missing; what was missing was the
+ * plan telling the truth loudly enough to act on. A reader deciding whether to allow this needs the
+ * SIZE and the fact that the file is already theirs — both of which are known here and were being
+ * withheld. The markers are named too, because a reversible edit and an irreversible one are also
+ * different acts, and this one is reversible.
+ */
+function ruleWriteDetail(existing: string | null | undefined, file: string): string {
+  const hasContent = existing !== null && existing !== undefined && existing.trim().length > 0;
+  if (!hasContent) {
+    return `${AGENT_RULE_DETAIL} — creates ${file}`;
+  }
+  const added = markedBlock().split('\n').length - 1;
+  return (
+    `${AGENT_RULE_DETAIL} — APPENDS ${String(added)} lines to your existing ${file}, ` +
+    'inside `reticle:begin`/`reticle:end` markers; delete the marked block to undo'
+  );
+}
+const RETICLE_MD_TITLE = 'Full agent rules';
+const RETICLE_MD_DETAIL =
+  'the reference the always-loaded rule points at (when NOT to verify, recovery, feedback)';
+
+/**
+ * A line that is only an import of AGENTS.md (`@AGENTS.md`, `@./AGENTS.md`). Claude Code reads the
+ * imported file as part of CLAUDE.md, so the rule `agentsMdStep` writes there already reaches it, and
+ * a second copy in CLAUDE.md would load the rule twice on every turn (#1680).
+ */
+const IMPORTS_AGENTS_MD = /^[ \t]*@(?:\.\/)?AGENTS\.md[ \t]*\r?$/m;
+
+function claudeRuleStep(input: PlanInput): Step | null {
+  if (!input.claudeCli) {
+    return null;
+  }
+  const path = agentFile(input, CLAUDE_MD_PATH);
+  if (IMPORTS_AGENTS_MD.test(input.claudeMdContent ?? '')) {
+    return {
+      title: AGENT_RULE_TITLE,
+      target: path,
+      status: StepStatus.ALREADY,
+      detail: `CLAUDE.md imports ${AGENTS_MD_PATH}, so the Reticle rule written there reaches Claude Code through the import; no second copy`,
+    };
+  }
+  const r = mergeMarkedInstruction(input.claudeMdContent);
+  if (r.status === AgentRuleStatus.ALREADY) {
+    return {
+      title: AGENT_RULE_TITLE,
+      target: path,
+      status: StepStatus.ALREADY,
+      detail: 'Reticle rule already in CLAUDE.md',
+    };
+  }
+  return {
+    title: AGENT_RULE_TITLE,
+    target: path,
+    status: StepStatus.APPLY,
+    detail: ruleWriteDetail(input.claudeMdContent, CLAUDE_MD_PATH),
+    write: { path, content: r.content },
+  };
+}
+
+/**
+ * The Cursor rule is a PROJECT file, so it is written only when Cursor plausibly works on THIS
+ * project — the repo has a `.cursor/` dir, or Cursor is the only agent found. `~/.cursor` merely
+ * existing on the machine meant every Claude Code user got an unexplained `.cursor/rules/reticle.mdc`
+ * committed into their repo. (Global MCP registration is different: it is global, and stays.)
+ */
+function cursorRuleStep(input: PlanInput): Step | null {
+  const cursorGlobal = (input.detectedClients ?? []).some((c) => c.id === McpClient.CURSOR);
+  if (!cursorGlobal && true !== input.cursorProjectPresent) {
+    return null;
+  }
+  if (input.cursorProjectPresent !== true && input.claudeCli) {
+    return null;
+  }
+  // The whole file is Reticle's — init created it — so a stale one is REWRITTEN rather than merged.
+  // Comparing content is what makes the rule updatable; comparing existence made it permanent.
+  const path = agentFile(input, CURSOR_RULE_PATH);
+  if (input.cursorRuleContent === cursorRuleFile()) {
+    return {
+      title: AGENT_RULE_TITLE,
+      target: path,
+      status: StepStatus.ALREADY,
+      detail: 'Reticle rule already in .cursor/rules',
+    };
+  }
+  return {
+    title: AGENT_RULE_TITLE,
+    target: path,
+    status: StepStatus.APPLY,
+    detail: AGENT_RULE_DETAIL,
+    write: { path, content: cursorRuleFile() },
+  };
+}
+
+/**
+ * Every coding agent `reticle init` knows how to wire itself into, and the three surfaces it wires:
+ * the global MCP registration, the project rule file that makes the agent USE Reticle, and the
+ * `/reticle` command.
+ *
+ * One list, because those three surfaces used to enumerate Claude and Cursor separately in three
+ * places — so supporting a fourth agent meant finding all three and getting each right. Adding one
+ * is now an entry here plus its builders; each builder answers null when that agent is not present
+ * for this user or this project, which is also how "no agent detected" falls through to the
+ * cross-agent AGENTS.md.
+ *
+ * Deliberately functions rather than data: registering with Claude runs its CLI while Cursor merges
+ * a JSON file, and pretending those are the same shape would cost more than it saves.
+ */
+const AgentId = {
+  CLAUDE: 'claude',
+  CURSOR: 'cursor',
+} as const;
+type AgentId = (typeof AgentId)[keyof typeof AgentId];
+
+interface AgentIntegration {
+  readonly id: AgentId;
+  /** Global MCP registration. Omit when the generic `otherClientSteps` loop handles it. */
+  readonly mcpStep?: (input: PlanInput) => Step | null;
+  /** The project instruction file this agent re-reads every session. */
+  readonly ruleStep: (input: PlanInput) => Step | null;
+  /** The project slash-command file, for agents that have a command surface. */
+  readonly commandStep: (input: PlanInput) => Step | null;
+}
+
+const AGENT_INTEGRATIONS: readonly AgentIntegration[] = [
+  {
+    id: AgentId.CLAUDE,
+    mcpStep: claudeMcpStep,
+    ruleStep: claudeRuleStep,
+    commandStep: claudeCommandStep,
+  },
+  {
+    id: AgentId.CURSOR,
+    ruleStep: cursorRuleStep,
+    commandStep: cursorCommandStep,
+  },
+];
+
+/** The steps one surface contributes across every known agent, in registry order. */
+function stepsForAgents(
+  input: PlanInput,
+  surface: (a: AgentIntegration) => ((input: PlanInput) => Step | null) | undefined,
+): Step[] {
+  return AGENT_INTEGRATIONS.map((a) => surface(a)?.(input) ?? null).filter(
+    (s): s is Step => s !== null,
+  );
+}
+
+/** The `/reticle` command file for every agent that has a command surface and is present here. */
+function slashCommandSteps(input: PlanInput): Step[] {
+  return stepsForAgents(input, (a) => a.commandStep);
+}
+
+/**
+ * `AGENTS.md`, always. It is the file every agent that is not Claude or Cursor reads.
+ *
+ * This used to be a FALLBACK, written only when no agent was detected. So a repo set up on a machine
+ * with Claude Code got `CLAUDE.md` and nothing else, and the next person to open it with Codex,
+ * Copilot, Amp, Gemini or any other agent found a fully instrumented app whose rules were addressed
+ * to somebody else's tool. The detection tells you which agent is running the install; it says
+ * nothing about which agents will open the repository afterwards.
+ */
+function agentsMdStep(input: PlanInput): Step {
+  const r = mergeMarkedInstruction(input.agentsMdContent);
+  const path = agentFile(input, AGENTS_MD_PATH);
+  if (r.status === AgentRuleStatus.ALREADY) {
+    return {
+      title: AGENT_RULE_TITLE,
+      target: path,
+      status: StepStatus.ALREADY,
+      detail: 'Reticle rule already in AGENTS.md',
+    };
+  }
+  return {
+    title: AGENT_RULE_TITLE,
+    target: path,
+    status: StepStatus.APPLY,
+    detail: ruleWriteDetail(input.agentsMdContent, AGENTS_MD_PATH),
+    write: { path, content: r.content },
+  };
+}
+
+/**
+ * `RETICLE.md`, the reference the always-loaded blocks point at.
+ *
+ * Written whole rather than merged, because `init` owns the entire file: there is no user content to
+ * preserve, and the marker dance exists only for files somebody else already writes in.
+ */
+function reticleMdStep(input: PlanInput): Step {
+  const path = agentFile(input, RETICLE_MD_PATH);
+  const content = reticleMdFile();
+  if (input.reticleMdContent === content) {
+    return {
+      title: RETICLE_MD_TITLE,
+      target: path,
+      status: StepStatus.ALREADY,
+      detail: 'full rules already current',
+    };
+  }
+  return {
+    title: RETICLE_MD_TITLE,
+    target: path,
+    status: StepStatus.APPLY,
+    detail: RETICLE_MD_DETAIL,
+    write: { path, content },
+  };
+}
+
+/**
+ * The behavioral rules that make the agent actually USE Reticle, and know when not to.
+ *
+ * Every detected agent's own file, plus `AGENTS.md` for the ones that will open this repo later, plus
+ * `RETICLE.md` holding the reference half. Rides with the MCP wiring: `--no-mcp` opts out of
+ * registering the tools AND of every rule file, because rules for tools the agent cannot reach are
+ * noise.
+ */
+function agentRuleSteps(input: PlanInput): Step[] {
+  if (!input.options.mcp) {
+    return [];
+  }
+  return [...stepsForAgents(input, (a) => a.ruleStep), agentsMdStep(input), reticleMdStep(input)];
+}
+
+/**
+ * Keep `.reticle/` out of the project's `prettier --check`.
+ *
+ * When the project uses Prettier, `init` adds `.reticle/` to the project's `.prettierignore`.
+ * The nested `.reticle/.gitignore` does not help — Prettier only reads the ignore file of the
+ * directory it runs from — and matching Prettier's exact JSON output is a losing game, so
+ * excluding the directory is the root-cause fix (#1560).
+ *
+ * SKIP when the project does not use Prettier. ALREADY when `.reticle/` is already excluded.
+ * Otherwise APPLY: create the file, or append the entry to the existing one.
+ */
+function prettierIgnoreStep(input: PlanInput): Step | null {
+  if (true !== input.detection.usesPrettier) {
+    return null;
+  }
+  const existing = input.prettierIgnoreSource ?? null;
+  if (null !== existing && ignoresReticle(existing)) {
+    return {
+      title: 'Prettier ignore',
+      target: PRETTIERIGNORE_PATH,
+      status: StepStatus.ALREADY,
+      detail: '.reticle/ already excluded from Prettier',
+    };
+  }
+  const content = withReticleIgnored(existing);
+  return {
+    title: 'Prettier ignore',
+    target: PRETTIERIGNORE_PATH,
+    status: StepStatus.APPLY,
+    detail:
+      null === existing
+        ? 'create .prettierignore excluding .reticle/ so `prettier --check` passes'
+        : 'add .reticle/ to .prettierignore so `prettier --check` passes',
+    write: { path: PRETTIERIGNORE_PATH, content, expect: [RETICLE_IGNORE_ENTRY] },
+  };
+}
+
+const RETICLE_CONFIG_TITLE = 'Reticle config';
+const AGENT_ROOT_CONFIG_TITLE = 'Reticle config (agent root)';
+
+/**
+ * The SECOND `.reticle.json`, in the directory the agent runs from.
+ *
+ * `.reticle.json` is not app wiring — nothing in the app reads it. The CLI and `reticle mcp` read it
+ * from their own CWD (see cli-port), and that CWD is the repo root, not the app directory a redirect
+ * wired. Reported from the field: an app in `frontend/` on a non-default bridge port left the root
+ * with no config at all, so `reticle mcp` fell back to 4400 — which on that machine was ANOTHER
+ * project's daemon, and `reticle_sessions` would have listed a different app's tabs while the wired
+ * app sat unseen. Nothing in the report said so; every step was green.
+ *
+ * Written in BOTH places rather than moved: a human standing in the app runs `reticle status` there,
+ * and the two files are byte-identical, so neither can disagree with the other about the port or the
+ * project identity.
+ */
+
+function agentRootConfigStep(input: PlanInput, content: string, renamedFrom?: string): Step[] {
+  const root = input.agentFileRoot;
+  if (root === undefined || 0 === root.length) {
+    return [];
+  }
+  const path = agentFile(input, RETICLE_CONFIG_FILE);
+  const declared = projectIdOf(input.agentRootConfigSource);
+  // The root's copy of the id `--new-id` just replaced is this checkout's, not another app's.
+  const existingProject = declared === renamedFrom ? undefined : declared;
+  const wantedProject = projectIdOf(content);
+  /**
+   * A monorepo has more than one app and the root can only point at one of them.
+   *
+   * ABSENT and CONFLICTING used to share this branch, so the second got the first's treatment and
+   * its reassuring wording. Reported from the field: two instrumented apps, a root config naming
+   * the first, and `init --app <the second>` repointed the root with no warning -- after which an
+   * agent started at the root reads one project's config and drives another. That is the
+   * silent-wrong-target failure this product exists to prevent, shipped by its own installer.
+   *
+   * Neither answer is ours to pick. Overwriting discards the other app's identity; skipping quietly
+   * leaves the agent aimed away from the app just wired. So the conflict is NAMED and nothing is
+   * written -- the app's own config is still correct either way, so the app is fully instrumented
+   * and only the root pointer is left for a human to decide.
+   */
+  if (
+    existingProject !== undefined &&
+    wantedProject !== undefined &&
+    existingProject !== wantedProject
+  ) {
+    return [
+      {
+        title: AGENT_ROOT_CONFIG_TITLE,
+        target: path,
+        status: StepStatus.NOTICE,
+        detail:
+          `left alone: it names project "${existingProject}", not "${wantedProject}". An agent ` +
+          'started here would read that project and drive this one. Point it at whichever app ' +
+          'this agent should verify, or run the agent from the app directory.',
+      },
+    ];
+  }
+  // Several apps: a root config names one and is wrong for the rest. Not written; an agent at the
+  // root is served whichever app's daemon is live, and one started in an app reads that app's.
+  if (true === input.agentRootSeveralApps && existingProject === undefined) {
+    return [
+      {
+        title: AGENT_ROOT_CONFIG_TITLE,
+        target: path,
+        status: StepStatus.NOTICE,
+        detail:
+          'not written: this workspace has several apps and the root can name only one. Run the ' +
+          "agent from an app's directory to pin it to that app.",
+      },
+    ];
+  }
+  if (input.agentRootConfigSource === content) {
+    return [
+      {
+        title: AGENT_ROOT_CONFIG_TITLE,
+        target: path,
+        status: StepStatus.ALREADY,
+        detail: 'the agent already reads the same project config',
+      },
+    ];
+  }
+  return [
+    {
+      title: AGENT_ROOT_CONFIG_TITLE,
+      target: path,
+      status: StepStatus.APPLY,
+      detail:
+        'the same config where the agent runs — `reticle mcp` reads it from ITS cwd, and without ' +
+        'it the agent talks to whatever daemon is on the default port',
+      write: { path, content },
+    },
+  ];
+}
+
+function reticleConfigStep(
+  input: PlanInput,
+  content: string,
+  onDisk: string | null | undefined,
+  movedFrom?: number,
+  renamedFrom?: string,
+): Step {
+  if (true === input.reticleConfigExists) {
+    const problem = existingConfigProblem(onDisk);
+    if (problem !== undefined) {
+      // `ℹ`, not `·`: the step is done and something about the result still stops things working,
+      // which is the one mark that says "there is something here to read".
+      return {
+        title: RETICLE_CONFIG_TITLE,
+        target: RETICLE_CONFIG_FILE,
+        status: StepStatus.NOTICE,
+        detail: problem,
+      };
+    }
+    // The one thing a re-run can still learn: which channel the user actually arrived through.
+    // See configWithInstallSource — it only ever ADDS a field that is absent.
+    const backfilled = configWithInstallSource(onDisk, input.installSource);
+    if (backfilled !== undefined || movedFrom !== undefined || renamedFrom !== undefined) {
+      const port = input.options.port;
+      return {
+        title: RETICLE_CONFIG_TITLE,
+        target: RETICLE_CONFIG_FILE,
+        status: StepStatus.APPLY,
+        detail:
+          renamedFrom !== undefined
+            ? `this checkout's own project id: ${String(input.options.projectId)} (was ${renamedFrom}, the id it was copied with)`
+            : movedFrom !== undefined && port !== undefined
+              ? portMoveDetail(movedFrom, port)
+              : 'record which install route this project came through',
+        write: { path: RETICLE_CONFIG_FILE, content: backfilled ?? onDisk ?? content },
+      };
+    }
+    return {
+      title: RETICLE_CONFIG_TITLE,
+      target: RETICLE_CONFIG_FILE,
+      status: StepStatus.ALREADY,
+      detail: '.reticle.json already exists',
+    };
+  }
+  return {
+    title: RETICLE_CONFIG_TITLE,
+    target: RETICLE_CONFIG_FILE,
+    status: StepStatus.APPLY,
+    detail: 'write project config (framework + port)',
+    write: { path: RETICLE_CONFIG_FILE, content },
+  };
+}
+
+/**
+ * The project config, in every directory that has to read it: the app's, and — after a redirect —
+ * the one the agent runs from. One content string for both, so they cannot disagree; an existing
+ * app-side config wins over a freshly derived one, or a re-run would copy a DIFFERENT identity up.
+ *
+ * Except its port, when a re-run asked for a different one: the daemon is about to start on the
+ * requested port, and a config still naming the old one is half of a split brain (see
+ * port-steps.ts). Only the port moves; the identity stays the one already on disk.
+ */
+/**
+ * `--new-id`: the config with `projectId` replaced by the one derived for THIS checkout, or null when
+ * there is nothing to replace. A copied repository keeps the original's `.reticle.json`, and init
+ * otherwise keeps a config on disk as it is, so nothing else gives the copy an id of its own.
+ */
+function withOwnProjectId(
+  source: string,
+  options: PlanInput['options'],
+): { code: string; from: string } | null {
+  const id = options.projectId;
+  const from = projectIdOf(source);
+  if (true !== options.newId || id === undefined || from === undefined || from === id) {
+    return null;
+  }
+  const fields = JSON.parse(source) as Record<string, unknown>;
+  return { code: `${JSON.stringify({ ...fields, projectId: id }, null, 2)}\n`, from };
+}
+
+function reticleConfigSteps(input: PlanInput): Step[] {
+  const existing = input.reticleConfigSource;
+  const copied =
+    true === input.reticleConfigExists && null !== existing && existing !== undefined
+      ? existing
+      : undefined;
+  const renamed = copied === undefined ? null : withOwnProjectId(copied, input.options);
+  const onDisk = renamed?.code ?? copied;
+  const moved = onDisk === undefined ? null : retargetConfigPort(onDisk, input.options.port);
+  const content =
+    moved?.code ??
+    onDisk ??
+    reticleConfigContent(
+      input.detection.framework,
+      input.options.port,
+      input.options.projectId,
+      // Only when it is actually known. Writing `unknown` would be indistinguishable from a
+      // config written before this field existed, and the two mean different things.
+      input.installSource,
+    );
+  return [
+    reticleConfigStep(input, content, moved?.code ?? onDisk, moved?.from, renamed?.from),
+    ...agentRootConfigStep(input, content, renamed?.from),
+    ...(null === renamed ? [] : copiedIdSteps(input, renamed.from)),
+  ];
+}
+
+/**
+ * `--new-id`: the old id where the app quotes it by hand, as in `connect({ projectId: '…' })`. Left
+ * there, the copy's evidence goes on into the original checkout. Only the whole quoted literal moves:
+ * the id is a hash-suffixed name nothing else spells.
+ */
+function copiedIdSteps(input: PlanInput, from: string): Step[] {
+  const id = input.options.projectId;
+  if (id === undefined) {
+    return [];
+  }
+  return (input.copiedIdSources ?? []).map(({ path, source }) => ({
+    title: RETICLE_CONFIG_TITLE,
+    target: path,
+    status: StepStatus.APPLY,
+    detail: `the project id the app names by hand: ${id} (was ${from})`,
+    write: {
+      path,
+      content: ['"', "'", '`'].reduce(
+        (code, q) => code.replaceAll(`${q}${from}${q}`, `${q}${id}${q}`),
+        source,
+      ),
+      expect: [id],
+    },
+  }));
+}
+
+export function buildPlan(input: PlanInput): Plan {
+  const cspSteps = cspStep(input);
+  const prettierIgnore = prettierIgnoreStep(input);
+  const steps: Step[] = [
+    ...cspSteps,
+    ...mcpSteps(input),
+    ...agentRuleSteps(input),
+    ...slashCommandSteps(input),
+    ...claudeSettingsSteps(agentFile(input, CLAUDE_SETTINGS_PATH), input.claudeSettingsContent, {
+      stop: true === input.hooks,
+      // Beside the CLAUDE.md rule: the same agent, the same consent to write its instruction files.
+      compact: input.options.mcp && input.claudeCli,
+      prompt: true === input.claudePromptHook,
+      bin: input.hookBin,
+    }),
+    ...promptHookSteps(input.promptHooks ?? [], true === input.claudePromptHook, input.hookBin),
+    ...uiLibraryStep(input),
+    ...webGlCanvasStep(input),
+    installStep(input),
+    ...reticleConfigSteps(input),
+    ...(prettierIgnore !== null ? [prettierIgnore] : []),
+  ];
+  // Both steps can patch index.html: the connect write must keep the CSP edit that runs first.
+  const patchedIndex = cspSteps.find((step) => step.write?.path === HTML_INDEX_PATH)?.write
+    ?.content;
+  steps.push(
+    ...frameworkSteps(
+      patchedIndex === undefined ? input : { ...input, htmlIndexSource: patchedIndex },
+    ),
+  );
+  // LAST, and a notice rather than an action: it is a statement about this machine's shape, and it
+  // only matters once every file above has been written. See containerised-dev-server.ts.
+  const container = containerisedStep(input);
+  if (container !== null) {
+    steps.push(container);
+  }
+  return { framework: input.detection.framework, uiLibrary: input.detection.uiLibrary, steps };
+}

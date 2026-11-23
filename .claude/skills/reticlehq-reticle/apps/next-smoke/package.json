@@ -1,0 +1,27 @@
+{
+  "name": "@reticlehq/next-smoke",
+  "version": "3.10.11",
+  "private": true,
+  "description": "A real Next.js (app router, React 19) app to smoke-test Reticle on Next.",
+  "scripts": {
+    "dev": "next dev -p 3100"
+  },
+  "dependencies": {
+    "next": "^16.4.6",
+    "prosemirror-model": "^1.25.12",
+    "prosemirror-schema-basic": "^1.2.5",
+    "prosemirror-state": "^1.4.4",
+    "prosemirror-view": "^1.42.9",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@reticlehq/browser": "workspace:*",
+    "@reticlehq/next": "workspace:*",
+    "@reticlehq/react": "workspace:*",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "typescript": "^5.7.3"
+  }
+}

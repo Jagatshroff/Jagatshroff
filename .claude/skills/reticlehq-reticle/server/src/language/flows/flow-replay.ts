@@ -1,0 +1,995 @@
+import { formatStepAddress } from 'open-verification';
+import { assertsState, expectLabel, expectedElementTestid, withoutClauses } from '@reticlehq/core';
+import { span } from '@/trace.js';
+import {
+  ambiguityDrift,
+  anchorLabel,
+  expectElementDrift,
+  refFor,
+  reresolved,
+  resolveTestid,
+  testidDrift,
+} from './flow-anchor.js';
+export { nearestIsAmbiguous, nearestTestid, resolveQuery } from './flow-anchor.js';
+import type { FlowReplaySession, WaitForSignal, Sleep } from './flow-replay-types.js';
+export type { FlowReplaySession, WaitForSignal, Sleep } from './flow-replay-types.js';
+import { routeOfEvent, routeOfUrl } from '@reticlehq/engine/question/predicate/predicate-route.js';
+import { evalConsole } from '@reticlehq/engine/question/predicate/predicate-console.js';
+import { appScope, stepEffect } from '@reticlehq/engine/evidence/step-effect.js';
+import { stepContradictions } from './flow-cross-step.js';
+import { undecidedExpectDrift } from './flow-undecided.js';
+import {
+  AnchorKind,
+  DriftReason,
+  EventType,
+  FlowStepTool,
+  StepEffect,
+  type Drift,
+  type FlowFile,
+  type FlowStep,
+  type FlowStepResult,
+  type ReticleEvent,
+  PredicateKind,
+  ReplayStatus,
+} from '@reticlehq/core';
+import { asString, invokedFlowMissing, isConsequenceDrift } from '@reticlehq/core';
+import { anchorFieldName } from './fields/flow-secret-field.js';
+import {
+  degradedStepResult,
+  isDocumentPressStep,
+  isDegradedAnchor,
+  runComponentStep,
+  runRoleStep,
+  runSequenceStep,
+} from './flow-step-runners.js';
+import { inFlightRequestLabels } from '@/surface/tools/act/settle-in-flight.js';
+import { namedNetIsInFlight } from '@reticlehq/engine/evidence/unsettled.js';
+import { captureBaselines, type Baselines } from '@reticlehq/engine/evidence/baseline.js';
+
+/** What a still-open named request means, in the drift's own words. */
+const IN_FLIGHT_AT_BUDGET_END =
+  'the request this step declared had not come back when the budget ended — it is still in flight, ' +
+  'so nothing here says the app failed. Raise the step timeout, or look at the endpoint';
+import { isDocumentGoneError } from '@/portal/session/facts/session-replaced.js';
+import { actOnResolvedRef } from './flow-step-runners.js';
+import { isPageStep, runPageStep, type OpenPage, type SendRequest } from './steps/page-steps.js';
+
+/**
+ * The document this replay was driving went away mid-run.
+ *
+ * Almost always because the replay itself navigated it — a `startPath` goto, or a step that clicks a
+ * link. The steps already in hand are real answers from the document that WAS there, so they travel
+ * with the error; the step that was in flight has no answer at all and is deliberately absent.
+ * Synthesising one would be a verdict about a page nobody observed, which is the one thing worse
+ * than returning no verdict.
+ *
+ * Typed rather than a message, because the caller has to tell it from a step that genuinely failed:
+ * one says the app is wrong, the other says we stopped watching.
+ */
+export class DocumentLostDuringReplay extends Error {
+  constructor(
+    readonly steps: FlowStepResult[],
+    readonly atStep: number,
+    lostTo?: unknown,
+  ) {
+    super(`the document was replaced while step ${String(atStep)} was running`, {
+      cause: lostTo,
+    });
+  }
+}
+
+const realSleep: Sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/*
+ * How replay paces itself between steps. A person does not act on a screen that is still changing,
+ * and replay did: it acted the moment the last step's consequence held. An htmx row swap puts a new
+ * button in the page and binds it a moment later, so a click in between did nothing, and a correct
+ * build failed. A busy machine makes that moment longer, so the false fail came under parallel load.
+ *
+ * Quiet means no network, DOM or animation activity for `STEP_QUIET_MS`, which is shorter than any
+ * person takes to act on a changed screen. A page that never goes quiet (a poll, a spinner) gets
+ * `STEP_QUIET_BUDGET_MS` and then the step runs anyway: the wait paces replay and decides nothing.
+ */
+const STEP_QUIET_MS = 250;
+const STEP_QUIET_BUDGET_MS = 2_000;
+
+/**
+ * The route (pathname) currently in effect — the page a step runs on. Reads the latest ROUTE_CHANGE
+ * from the whole event buffer; mirrors the predicate engine's route field order (pathname → to).
+ * Returns undefined when no route has been observed (e.g. a fake session) so `page` stays optional.
+ */
+function currentRoute(session: FlowReplaySession): string | undefined {
+  const routes = session.eventsSince(0).filter((e) => e.type === EventType.ROUTE_CHANGE);
+  const last = routes.at(-1);
+  // A page that loaded and never navigated has no route event; its URL is still where it is.
+  if (last === undefined) {
+    const loaded = session.url === undefined ? undefined : routeOfUrl(session.url);
+    return loaded !== undefined && loaded.routePath.length > 0 ? loaded.routePath : undefined;
+  }
+  // The ROUTER's path. This field answers "which page did this step run on", and the document
+  // pathname is `/` on every page of a hash-routed app — so a whole desktop replay reported `/` for
+  // every step. Sixth place the same reading was wrong; see routeOfEvent.
+  const parts = routeOfEvent(last);
+  if (parts === undefined || 0 === parts.docPath.length) {
+    return undefined;
+  }
+  return parts.routePath.length > 0 ? parts.routePath : undefined;
+}
+
+/** Pathname only (drop origin + query) so a net URL stays terse in the journey. */
+function trimUrl(url: string): string {
+  try {
+    return new URL(url, 'http://x').pathname;
+  } catch {
+    return url.length > 60 ? `${url.slice(0, 59)}…` : url;
+  }
+}
+
+/**
+ * A compact "what happened after this step" summary from the post-action event window — the
+ * journey's consequence column ("→ /deployments", "signal modal:opened", "GET /api/x 500"). Notable
+ * events only (route / domain signal / network / console error), terse and capped to stay token-cheap.
+ */
+function summarizeConsequence(events: ReticleEvent[]): string | undefined {
+  const parts: string[] = [];
+  const lastRoute = events.filter((e) => e.type === EventType.ROUTE_CHANGE).at(-1);
+  if (lastRoute !== undefined) {
+    const routed = routeOfEvent(lastRoute);
+    if (routed !== undefined && routed.routePath.length > 0) {
+      parts.push(`→ ${routed.routePath}`);
+    }
+  }
+  const signals = new Set<string>();
+  for (const e of events) {
+    if (e.type !== EventType.SIGNAL) {
+      continue;
+    }
+    const name = asString((e.data ?? {})['name']);
+    if (name !== undefined) {
+      signals.add(name);
+    }
+  }
+  for (const name of [...signals].slice(0, 2)) {
+    parts.push(`signal ${name}`);
+  }
+  for (const n of events.filter((e) => e.type === EventType.NET_REQUEST).slice(0, 2)) {
+    const data = n.data ?? {};
+    const method = asString(data['method']) ?? 'GET';
+    const path = trimUrl(asString(data['url']) ?? '');
+    const status = 'number' === typeof data['status'] ? ` ${data['status']}` : '';
+    parts.push(`${method} ${path}${status}`.trim());
+  }
+  const errors = events.filter(isConsoleError).length;
+  if (errors > 0) {
+    parts.push(`${errors} console error${errors > 1 ? 's' : ''}`);
+  }
+  return parts.length > 0 ? parts.join('; ') : undefined;
+}
+
+const isConsoleError = (e: ReticleEvent): boolean =>
+  e.type === EventType.CONSOLE_ERROR || e.type === EventType.ERROR_UNCAUGHT;
+
+/** At most this many console errors travel on one step; its `digest` still counts them all. */
+const CONSOLE_ERRORS_PER_STEP = 5;
+
+/** The console errors a step's window saw, for the run artifact's evidence. See FlowStepResult. */
+function consoleErrorsIn(events: ReticleEvent[]): FlowStepResult['consoleErrors'] {
+  const errors = events
+    .filter(isConsoleError)
+    .slice(0, CONSOLE_ERRORS_PER_STEP)
+    .map((e) => ({ level: e.type, message: asString(e.data['message']) ?? '', at: e.t }));
+  return errors.length > 0 ? errors : undefined;
+}
+
+type StepExpect = NonNullable<FlowStep['expect']>;
+type ConsoleClause = Extract<StepExpect, { kind: typeof PredicateKind.CONSOLE }>;
+
+/** The console-absent clauses an expect cannot pass without: itself, or any `allOf` member. */
+function requiredConsoleAbsences(expect: StepExpect): ConsoleClause[] {
+  if (PredicateKind.ALL_OF === expect.kind) {
+    return expect.predicates.flatMap(requiredConsoleAbsences);
+  }
+  return PredicateKind.CONSOLE === expect.kind && true === expect.absent ? [expect] : [];
+}
+
+/**
+ * A console-absent expect, read again over the step's WHOLE window.
+ *
+ * The wait that graded the expect ends before the window does, so an error landing between the two
+ * was counted by the step's consequence and missed by its verdict (#1344). The window wins.
+ */
+function lateConsoleDrift(expect: StepExpect, events: ReticleEvent[]): Drift | undefined {
+  for (const clause of requiredConsoleAbsences(expect)) {
+    const read = evalConsole(events, clause);
+    if (read.pass) {
+      continue;
+    }
+    return {
+      reasonKind: DriftReason.SIGNAL_NOT_OBSERVED,
+      reason: read.failureReason ?? "the step's declared consequence did not hold",
+      anchor: expectLabel(expect),
+      nearest: null,
+    };
+  }
+  return undefined;
+}
+
+/** A console-absent expect read over the start-page load, said as such. See `loadSince`. */
+function loadDrift(expect: StepExpect, loadEvents: ReticleEvent[]): Drift | undefined {
+  const drift = 0 === loadEvents.length ? undefined : lateConsoleDrift(expect, loadEvents);
+  return drift === undefined
+    ? undefined
+    : { ...drift, reason: `${drift.reason}, logged while replay loaded the start page` };
+}
+
+/** Run one testid-anchored step: re-resolve via QUERY, then ACT on the live ref, else drift. */
+export async function runTestidStep(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  value: string,
+  dynamic: ReadonlySet<string>,
+  confirmDangerous: boolean,
+  sleep: Sleep,
+): Promise<FlowStepResult> {
+  const { refs, hint } = await resolveTestid(session, value, sleep);
+  if (0 === refs.length) {
+    return {
+      step: index,
+      tool: step.tool,
+      anchor: value,
+      ok: false,
+      drift: testidDrift(value, hint),
+    };
+  }
+  /*
+   * More than one match is DRIFT, not a note on a passing step.
+   *
+   * This used to take refs[0], act, and return ok:true with `ambiguousTestidNote`. The verdict
+   * reads `drift` and `ok` and never reads a note, so "we guessed which element you meant" was
+   * indistinguishable from "it did what it did before" -- the one claim a replay makes.
+   *
+   * The record itself comes from `ambiguityDrift`, shared with the role and component runners: this
+   * anchor kind was the first to get the rule, and writing it inline is how the other two came to
+   * answer the same question differently.
+   */
+  const ambiguous = ambiguityDrift(step.anchor, refs);
+  if (ambiguous !== null) {
+    return { step: index, tool: step.tool, anchor: value, ok: false, drift: ambiguous };
+  }
+  // The only match, or the recorded position among a shared test id (#2135).
+  const ref = refFor(step.anchor, refs) ?? '';
+  /*
+   * The same dispatch its siblings use, including the one re-resolve on a stale ref (2.3).
+   *
+   * This runner had its own inline copy and no retry, so a flow died on a re-render purely because
+   * the step was anchored by testid rather than by role — the locator deciding how sturdy the replay
+   * is, which is exactly backwards. testid is also the anchor `reticle init` steers people towards,
+   * so the kind most likely to appear in a real flow was the kind without the cure.
+   *
+   * The re-resolve keeps the ambiguity rule above: more than one match is drift, never a guess, so
+   * it reports an `anchor_ambiguous` drift rather than handing back the first of the new matches.
+   */
+  const result = await actOnResolvedRef(
+    session,
+    step,
+    index,
+    value,
+    ref,
+    confirmDangerous,
+    // The field this step types into — from the anchor, so a redacted fill can be supplied from
+    // RETICLE_SECRET_<FIELD> without the flow carrying the secret.
+    anchorFieldName(step.anchor),
+    async () => reresolved(step.anchor, (await resolveTestid(session, value, sleep)).refs),
+  );
+  if (!result.ok) {
+    return result;
+  }
+  // assert the step's expect.element testid is present AFTER the action —
+  // unless that testid was marked DYNAMIC (the LLM-output case), in which case its presence/content
+  // is NOT asserted (only the action ran). The skip is scoped strictly to the dynamic set.
+  const expectTestid = expectedElementTestid(step.expect);
+  if (expectTestid !== undefined && !dynamic.has(expectTestid)) {
+    const expectRefs = await resolveTestid(session, expectTestid, sleep);
+    if (0 === expectRefs.refs.length) {
+      return {
+        step: index,
+        tool: step.tool,
+        // The step's OWN anchor, not the expectation's target. Replay stops at the first drift, so
+        // this result is the only thing the caller sees about why the run ended — naming the
+        // assertion here reads as "step N's locator drifted" and hides that the action did run.
+        anchor: value,
+        ok: false,
+        drift: expectElementDrift(expectTestid, expectRefs.hint),
+      };
+    }
+  }
+  return result;
+}
+
+/**
+ * After a step's anchor resolves and its action runs, its `expect` is EVALUATED — every kind of it.
+ *
+ * For a long time only `expect.state` was, so a recorded `expect.signal` or `expect.net` was written
+ * to disk and read by nothing while `flow_save` graded the flow "asserted". Driven end to end over
+ * MCP: annotate a step with a signal that never fires, save (grade "asserted"), replay -> status
+ * "ok". A green that cannot go red, inside the feature whose job is catching exactly that.
+ *
+ * It compiles through the SAME `successToPredicate` the flow-level `success` has always used, so
+ * there is one definition of what an expect means and the step form cannot drift from it again.
+ * Turning this on makes previously-green flows go red. That is the point — they were green because
+ * nothing was looking.
+ */
+/**
+ * Exported so a PRECONDITION is judged by the same code that judges a consequence.
+ *
+ * `requires` and `expect` are the same shape on purpose: a precondition is a consequence somebody
+ * else's flow was responsible for. Evaluating them with two different functions is how the two
+ * quietly stop agreeing, and the disagreement would land as a flow that replays green against a
+ * state it was never meant to run in.
+ */
+export async function assertStepExpect(
+  session: FlowReplaySession,
+  expect: NonNullable<FlowStep['expect']>,
+  waitForSignal: WaitForSignal,
+  timeoutMs: number,
+  since: number,
+  baselines?: Baselines,
+): Promise<Drift | undefined> {
+  // A testid is already asserted against the live DOM by the step runner. A role/name locator is
+  // not that path — stripping every element made a recorded `until` by button name a no-op, so a
+  // flow that proved the control at capture time could not go red when it was gone.
+  /*
+   * Two clauses replay must not wait on, both for reasons that predate the tree.
+   *
+   * A testid element was already asserted against the live DOM by the step runner, so waiting on it
+   * again is a second read of a question already answered. A DYNAMIC testid is one whose content a
+   * model writes, and its presence is deliberately never asserted.
+   *
+   * A role/name locator is NEITHER, and stripping every element made a recorded `until` by button
+   * name a no-op — a flow that proved the control at capture time could not go red when it was gone.
+   *
+   * The DYNAMIC set used to be a parameter here and was dead the whole time: the testid was deleted
+   * from the expectation on the line above, and the only thing that read the set asked for the
+   * testid that had just been removed. One production caller was already passing an empty set. The
+   * rule is real and still applies to the flow's SUCCESS oracle, which is where it lives.
+   */
+  const predicate = withoutClauses(
+    expect,
+    // Only a PRESENT testid is the runner's to check; an absence stays here or nobody checks it.
+    (clause) =>
+      PredicateKind.ELEMENT === clause.kind &&
+      clause.query.testid !== undefined &&
+      true !== clause.absent,
+  );
+  if (predicate === undefined) {
+    return undefined;
+  }
+  const verdict = await waitForSignal(session, predicate, timeoutMs, since, baselines);
+  if (verdict.pass) {
+    return undefined;
+  }
+  const undecided = undecidedExpectDrift(verdict, expect);
+  if (undecided !== undefined) {
+    return undecided;
+  }
+  // A request the step NAMED that had not come back yet is a blind spot, not an assertion the app
+  // failed. The live verdict path already draws this line (namedNetIsInFlight); replay read the
+  // same window and never asked, so a slow endpoint was reported as a consequence that never fired.
+  // An unrelated open request does not pardon a named URL that never started — matching decides it.
+  const openRequests = assertsState(expect)
+    ? []
+    : inFlightRequestLabels(session.eventsSince(since), session.url, session.background);
+  const namedInFlight = namedNetIsInFlight(predicate, openRequests);
+  // The store case keeps its own kind because heal and the run report branch on it; everything
+  // else is a consequence that did not hold, and the reason carries observed-vs-expected.
+  let reasonKind: DriftReason = DriftReason.SIGNAL_NOT_OBSERVED;
+  if (assertsState(expect)) {
+    reasonKind = DriftReason.STATE_MISMATCH;
+  } else if (namedInFlight) {
+    reasonKind = DriftReason.NET_STILL_IN_FLIGHT;
+  }
+  return {
+    reasonKind,
+    reason: namedInFlight
+      ? `${IN_FLIGHT_AT_BUDGET_END} (${openRequests.join(', ')})`
+      : withCaseOnly(
+          verdict.failureReason ?? "the step's declared consequence did not hold",
+          verdict,
+        ),
+    anchor: expectLabel(expect),
+    nearest: null,
+  };
+}
+
+/**
+ * A text check that missed only on case says so, with what would hold. Text checks match case
+ * exactly now, so a flow saved when they did not goes red on capitalisation alone; the person
+ * reading its replay needs the fix (`ignoreCase: true`, or re-record), not a bare "did not hold".
+ */
+export function withCaseOnly(
+  reason: string,
+  verdict: { caseOnlyMiss?: boolean; wouldHold?: string },
+): string {
+  if (true !== verdict.caseOnlyMiss) {
+    return reason;
+  }
+  const shown = verdict.wouldHold === undefined ? '' : ` ("${verdict.wouldHold}")`;
+  return `${reason} — the page shows it in another case${shown}. Text checks match case exactly: if any case is meant, add ignoreCase: true to this check, or re-record the flow.`;
+}
+
+/** Run one signal-anchored step: wait for the signal predicate, else drift (no nearest for signals). */
+async function runSignalStep(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  name: string,
+  waitForSignal: WaitForSignal,
+  signalTimeoutMs: number,
+  since: number,
+): Promise<FlowStepResult> {
+  // Scope to THIS replay's floor, not the whole buffer.
+  //
+  // A signal step is a pure wait — the signal is fired by the PRECEDING act step — so a per-step floor
+  // would miss it (false negative). But the default whole-buffer read (since=0) was too loose in the
+  // one place it matters most: reticle_flow_verify replays every saved flow back-to-back in ONE
+  // session, so a signal an EARLIER flow emitted (`auth:granted`, `nav:changed`) sat in the buffer and
+  // satisfied a LATER flow's signal step even when that flow's own action never fired it — a
+  // cross-flow false green on the exact suite-verify path the regression-cost claim rests on. The
+  // replay-start floor excludes prior flows/runs while still seeing this run's adjacent-step signal.
+  const verdict = await waitForSignal(
+    session,
+    { kind: PredicateKind.SIGNAL, name },
+    signalTimeoutMs,
+    since,
+  );
+  if (verdict.pass) {
+    return { step: index, tool: step.tool, anchor: name, ok: true };
+  }
+  return {
+    step: index,
+    tool: step.tool,
+    anchor: name,
+    ok: false,
+    drift: {
+      reasonKind: DriftReason.SIGNAL_NOT_OBSERVED,
+      reason: `signal "${name}" not observed`,
+      anchor: name,
+      nearest: null,
+    },
+  };
+}
+
+/**
+ * Replay a loaded flow by RE-RESOLVING every step's semantic anchor against the live DOM — never
+ * a stale ref. A testid anchor is re-found by reticle_query; a signal anchor waits on a predicate.
+ * On the first anchor MISS the step carries legible drift and replay STOPS, returning the partial
+ * results. This is the "whose fault is it" contract, not a blind "command failed".
+ */
+/**
+ * How a replay is loaded, where it starts reporting, and how far it goes.
+ */
+export interface ReplayFromOptions {
+  /**
+   * Opens the page a `navigate` step names and returns the session of the page that loaded. Supplied
+   * by the caller that owns the sessions. Absent: a `navigate` step fails, never skips.
+   */
+  navigate?: OpenPage<FlowReplaySession>;
+  /** Sends the request a `request` step names. Absent: a `request` step fails, never skips. */
+  request?: SendRequest;
+  /**
+   * Told after every step it reports: how many are done, of how many, and whether this one held.
+   * The HUD's replay chip draws its progress from this; it must never throw into the replay.
+   */
+  onStep?: (done: number, total: number, held: boolean) => void;
+  /**
+   * Told each reported step the moment its outcome is decided, before it is kept, so a caller can
+   * add to it (the step's screenshot). Never allowed to fail the replay.
+   */
+  onStepResult?: (result: FlowStepResult, flow: string) => Promise<void>;
+  /**
+   * Resume at this step: an index, or a step's `id` (which survives edits that shift indices).
+   *
+   * There is no state to restore, so the steps before it are re-driven — quickly, as setup: their
+   * actions run, their declared consequences are not checked and their results are not reported.
+   * The one exception is a setup step that FAILS: the resume never reached the step it was asked
+   * for, and swallowing that would report the run as starting where it did not.
+   */
+  from?: number | string;
+  /**
+   * Stop before this step index: drive the journey only as far as a point, such as a dialog that
+   * several journeys branch from. Absent means the whole flow.
+   */
+  to?: number;
+  /**
+   * Continue at this step on the page as it is: earlier steps are not driven at all, because the
+   * caller already drove an identical prefix (another flow replayed `to` this step).
+   */
+  at?: number;
+  /**
+   * How to load a flow this one INVOKES. Absent means invocations cannot be followed.
+   *
+   * A composite whose sub-flow cannot be loaded must FAIL and say so. It must not be reported as a
+   * missing anchor — which is what happened before this existed: the invoke step fell through to
+   * the anchor path and replay went looking for an element with a testid literally named
+   * `demo/signin`, then reported the journey as NO LONGER TRUE with a suggested fix of "sign-out".
+   * Every word of that was wrong, and it was found by driving, not by a unit test — the in-memory
+   * replayer had honoured invocations for an hour by then. Two replay paths; one was wired.
+   */
+  resolveFlow?: (name: string) => Promise<FlowFile | undefined>;
+  /**
+   * Set when replay loaded the start page itself: the session time the load began.
+   *
+   * The load is then part of the journey. An error the page logged while it loaded lands before
+   * step 1 opens its window, so a "no console errors" on step 1 passed over it. Only console-absent
+   * clauses look back to here. A `net` or `text` clause that did so could be satisfied by the load
+   * and not by the step, which is a false pass.
+   */
+  loadSince?: number;
+  /** The invocation chain that reached this flow, nearest caller first. Empty at the top. */
+  via?: readonly { flow: string; step: number }[];
+  /**
+   * Keep going past a step whose ACTION ran and whose declared consequence merely did not hold.
+   *
+   * Off by default, because a regression flow wants the first break and nothing after it. A BUG
+   * SWEEP wants the opposite: a flow that declares what each step SHOULD do, driven against an app
+   * where several of them do not, and one verdict per step. Without this the sweep stops at the
+   * first defect and reports the rest as `notAttempted` — measured on a 6-step flow that halted at
+   * step 0 with five real defects behind it.
+   *
+   * An ANCHOR drift still halts either way: there the element was never found, so the page is not
+   * where the flow says it is and continuing would invent results. `isConsequenceDrift` is the line.
+   */
+  sweep?: boolean;
+}
+
+/**
+ * The index a replay resumes at, or `undefined` when `from` names no step of this flow.
+ *
+ * A step declared `commits` in the prefix refuses the resume (0 = replay everything): re-driving it
+ * is not setup, it is a second charge, a second email, a second record.
+ */
+export function resumeIndex(
+  from: number | string | undefined,
+  steps: readonly FlowStep[],
+): number | undefined {
+  if (from === undefined) {
+    return 0;
+  }
+  const at = 'number' === typeof from ? from : steps.findIndex((step) => step.id === from);
+  if (at < 0 || at >= steps.length || !Number.isInteger(at)) {
+    return undefined;
+  }
+  return steps.slice(0, at).some((step) => StepEffect.COMMITS === step.effect) ? 0 : at;
+}
+
+/**
+ * How far a replay drives: `to` stops before a step (positive), `at` picks up at one on the page as
+ * it is. `at: 0` is the whole flow continuing the page the flow before it left, with no reload.
+ */
+export function replayWindow(args: Record<string, unknown>): { to?: number; at?: number } {
+  const index = (raw: unknown, least: number): number | undefined =>
+    'number' === typeof raw && Number.isInteger(raw) && least <= raw ? raw : undefined;
+  const to = index(args['to'], 1);
+  const at = index(args['at'], 0);
+  return { ...(to === undefined ? {} : { to }), ...(at === undefined ? {} : { at }) };
+}
+
+/** A part-way replay's status, from the steps it drove. */
+export function partialStatus(steps: readonly FlowStepResult[]): ReplayStatus {
+  if (steps.some((step) => step.drift !== undefined)) {
+    return ReplayStatus.DRIFT;
+  }
+  return steps.every((step) => step.ok) ? ReplayStatus.OK : ReplayStatus.ERROR;
+}
+
+/** The `from` argument, narrowed: a step index or a step id. */
+export function resumeArg(raw: unknown): number | string | undefined {
+  return 'number' === typeof raw || ('string' === typeof raw && raw.length > 0) ? raw : undefined;
+}
+
+/** Why `from` cannot be resumed at, or undefined when it can (or was not given). */
+export function unresolvedResume(
+  from: number | string | undefined,
+  steps: readonly FlowStep[],
+): string | undefined {
+  if (resumeIndex(from, steps) !== undefined) {
+    return undefined;
+  }
+  return `cannot resume at ${JSON.stringify(from)}: this flow has ${String(steps.length)} step(s) and no step by that id`;
+}
+
+/**
+ * Run an `invoke` step: load the named flow and replay it, or fail saying why.
+ *
+ * Never silently skipped. An invocation that cannot be followed and is reported as OK would mean a
+ * composite replays green having run none of its sub-journeys — a false green arriving through the
+ * feature meant to make verification stronger.
+ *
+ * The nested steps are NOT spliced into the caller's results. A composite's own step list stays its
+ * own, and the sub-journey's outcome is summarised on the invocation, so a reader sees the shape
+ * they recorded rather than a flattened list that has lost every boundary.
+ */
+async function runInvokeStep(
+  session: FlowReplaySession,
+  flow: FlowFile,
+  step: FlowStep,
+  index: number,
+  waitForSignal: WaitForSignal,
+  signalTimeoutMs: number,
+  confirmDangerous: boolean,
+  sleep: Sleep,
+  options: ReplayFromOptions,
+  setup = false,
+): Promise<FlowStepResult> {
+  const name = step.invoke ?? '';
+  const via = options.via ?? [];
+  const here = { flow: flow.name, step: index, via };
+  const address = formatStepAddress(here);
+  const base = { step: index, tool: FlowStepTool.INVOKE, anchor: name, at: address };
+  const chain = [...via.map((v) => v.flow), flow.name];
+  if (chain.includes(name)) {
+    return {
+      ...base,
+      ok: false,
+      error: `invocation returns to a flow already running: ${[...chain, name].join(' → ')}`,
+    };
+  }
+  const sub = options.resolveFlow === undefined ? undefined : await options.resolveFlow(name);
+  if (sub === undefined) {
+    return {
+      ...base,
+      ok: false,
+      error: invokedFlowMissing(name),
+    };
+  }
+  // `from` is an offset into the CALLER's steps. A sub-journey invoked from the setup prefix runs
+  // whole and unchecked (from = its length); one invoked at or after the resume point runs normally.
+  // Nor the progress callback: a sub-flow's steps are one step of the flow the chip is drawing.
+  const { from: _outer, onStep: _progress, to: _to, at: _at, ...rest } = options;
+  const carried = setup ? { ...rest, from: sub.steps.length } : rest;
+  const nested = await replayFlow(
+    session,
+    sub,
+    waitForSignal,
+    signalTimeoutMs,
+    confirmDangerous,
+    sleep,
+    {
+      ...carried,
+      via: [{ flow: flow.name, step: index }, ...via],
+    },
+  );
+  const failed = nested.find((r) => false === r.ok);
+  if (failed !== undefined) {
+    return {
+      ...base,
+      ok: false,
+      error: `"${name}" failed at ${failed.at ?? `step ${String(failed.step)}`}: ${failed.error ?? 'see that flow'}`,
+      ...(failed.drift === undefined ? {} : { drift: failed.drift }),
+    };
+  }
+  return { ...base, ok: true, note: `ran ${name} (${String(nested.length)} step(s))` };
+}
+
+export async function replayFlow(
+  session: FlowReplaySession,
+  flow: FlowFile,
+  waitForSignal: WaitForSignal,
+  signalTimeoutMs: number,
+  confirmDangerous = false,
+  sleep: Sleep = realSleep,
+  options: ReplayFromOptions = {},
+): Promise<FlowStepResult[]> {
+  const results: FlowStepResult[] = [];
+  // Steps before this index are setup. `from` was validated by the caller; an unresolvable one
+  // resumes nowhere rather than everywhere, so it cannot silently widen into a full replay.
+  const from = resumeIndex(options.from, flow.steps) ?? flow.steps.length;
+  // testids whose region is LLM-dynamic — their expect-presence is NOT asserted.
+  const dynamic = new Set<string>(
+    (flow.dynamic ?? [])
+      .filter((a) => a.kind === AnchorKind.TESTID)
+      .map((a) => (a.kind === AnchorKind.TESTID ? a.value : '')),
+  );
+  // Floor for signal steps: signals that fire during THIS replay, never a prior flow/run in the same
+  // session. Captured once, before any step, so a back-to-back suite verify cannot cross-satisfy.
+  const replayFloor = session.elapsed();
+  // How long a step waits for its consequence: the step's own declaration, else the flow's, else the
+  // caller's default. Resolved per step rather than once, because one slow step in an otherwise fast
+  // journey is the common shape — a file import, a model-backed endpoint — and making the whole flow
+  // wait for the slowest step would trade a false red for a slow suite. See FlowStep.timeoutMs.
+  const waitFor = (step: FlowStep): number =>
+    step.timeoutMs ?? flow.signalTimeoutMs ?? signalTimeoutMs;
+  let index = 0;
+  const tell = (result: FlowStepResult | undefined): void => {
+    try {
+      options.onStep?.(
+        index + 1,
+        flow.steps.length,
+        true === result?.ok && result.drift === undefined,
+      );
+    } catch {
+      /* progress is a picture of the replay, never a reason to stop it */
+    }
+  };
+  try {
+    for (const step of flow.steps) {
+      if (options.to !== undefined && index >= options.to) {
+        break;
+      }
+      if (options.at !== undefined && index < options.at) {
+        index += 1;
+        continue;
+      }
+      if (index > (options.at ?? 0)) {
+        await waitForSignal(
+          session,
+          { kind: PredicateKind.SETTLED, quietMs: STEP_QUIET_MS },
+          STEP_QUIET_BUDGET_MS,
+        );
+      }
+      if (step.invoke !== undefined) {
+        results.push(
+          await runInvokeStep(
+            session,
+            flow,
+            step,
+            index,
+            waitForSignal,
+            signalTimeoutMs,
+            confirmDangerous,
+            sleep,
+            options,
+            index < from,
+          ),
+        );
+        const last = results[results.length - 1];
+        if (last !== undefined && index < from && last.ok) {
+          results.pop();
+        }
+        tell(last);
+        if (last !== undefined && false === last.ok) {
+          break;
+        }
+        index += 1;
+        continue;
+      }
+      if (isPageStep(step)) {
+        const ran = await runPageStep(step, index, {
+          open: options.navigate,
+          send: options.request,
+          checked: index >= from,
+          confirmDangerous,
+          // A navigated page's clock starts at its own connect, so its whole life is the window.
+          judge: (on, expectation) =>
+            assertStepExpect(on, expectation, waitForSignal, waitFor(step), 0),
+          route: currentRoute,
+        });
+        const result = ran.result;
+        if (ran.session !== undefined) {
+          // The page that asked for the load is gone; every later step runs on the one that loaded.
+          session = ran.session;
+        }
+        if (index < from && result.ok && result.drift === undefined) {
+          index += 1;
+          continue;
+        }
+        if (index < from) {
+          result.note = `setup step for resuming at step ${String(from)} failed`;
+        }
+        await options.onStepResult?.(result, flow.name).catch(() => undefined);
+        results.push(result);
+        tell(result);
+        if (!result.ok || result.drift !== undefined) {
+          break;
+        }
+        index += 1;
+        continue;
+      }
+      const label = anchorLabel(step.anchor);
+      /** One sub-step's expect, over the window that sub-step opened. See runSequenceStep. */
+      const budget = waitFor(step);
+      const judgeSubStep = async (expectation: StepExpect, since: number, before?: Baselines) =>
+        (await assertStepExpect(session, expectation, waitForSignal, budget, since, before)) ??
+        lateConsoleDrift(
+          expectation,
+          session.eventsSince(since).filter((e) => e.t >= since),
+        );
+      // The page this step runs on (the journey's "which page") — captured before the action.
+      const page = currentRoute(session);
+      // This step's event-time floor, and (as act_and_wait) what `unchanged` and kin compare with.
+      const cursorBefore = session.elapsed();
+      const baselines = index < from ? undefined : await captureBaselines(session, step.expect);
+      const subSteps = step.steps;
+      // Traced per step, so a slow replay says WHICH step and which anchor kind spent the time. The
+      // per-step `durationMs` below is what the agent gets back; this is what a developer profiling
+      // the replay engine gets, nested under the tool call with the browser round-trips beneath it.
+      const result: FlowStepResult = await span(
+        'flow.step',
+        { index, anchor: step.anchor.kind, label },
+        async () => {
+          if (isDegradedAnchor(step.anchor)) {
+            // Never QUERY the sentinel — it marks "no anchor was determined", not an element to find.
+            return degradedStepResult(step, index, label);
+          }
+          if (subSteps === undefined && isDocumentPressStep(step)) {
+            // A document-key press: dispatched with no ref, as it ran live (#1559).
+            return actOnResolvedRef(session, step, index, label, '', confirmDangerous);
+          }
+          if (subSteps !== undefined && subSteps.length > 0) {
+            return runSequenceStep(
+              session,
+              step,
+              index,
+              subSteps,
+              confirmDangerous,
+              sleep,
+              dynamic,
+              index < from ? undefined : judgeSubStep,
+            );
+          }
+          if (step.anchor.kind === AnchorKind.SIGNAL) {
+            return runSignalStep(
+              session,
+              step,
+              index,
+              label,
+              waitForSignal,
+              waitFor(step),
+              replayFloor,
+            );
+          }
+          if (step.anchor.kind === AnchorKind.COMPONENT) {
+            return runComponentStep(session, step, index, step.anchor, confirmDangerous, sleep);
+          }
+          if (step.anchor.kind === AnchorKind.ROLE) {
+            // Named or nameless, a role anchor resolves by role. The degraded placeholder and the
+            // document-key press were handled above, so what reaches here addresses a real control:
+            // a nameless one (an icon-only button) by its position among nameless controls of its
+            // role. It used to fall through to the testid path, which queried the ROLE as a testid
+            // and answered `testid "button" not found` on a working page.
+            return runRoleStep(session, step, index, step.anchor, confirmDangerous, sleep);
+          }
+          return runTestidStep(session, step, index, label, dynamic, confirmDangerous, sleep);
+        },
+      );
+      // Once the anchor resolved and the action ran, the step's own expect is evaluated — signal, net,
+      // console and store truth alike — deterministically, in the same cheap replay loop, with no LLM.
+      /*
+       * The step's own expect. A sub-step's expect was judged by the sequence runner, in the window
+       * of that sub-step, as the live `act_sequence` path judges it.
+       *
+       * `classifyFlowAssertions` walks act_sequence sub-steps and counts an expect on either level,
+       * and this and what replay enforces must move together, or "the difference is a false green or
+       * a lost verification". Judged here, at the end, a route expect on a middle sub-step failed
+       * once a later one moved on, and a later claim could pass on an earlier sub-step's request.
+       */
+      const declared = [step.expect, ...(step.steps ?? []).map((sub) => sub.expect)].filter(
+        (expectation): expectation is NonNullable<FlowStep['expect']> => expectation !== undefined,
+      );
+      const own = step.expect === undefined ? [] : [step.expect];
+      // A setup step's consequence is not checked: it is re-driven to get somewhere, not to prove it.
+      const checked = index < from ? [] : own;
+      for (const expectation of checked) {
+        if (!result.ok || result.drift !== undefined) {
+          break;
+        }
+        const expectDrift = await assertStepExpect(
+          session,
+          expectation,
+          waitForSignal,
+          waitFor(step),
+          cursorBefore,
+          baselines,
+        );
+        if (expectDrift !== undefined) {
+          result.ok = false;
+          result.drift = expectDrift;
+        }
+      }
+      if (page !== undefined) {
+        result.page = page;
+      }
+      const endPage = currentRoute(session);
+      if (endPage !== undefined && endPage !== page) {
+        result.endPage = endPage;
+      }
+      const windowEvents = session.eventsSince(cursorBefore).filter((e) => e.t >= cursorBefore);
+      const loadSince = 0 === index ? options.loadSince : undefined;
+      const loadEvents =
+        loadSince === undefined
+          ? []
+          : session.eventsSince(loadSince).filter((e) => e.t < cursorBefore);
+      const consequence = summarizeConsequence(windowEvents);
+      if (consequence !== undefined) {
+        result.consequence = consequence;
+      }
+      const consoleErrors = consoleErrorsIn(windowEvents);
+      if (consoleErrors !== undefined) {
+        result.consoleErrors = consoleErrors;
+      }
+      for (const expectation of checked) {
+        if (!result.ok || result.drift !== undefined) {
+          break;
+        }
+        const late =
+          lateConsoleDrift(expectation, windowEvents) ?? loadDrift(expectation, loadEvents);
+        if (late !== undefined) {
+          result.ok = false;
+          result.drift = late;
+        }
+      }
+      // Per-step wall time is NOT shipped: it is `window.until - window.since`, computed from two numbers
+      // the next line already puts in the same object, under the same emission condition. A step used to
+      // carry the subtraction AND both operands, on every step of every replay.
+      const cursorAfter = session.elapsed();
+      // ONE builder, shared with the live act path, so a driven step and a replayed one describe what
+      // happened in identical words rather than in two vocabularies that agree by coincidence.
+      const effect = stepEffect(
+        windowEvents,
+        { since: cursorBefore, until: cursorAfter },
+        // A failure the step declared is its expected result, as it is on the live path. The reads
+        // that finished before the step let a background read that fails on every tick be left
+        // alone, instead of being blamed on each step it happens to fall inside.
+        {
+          ...appScope(session),
+          declared,
+          before: session
+            .eventsSince(0)
+            .filter((e) => e.t < cursorBefore && e.type === EventType.NET_REQUEST),
+        },
+      );
+      // "Never settled" is decided once the replay is over, by the whole-span pass (flow-cross-step).
+      const stepOwn = stepContradictions(effect.contradictions ?? []);
+      delete effect.contradictions;
+      Object.assign(result, effect, 0 === stepOwn.length ? {} : { contradictions: stepOwn });
+      /*
+       * A prefix step is setup and is not reported -- UNLESS it failed.
+       *
+       * A failure there means the resume never reached the step it was asked to resume from, and the
+       * run did not start where the caller will read it as having started. Swallowing it would turn
+       * "I could not get there" into "I got there and it was fine".
+       */
+      // `tool` is dropped HERE rather than at the ten places that set it, so a new step runner cannot
+      // forget the rule and quietly re-introduce the cost. Spelled out only when it is NOT the default.
+      if (FlowStepTool.ACT === result.tool) {
+        delete result.tool;
+      }
+      if (index < from && result.ok && result.drift === undefined) {
+        index += 1;
+        continue;
+      }
+      if (index < from) {
+        result.note = `setup step for resuming at step ${String(from)} failed`;
+      }
+      await options.onStepResult?.(result, flow.name).catch(() => undefined);
+      results.push(result);
+      tell(result);
+      // Under `sweep`, a failure whose action still RAN does not stop the run — the page is where the
+      // step left it, so the next step is as meaningful as it was going to be. Anything else halts.
+      const sweepPast =
+        true === options.sweep &&
+        result.drift !== undefined &&
+        isConsequenceDrift(result.drift.reasonKind);
+      if (!sweepPast && (result.drift !== undefined || !result.ok)) {
+        break;
+      }
+      index += 1;
+    }
+    // And once after the last step: a page can satisfy the last expect at once and finish its own
+    // work after (a sort header marks itself, then fetches the rows). The journey is judged next.
+    if (results.length > 0) {
+      await waitForSignal(
+        session,
+        { kind: PredicateKind.SETTLED, quietMs: STEP_QUIET_MS },
+        STEP_QUIET_BUDGET_MS,
+      );
+    }
+  } catch (error: unknown) {
+    if (!isDocumentGoneError(error)) {
+      throw error;
+    }
+    throw new DocumentLostDuringReplay(results, index, error);
+  }
+  return results;
+}

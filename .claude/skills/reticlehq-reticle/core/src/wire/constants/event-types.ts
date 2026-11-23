@@ -1,0 +1,263 @@
+/**
+ * The event vocabulary: every normalized type the ring buffer can hold.
+ *
+ * Split out of `constants.ts` when that file crossed the 1000-line cap while gaining a channel for
+ * form fields. Cohesive on its own terms, and the most-read list in the contract: this is the set an
+ * observer produces, a predicate reasons over and a replayed step's digest counts, and each member
+ * carries the argument for why that channel exists at all.
+ *
+ * Re-exported from `constants.ts`, so `EventType` stays one import path for everyone outside core.
+ */
+export const EventType = {
+  DOM_ADDED: 'dom.added',
+  DOM_REMOVED: 'dom.removed',
+  DOM_ATTR: 'dom.attr',
+  DOM_TEXT: 'dom.text',
+  NET_REQUEST: 'net.request',
+  NET_PENDING: 'net.pending',
+  /**
+   * A fetch or XHR that the browser recorded in resource timing, and that no patched transport saw.
+   *
+   * The app sent it through a `fetch` reference it saved before Reticle patched `fetch`. It is NOT a
+   * `net.request`: it has no method, and its status is only a hint (0 cross-origin without
+   * `Timing-Allow-Origin`). A second record for one call would also raise a false duplicate. It
+   * exists so a `net` miss over its URL reads `unknown`, not `no`.
+   * `data: { url, urlRaw?, initiator, status? }`.
+   */
+  NET_UNPATCHED: 'net.unpatched',
+  /** An SSE (EventSource) or WebSocket frame — a message on a long-lived streaming connection. */
+  NET_STREAM: 'net.stream',
+  /** A web-perf metric a screenshot can't verify: LCP, cumulative layout shift, or a long task. */
+  PERF: 'perf',
+  ROUTE_CHANGE: 'route.change',
+  CONSOLE_LOG: 'console.log',
+  CONSOLE_WARN: 'console.warn',
+  CONSOLE_ERROR: 'console.error',
+  CONSOLE_INFO: 'console.info',
+  CONSOLE_DEBUG: 'console.debug',
+  ERROR_UNCAUGHT: 'error.uncaught',
+  VISIBLE_SHOWN: 'visible.shown',
+  ANIM_START: 'anim.start',
+  ANIM_END: 'anim.end',
+  SCROLL_POSITION: 'scroll.position',
+  REVEAL_SHOWN: 'reveal.shown',
+  SIGNAL: 'signal',
+  STATE_CHANGE: 'state.change',
+  /** a write to localStorage/sessionStorage/cookies — `data: { area, key, old?, new? }` (values redacted). */
+  STORAGE_CHANGE: 'storage.change',
+  /** page-level visibility/focus health (distinct from element-level VISIBLE_*). */
+  PAGE_HEALTH: 'page.health',
+  /**
+   * synthetic: the page called window.open, so the consequence of what was just clicked may live in
+   * another browsing context this one cannot observe (an OAuth popup is the archetype).
+   * `data: { href }` — the URL the page asked to open, when it named one.
+   */
+  CONTEXT_OPENED: 'context.opened',
+  /**
+   * The app opened a native `alert`/`confirm`/`prompt` while Reticle was driving it.
+   *
+   * Recorded because Reticle ANSWERS these rather than letting them block — a native dialog halts
+   * the main thread, and the SDK's own message pump is on that thread, so one `confirm` behind a
+   * driven click made the tab permanently unresponsive with no recovery from inside the session.
+   * Answering silently would trade a wedge for an invisible one, so the question the app asked, and
+   * the answer given, ride out as an event.
+   */
+  DIALOG_OPENED: 'dialog.opened',
+  /** aggregated React commits over a throttle window (dev builds) — `data: { commits }`. Commit storms /
+   * wasted re-renders show up here without a per-render flood. */
+  RENDER_COMMIT: 'render.commit',
+  /** element focus moved — `data: { to, from, toBody }`. Focus dropping to body after an act is a regression. */
+  FOCUS_CHANGE: 'focus.change',
+  /**
+   * a form field's value moved — `data: { field, kind, value?, checked?, previous?, previousChecked?, redacted?, length }`.
+   *
+   * The DOM observer never saw this: `value` is in its attribute allowlist, but React and every
+   * controlled input set the PROPERTY, so `MutationObserver` does not fire. `value` is omitted and
+   * `redacted` set for a password, a sensitive name, or a payment autocomplete hint; `length` is
+   * always present, because "it was wiped" is assertable without carrying anybody's data.
+   * `checked` is the checkbox/radio property (`value` there is the HTML value, usually `"on"`).
+   * `kind: "settled"` is a read after the action's handlers; `previous` / `previousChecked` are
+   * the pre-action reading, so a restore is distinguishable from a render.
+   */
+  FIELD_CHANGE: 'field.change',
+  /** browser → bridge: a human recording compiled in-page. */
+  FLOW_RECORDED: 'flow.recorded',
+  /** synthetic: browser transport queue overflowed; events were dropped. `data: { dropped: number }`. */
+  TRANSPORT_OVERFLOW: 'transport.overflow',
+  /**
+   * synthetic: a per-channel cap truncated a batch (e.g. a DOM mutation flood). `data: { channel, dropped }`.
+   * Marks downstream rollups/envelopes as built on incomplete data — a ledger that lies at scale is worse
+   * than no ledger, so truncation is never silent.
+   */
+  TRUNCATED: 'truncated',
+  /**
+   * synthetic: the SDK detected a region it CANNOT observe (a cross-origin iframe, a closed shadow root).
+   * `data: { kind: BlindSpotKind, count }`. Surfaced on results as `coverage: partial` so a green never
+   * implies it saw everything.
+   */
+  BLIND_SPOT: 'blind-spot',
+  /** synthetic: the SDK ITSELF failed (an observer threw). `data: { site, message, errorType }`.
+   *  Rides the existing bridge — no outbound request. See browser/observers/sdk-failure.ts. */
+  SDK_FAILED: 'sdk.failed',
+  /**
+   * synthetic (driven only): CDP/Playwright-authoritative network detail for a response the in-page
+   * fetch/XHR wrapper also saw — full response headers + authoritative status/mimeType the page-side
+   * wrapper can't reach. `data: { url, method?, status, headers, resourceType? }`. Merged onto the
+   * matching in-page NET_REQUEST so the driven view never loses fidelity to an outside-in tool.
+   */
+  NET_DETAIL: 'net.detail',
+  /** SDK response body captured after headers. Matched to its NET_REQUEST by id, method and URL. */
+  NET_RESPONSE_BODY: 'net.response-body',
+  /**
+   * Live-control: browser → bridge. A human acted on the presenter panel.
+   * `data: { kind: HumanControlKind; text?: string }`. Rides the existing EventMessage.
+   */
+  HUMAN_CONTROL: 'human.control',
+  /**
+   * Human review: browser → bridge. A human pinned a mistake to an element on the running page
+   * (the "annotate the bug where you see it" loop). `data` narrows to HumanMarkDataSchema — a note
+   * plus a re-resolvable element anchor (and its source file:line when the framework stamped one) so
+   * the agent that drains the mark knows exactly which element and which source to fix.
+   */
+  HUMAN_MARK: 'human.mark',
+  /**
+   * The app produced a FILE — a Blob handed to `URL.createObjectURL`, usually saved by clicking an
+   * anchor with `download`. `data: { filename?, mimeType, bytes, lines?, preview? }`. The one artifact
+   * class no outside-the-browser tool can inspect: it never crosses the network, so there is no
+   * request to intercept. See `observers/download.ts` for the defect that motivated it.
+   */
+  DOWNLOAD: 'download',
+  /**
+   * Browser -> bridge: a person used the HUD — pressed a control, or the HUD changed how it sits.
+   * `data` narrows to HudUseDataSchema: names only. Telemetry, not evidence: the session takes it
+   * off the wire before the buffer, so no verdict, settle or agent read ever sees it.
+   */
+  HUD_USED: 'hud.used',
+  /**
+   * A `<video>` or `<audio>` changed playback state: `data: { event, tag, currentTime, duration?,
+   * readyState, paused }`. The event's own `t` orders it against the network, which is what a media
+   * defect ("Ready before the response arrived") is: an ordering in time no DOM count shows.
+   */
+  MEDIA_STATE: 'media.state',
+  /**
+   * A `<canvas>` drew something different: `data: { digest, width, height, mean }`. A hash of a
+   * 16x16 sample of its pixels and their mean colour, emitted only when the digest changes. What a
+   * canvas shows never reaches the DOM, so without this a canvas app's output is invisible.
+   */
+  CANVAS_DIGEST: 'canvas.digest',
+} as const;
+export type EventType = (typeof EventType)[keyof typeof EventType];
+
+/** The media events `MEDIA_STATE` reports. Not `timeupdate`: it fires several times a second. */
+export const MediaEvent = {
+  PLAY: 'play',
+  PLAYING: 'playing',
+  PAUSE: 'pause',
+  SEEKED: 'seeked',
+  ENDED: 'ended',
+  LOADED_DATA: 'loadeddata',
+  CAN_PLAY: 'canplay',
+  WAITING: 'waiting',
+  ERROR: 'error',
+} as const;
+export type MediaEvent = (typeof MediaEvent)[keyof typeof MediaEvent];
+
+/** What took a `CANVAS_DIGEST`: the 500 ms poll, or the end of an act (inside its window). */
+export const CanvasTrigger = {
+  POLL: 'poll',
+  ACT: 'act',
+} as const;
+export type CanvasTrigger = (typeof CanvasTrigger)[keyof typeof CanvasTrigger];
+
+/**
+ * Wire payload vocabularies. The browser observers EMIT these values and the schemas below VALIDATE
+ * them, so a browser-side typo (`'SSE'`) would pass tsc and fail only here, at runtime. Each is a const
+ * object — the browser imports the members, the schema derives its z.nativeEnum from the same object —
+ * so emitter and validator are one source. Kept here, not beside the schemas in `event-payloads.ts`:
+ * the browser imports only these, so a page does not download every payload schema.
+ */
+/**
+ * `FETCH` is a response whose BODY is still arriving after the request itself resolved.
+ *
+ * `fetch` settles at HEADERS, so a streamed response is reported complete while the server is still
+ * writing. Measured on a Next.js App Router page: the RSC payload's NET_REQUEST landed 16 ms in, the
+ * shell rendered, and the Suspense boundary's content arrived 889 ms later — a window in which
+ * nothing at all was observed, so `settled` passed while the fallback was still on screen.
+ */
+export const StreamTransport = { SSE: 'sse', WS: 'ws', FETCH: 'fetch' } as const;
+export type StreamTransport = (typeof StreamTransport)[keyof typeof StreamTransport];
+
+/** `CLOSE` pairs with `OPEN`: until it arrives, the body is still being written. */
+export const StreamDirection = { OPEN: 'open', IN: 'in', OUT: 'out', CLOSE: 'close' } as const;
+export type StreamDirection = (typeof StreamDirection)[keyof typeof StreamDirection];
+
+export const ScrollDirection = { UP: 'up', DOWN: 'down' } as const;
+
+/**
+ * How urgently a live region announces its text, as ARIA defines it. `role="alert"` is assertive,
+ * and `role="status"` is polite. An explicit `aria-live` value replaces the value of the role.
+ */
+export const LivePoliteness = { ASSERTIVE: 'assertive', POLITE: 'polite' } as const;
+export type LivePoliteness = (typeof LivePoliteness)[keyof typeof LivePoliteness];
+export type ScrollDirection = (typeof ScrollDirection)[keyof typeof ScrollDirection];
+
+/**
+ * How a `route.change` happened.
+ *
+ * `push` is `history.pushState`, `replace` is `history.replaceState`, and `pop` is the session
+ * history moving under the page (`popstate`, or a `hashchange` the page did not push). A
+ * same-pathname replace records UI state in the URL; it is not a navigation to a new view.
+ */
+export const RouteChangeHow = {
+  PUSH: 'push',
+  REPLACE: 'replace',
+  POP: 'pop',
+} as const;
+export type RouteChangeHow = (typeof RouteChangeHow)[keyof typeof RouteChangeHow];
+
+/** Wire field on `route.change` carrying a `RouteChangeHow`. */
+export const ROUTE_CHANGE_HOW_FIELD = 'how';
+
+/**
+ * Why a `field.change` was emitted.
+ *
+ * `input` is a burst of keystrokes and `change` is the commit that ends one — both are the user's
+ * own event, fired before a controlled component restores its DOM property. `settled` is a read of
+ * that property on the frame after the handlers ran. Only a settled read that differs from the
+ * pre-action value is evidence the screen moved.
+ */
+export const FieldChangeKind = {
+  INPUT: 'input',
+  CHANGE: 'change',
+  SETTLED: 'settled',
+} as const;
+export type FieldChangeKind = (typeof FieldChangeKind)[keyof typeof FieldChangeKind];
+
+/**
+ * Wire fields on `field.change` beyond `field` / `kind` / `value` / `length`.
+ *
+ * `checked` is the property a checkbox or radio actually renders; `value` on those is the HTML
+ * value (`"on"`), which does not move when the box is toggled. `previous` and `previousChecked`
+ * are the same reading from before the action, present on a settled event so a consumer can tell
+ * a render from a restore.
+ */
+export const FieldChangeField = {
+  FIELD: 'field',
+  KIND: 'kind',
+  LENGTH: 'length',
+  VALUE: 'value',
+  REDACTED: 'redacted',
+  CHECKED: 'checked',
+  PREVIOUS: 'previous',
+  PREVIOUS_CHECKED: 'previousChecked',
+} as const;
+
+/**
+ * The three readable client-side storage areas.
+ *
+ * `cookies` is plural because that is what the storage tool accepts, what the browser returns and
+ * what the docs publish. This member read `cookie` for as long as it had no callers, which is
+ * exactly how long a name can disagree with every use of it for free.
+ */
+export const StorageArea = { LOCAL: 'local', SESSION: 'session', COOKIE: 'cookies' } as const;
+export type StorageArea = (typeof StorageArea)[keyof typeof StorageArea];

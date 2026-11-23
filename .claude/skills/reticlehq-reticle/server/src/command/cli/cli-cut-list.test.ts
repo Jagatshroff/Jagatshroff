@@ -1,0 +1,305 @@
+import { describe, expect, it } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { REPO_ROOT } from '@/machine/repo-root.js';
+import { knownCommand, LOCAL_COMMANDS, parseCliArgs } from './cli-parse.js';
+import {
+  CLOUD_COMMANDS,
+  REMOVED_COMMANDS,
+  RENAMED_COMMANDS,
+  renamedCommandFor,
+  renamedNote,
+} from './cli-parse-grammar.js';
+import { CLI_USAGE, CLI_USAGE_ALL, DOCUMENTED_COMMANDS, renderHelp } from './cli-usage.js';
+import { statusLines } from './status/status-lines.js';
+
+/**
+ * The command surface: a short help page, old names that still run, removed names that say so.
+ */
+const PORT = 4400;
+const SHORT_HELP = [
+  'init',
+  'connect',
+  'try',
+  'verify',
+  'compare',
+  'gate',
+  'status',
+  'doctor',
+  'open',
+  'stop',
+  'update',
+  'logout',
+  'feedback',
+  'telemetry',
+];
+const HIDDEN = ['mcp', 'serve', 'drive', 'setup', 'config'];
+const commandLines = (page: string): string[] =>
+  page
+    .split('\n')
+    .filter((l) => /^ {2}\S/.test(l))
+    .map((l) => l.trim().split(/\s+/)[0] ?? '');
+
+describe('reticle --help', () => {
+  it('lists exactly the everyday commands, one line each', () => {
+    expect(commandLines(CLI_USAGE).sort()).toEqual([...SHORT_HELP].sort());
+  });
+
+  it('is short', () => {
+    expect(CLI_USAGE.split('\n').length).toBeLessThanOrEqual(30);
+  });
+
+  it('help all adds the hidden commands', () => {
+    const all = commandLines(CLI_USAGE_ALL);
+    for (const cmd of [...SHORT_HELP, ...HIDDEN, 'report', 'sync', 'runs']) {
+      expect(all, cmd).toContain(cmd);
+    }
+  });
+
+  it('every documented command is one the CLI runs', () => {
+    const runnable = new Set([...LOCAL_COMMANDS, ...CLOUD_COMMANDS]);
+    for (const cmd of DOCUMENTED_COMMANDS) {
+      expect(runnable.has(cmd), cmd).toBe(true);
+    }
+  });
+
+  it('no removed or renamed name is advertised', () => {
+    for (const cmd of [...REMOVED_COMMANDS.keys(), ...RENAMED_COMMANDS.keys()]) {
+      expect(commandLines(CLI_USAGE_ALL), cmd).not.toContain(cmd);
+    }
+  });
+
+  it('parses help topics', () => {
+    expect(parseCliArgs(['--help'], PORT)).toEqual({ kind: 'help' });
+    expect(parseCliArgs(['help'], PORT)).toEqual({ kind: 'help' });
+    expect(parseCliArgs(['help', 'all'], PORT)).toEqual({ kind: 'help', topic: 'all' });
+    expect(parseCliArgs(['--help', 'all'], PORT)).toEqual({ kind: 'help', topic: 'all' });
+    expect(parseCliArgs(['help', 'init'], PORT)).toEqual({ kind: 'help', topic: 'init' });
+    expect(parseCliArgs(['init', '--help'], PORT)).toEqual({ kind: 'help', topic: 'init' });
+  });
+
+  it('a command page carries the detail the short page dropped', () => {
+    expect(renderHelp('init')).toContain('--files-only');
+    expect(renderHelp('verify')).toContain('http-transport');
+    expect(renderHelp(undefined)).toBe(CLI_USAGE);
+    expect(renderHelp('all')).toBe(CLI_USAGE_ALL);
+  });
+
+  // `stop` asks the daemon over loopback first and signals only when that fails; the page said it
+  // only signalled the pid.
+  it('stop says it asks the daemon before it sends a signal', () => {
+    expect(renderHelp('stop')).toContain('asks the daemon to stop');
+    expect(renderHelp('stop')).not.toContain('by its recorded pid.');
+  });
+
+  it('init names the score the Harness does not need', () => {
+    expect(renderHelp('init')).toContain('runs at any instrumentation score');
+  });
+
+  it('says --http starts the verify endpoint, and MCP is already on the bridge port', () => {
+    const line = '--http starts the verify endpoint. MCP is already served on the bridge port.';
+    expect(renderHelp('serve')).toContain(line);
+    expect(renderHelp('mcp')).toContain(line);
+  });
+
+  it('an old name answers with the new page and says so', () => {
+    const page = renderHelp('affected', RENAMED_COMMANDS);
+    expect(page).toContain('usage:  reticle gate');
+    expect(page).toContain('`reticle affected` is now `reticle gate --list`');
+  });
+
+  it('each survivor page names the flag that replaced an old command', () => {
+    expect(renderHelp('gate')).toContain('--list');
+    expect(renderHelp('update')).toContain('--rollback');
+    expect(renderHelp('serve')).toContain('--restart');
+    expect(renderHelp('status')).toContain('license');
+  });
+});
+
+describe('renamed commands still run', () => {
+  it('stop --force is what kill was', () => {
+    expect(parseCliArgs(['stop', '--force'], PORT)).toEqual({
+      kind: 'kill',
+      port: PORT,
+      force: false,
+    });
+  });
+
+  it('gate --list does what affected did', () => {
+    const affected = { kind: 'affected', files: ['src/a.ts'] };
+    expect(parseCliArgs(['gate', '--list', 'src/a.ts'], PORT)).toEqual(affected);
+    expect(parseCliArgs(['affected', 'src/a.ts'], PORT)).toEqual(affected);
+    expect(parseCliArgs(['gate', '--list', '--since', 'main'], PORT)).toEqual({
+      kind: 'affected',
+      files: [],
+      since: 'main',
+    });
+    expect(parseCliArgs(['gate', 'src/a.ts'], PORT)).toMatchObject({ kind: 'gate' });
+  });
+
+  it('update --rollback does what rollback did', () => {
+    expect(parseCliArgs(['update', '--rollback'], PORT)).toEqual({ kind: 'rollback' });
+    expect(parseCliArgs(['rollback'], PORT)).toEqual({ kind: 'rollback' });
+    expect(parseCliArgs(['update'], PORT)).toEqual({ kind: 'update' });
+  });
+
+  it('serve --restart does what restart did, --force included', () => {
+    const restart = { kind: 'restart', port: 4500, force: false };
+    expect(parseCliArgs(['serve', '--restart', '--port', '4500'], PORT)).toEqual(restart);
+    expect(parseCliArgs(['restart', '--port', '4500'], PORT)).toEqual(restart);
+    expect(parseCliArgs(['serve', '--restart', '--force'], PORT)).toEqual({
+      kind: 'restart',
+      port: PORT,
+      force: true,
+    });
+    // `--force` belongs to the restart; alone it names the flag it needs, not "unknown argument".
+    expect(parseCliArgs(['serve', '--force'], PORT)).toEqual({
+      kind: 'error',
+      message: `--force works only with --restart`,
+    });
+    expect(parseCliArgs(['restart', '--force'], PORT)).toEqual({
+      kind: 'restart',
+      port: PORT,
+      force: true,
+    });
+  });
+
+  it('license still runs, and its note points at status', () => {
+    expect(parseCliArgs(['license'], PORT)).toEqual({ kind: 'license' });
+    expect(renamedCommandFor(['license'])).toBe('status');
+  });
+
+  it('each old name is still dispatched', () => {
+    const runnable = new Set([...LOCAL_COMMANDS, ...CLOUD_COMMANDS]);
+    for (const cmd of RENAMED_COMMANDS.keys()) {
+      expect(runnable.has(cmd), cmd).toBe(true);
+    }
+  });
+
+  it('the note is one plain line, dimmed only when asked', () => {
+    expect(renamedNote('rollback', 'update --rollback', false)).toBe(
+      '`reticle rollback` is now `reticle update --rollback`',
+    );
+    expect(renamedNote('rollback', 'update --rollback', true)).toContain('\u001b[2m');
+  });
+});
+
+describe('removed commands say so and fail', () => {
+  // The names renamed one release earlier have had their release. Each one now points at the command that replaced it.
+  it.each([
+    ['kill', 'reticle stop --force'],
+    ['login', 'reticle connect'],
+    ['link', 'reticle connect'],
+    ['project', 'reticle connect --project'],
+    ['whoami', 'reticle status'],
+    ['push', 'reticle sync'],
+    ['regression', 'reticle runs regression'],
+    ['share', 'reticle runs share'],
+    ['issues', 'reticle runs issues'],
+    ['memory', 'reticle runs memory'],
+  ])('%s points at %s', (cmd, survivor) => {
+    const parsed = parseCliArgs([cmd], PORT);
+    expect('removed' === parsed.kind && parsed.message).toContain(survivor);
+    expect(CLOUD_COMMANDS).not.toContain(cmd);
+    expect(LOCAL_COMMANDS).not.toContain(cmd);
+  });
+
+  it.each([...REMOVED_COMMANDS.keys()])('%s', (cmd) => {
+    for (const argv of [[cmd], [cmd, '--help']]) {
+      const parsed = parseCliArgs(argv, PORT);
+      expect(parsed.kind).toBe('removed');
+      expect('removed' === parsed.kind && parsed.message).toContain('was removed in this version');
+    }
+    // Still named in telemetry, so the people typing it are visible.
+    expect(knownCommand(cmd)).toBe(cmd);
+  });
+});
+
+/**
+ * The text the product prints names no removed or renamed command.
+ *
+ * The defect it catches: 3.8 removed `identify`, but the first answer to an agent on an unwired
+ * project still told it to run `npx @reticlehq/server identify`, and that command only says it was
+ * removed. `reticle login` and `kill --port` stayed in refusal text the same way. The help page is
+ * checked above; this reads the string lines of the shipped source, because those strings are
+ * written far from the command table.
+ */
+describe('shipped text names only commands that still exist', () => {
+  const OLD = new Set([...REMOVED_COMMANDS.keys(), ...RENAMED_COMMANDS.keys()]);
+  const COMMAND = /(?:\breticle|@reticlehq\/server(?:@[\w.-]+)?) ([a-z]+)\b/g;
+  // An old command may name itself: its own usage line, and the help line that says it is an alias.
+  const SELF_REFERENCE = /usage: reticle|is the same command/;
+  const isComment = (line: string): boolean => /^(\*|\/\/|\/\*)/.test(line);
+
+  it('in server, init and core source', () => {
+    const files = execFileSync(
+      'git',
+      ['ls-files', 'server/src/*.ts', 'init/src/*.ts', 'core/src/*.ts'],
+      { cwd: REPO_ROOT, encoding: 'utf8' },
+    )
+      .split('\n')
+      .filter((file) => file.length > 0 && !file.endsWith('.test.ts'));
+    expect(files.length, 'no source file was read').toBeGreaterThan(100);
+    const found: string[] = [];
+    for (const file of files) {
+      readFileSync(join(REPO_ROOT, file), 'utf8')
+        .split('\n')
+        .forEach((raw, i) => {
+          const line = raw.trim();
+          if (isComment(line) || SELF_REFERENCE.test(line)) {
+            return;
+          }
+          for (const m of line.matchAll(COMMAND)) {
+            if (OLD.has(m[1] ?? '')) {
+              found.push(`${file}:${String(i + 1)} ${m[0]}`);
+            }
+          }
+        });
+    }
+    expect(found).toEqual([]);
+  });
+});
+
+describe('status says which license is active', () => {
+  it('names an active or rejected license', () => {
+    const out = statusLines({
+      running: false,
+      license: { status: 'active', detail: 'licensed to Acme (team)' },
+    }).join('\n');
+    expect(out).toContain('license');
+    expect(out).toContain('licensed to Acme (team)');
+  });
+
+  it('says nothing when no key is set', () => {
+    for (const status of ['missing', 'eval']) {
+      const out = statusLines({ running: false, license: { status, detail: 'set a key' } });
+      expect(out.join('\n')).not.toContain('set a key');
+    }
+  });
+});
+
+describe('status says who is signed in', () => {
+  it('names the account and the linked project', () => {
+    const out = statusLines({ running: false, signedInAs: 'Acme', linkedProject: 'shop' }).join(
+      '\n',
+    );
+    expect(out).toContain('signed in as Acme');
+    expect(out).toContain('shop');
+  });
+
+  it('points a signed-out reader at connect', () => {
+    const out = statusLines({ running: false, signedInAs: null, linkedProject: null }).join('\n');
+    expect(out).toContain('reticle connect');
+  });
+});
+
+describe('the renamed-command note', () => {
+  it('names the new command for an old one', () => {
+    expect(renamedCommandFor(['affected'])).toBe('gate --list');
+  });
+
+  it('says nothing to a request for help', () => {
+    expect(renamedCommandFor(['restart', '--help'])).toBeUndefined();
+  });
+});

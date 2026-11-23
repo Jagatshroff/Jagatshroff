@@ -1,0 +1,396 @@
+# Reticle, in one line, on a stock Windows box:
+#
+#   irm https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.ps1 | iex
+#
+# The twin of install.sh, and it exists because `sh` is not on a stock Windows machine at all:
+# without this, the majority platform is told to install Git Bash or WSL before it can run the
+# command every doc shows. The prototype next door shipped both a .sh and a .cmd for the same
+# reason; this is that decision applied to the installer.
+#
+# The pair is safe because there is almost nothing to drift. Both launchers do the same three
+# things, the first two of which CANNOT be Node, because Node may not exist yet:
+#
+#   1. is there a usable `node`?
+#   2. npm install -g @reticlehq/server
+#   3. hand every other decision to `reticle setup install`
+#
+# Everything else -- writing config, registering the MCP server with the agents on this machine,
+# saying what happened -- is `reticle setup install`, which is Node and exists once. If either
+# launcher ever needs a fifth step, it belongs in that command, not in here twice.
+#
+# ZERO HUMAN INPUT. Nothing is asked. The common case is an agent following a link somebody pasted,
+# and a prompt there is a hang nobody sees.
+
+$ErrorActionPreference = 'Stop'
+
+$ReticlePkg = '@reticlehq/server'
+# The floor the package declares in `engines`. Repeated here because nothing can read package.json
+# before Node exists; `engines` stays the source of truth and this is the pre-Node echo of it.
+$NodeMinMajor = 20
+# See install.sh: engines.node is >=20.11, so a major-only check admits 20.0-20.10 and defers the
+# refusal to npm, after this script has already told the user they were fine.
+$NodeMinMinor = 11
+$StateDir = if ($env:RETICLE_STATE_DIR) { $env:RETICLE_STATE_DIR } else { Join-Path $HOME '.reticle' }
+# Which route installed Reticle, declared rather than guessed: every `reticle` this script runs
+# carries it, and the CLI remembers the first one it sees. A channel that wraps this script and
+# declared itself already keeps its own value.
+if (-not $env:RETICLE_INSTALL_SOURCE) { $env:RETICLE_INSTALL_SOURCE = 'install_script' }
+
+function Say([string]$Message) { [Console]::Error.WriteLine($Message) }
+
+# Colour only for a person: a console, NO_COLOR unset. Console colours rather than escape codes,
+# because a stock Windows PowerShell console does not draw escape codes.
+function Paint([bool]$Redirected) { return (-not $Redirected) -and (-not $env:NO_COLOR) }
+function Write-Colored([System.IO.TextWriter]$Stream, [bool]$Redirected, [string]$Color, [string]$Message) {
+  if (Paint $Redirected) {
+    $was = [Console]::ForegroundColor
+    [Console]::ForegroundColor = $Color
+    $Stream.WriteLine($Message)
+    [Console]::ForegroundColor = $was
+  } else {
+    $Stream.WriteLine($Message)
+  }
+}
+function Ok([string]$Message) { Write-Colored ([Console]::Error) ([Console]::IsErrorRedirected) 'Green' ([char]0x2713 + " $Message") }
+function Emit([string]$Message) { [Console]::Out.WriteLine($Message) }
+function Out-Colored([string]$Color, [string]$Message) { Write-Colored ([Console]::Out) ([Console]::IsOutputRedirected) $Color $Message }
+
+# `irm | iex` runs this file inside the user's own PowerShell session, where `exit` closes that
+# session: the error, or the success text and its next step, vanish with the window. Run as a file
+# (`powershell -File install.ps1`), `exit` is right, because the process exit code is the contract.
+# So: exit when this is a file, otherwise unwind to the bottom of the file with the code set.
+# Redirected output means nobody is reading a window: an agent ran `powershell -Command "irm | iex"`
+# and reads the process exit code, which a non-exiting unwind leaves at 0 even on failure.
+$script:ReticleExitCode = 0
+function Quit([int]$Code) {
+  if ($PSCommandPath -or [Console]::IsOutputRedirected -or [Console]::IsErrorRedirected) { exit $Code }
+  $script:ReticleExitCode = $Code
+  throw 'reticle-exit'
+}
+
+# `npm` and `reticle` resolve to their `.ps1` shims first, and the default Windows execution policy
+# refuses to run a .ps1 ("running scripts is disabled on this system"), so a stock machine failed
+# right after the Node check. The `.cmd` shims sit beside them and are not subject to the policy.
+function Native([string]$Name) {
+  if (Get-Command "$Name.cmd" -ErrorAction SilentlyContinue) { return "$Name.cmd" }
+  return $Name
+}
+
+# Takes the lines as an array rather than one here-string. Here-strings in this file broke on the
+# backticks in `node`/`reticle`, which PowerShell reads as escapes, and a launcher that does not
+# parse is worse than one that is plain.
+function Die([string[]]$Lines) {
+  Say ''
+  Write-Colored ([Console]::Error) ([Console]::IsErrorRedirected) 'Red' ([char]0x2717 + ' Reticle was not installed.')
+  Say ($Lines -join [Environment]::NewLine)
+  Quit 1
+}
+
+# The ONE thing this script reports on its own, and only on failure.
+#
+# A pre-Node failure has nobody to emit it -- that is the whole reason for the handoff below. One
+# line on disk means that if the person fixes the cause and installs later, the CLI drains it and
+# the funnel shows a retry after a failure, which is exactly the shape worth seeing.
+function Note-Failure([string]$Step, [string]$Reason) {
+  if ($env:RETICLE_TELEMETRY -eq '0') { return }
+  if ($env:DO_NOT_TRACK) { return }
+  if (Test-Path (Join-Path $StateDir 'telemetry-opt-out')) { return }
+  try {
+    if (-not (Test-Path $StateDir)) { New-Item -ItemType Directory -Force $StateDir | Out-Null }
+    $line = '{{"phase":"install","step":"{0}","status":"failed","reason":"{1}"}}' -f $Step, $Reason
+    # Not Add-Content -Encoding utf8: on Windows PowerShell 5.1 that writes a BOM, and a JSON-lines
+    # reader then rejects the first line.
+    [IO.File]::AppendAllText((Join-Path $StateDir 'install-trace.jsonl'), $line + "`n")
+  } catch {
+    # A machine that cannot take the note is not a reason to fail the install.
+  }
+}
+
+function Check-Node {
+  $node = Get-Command node -ErrorAction SilentlyContinue
+  if (-not $node) {
+    Note-Failure 'runtime_ready' 'no_node'
+    Die @(
+      "Node $NodeMinMajor.$NodeMinMinor+ is required and no 'node' was found.",
+      '',
+      '  winget  winget install OpenJS.NodeJS.LTS',
+      '  any     https://nodejs.org/en/download',
+      '',
+      'Install Node, then run the same command again. Reticle does not install a runtime for you: a piped script that puts a language toolchain on your machine without asking is not something you should run, from us or from anybody.'
+    )
+  }
+  # `node -v` and split HERE, rather than `node -p 'process.versions.node.split(".")[0]'`.
+  #
+  # Two Windows-only traps, both of which reported a perfectly good Node 24 as "too old":
+  # PowerShell strips the inner double quotes before the native command sees them, so node received
+  # `split(.)` and died on a syntax error; and `2>$null` on a native command wraps stderr in an
+  # ErrorRecord, which under $ErrorActionPreference = 'Stop' throws. Passing no quoted argument at
+  # all avoids both, and `v24.21.0` is a shape that does not need a JS expression to read.
+  $major = 0
+  $minor = 0
+  try {
+    $parts = (& node -v).TrimStart('v').Split('.')
+    $major = [int]$parts[0]
+    $minor = [int]$parts[1]
+  } catch { $major = 0; $minor = 0 }
+  if (($major -lt $NodeMinMajor) -or (($major -eq $NodeMinMajor) -and ($minor -lt $NodeMinMinor))) {
+    Note-Failure 'runtime_ready' 'node_too_old'
+    Die @("Node $major.$minor is too old -- Reticle needs $NodeMinMajor.$NodeMinMinor or newer. Install a newer one (winget install OpenJS.NodeJS.LTS, or nodejs.org), then run the same command again.")
+  }
+}
+
+# What the closing tells the person to type: `reticle`, or its full path when the folder it landed
+# in is not on PATH yet, so every printed command works where they read it.
+$script:ReticleBin = 'reticle'
+# Set when that folder was not on PATH: this session gets it, and the next steps say how to keep it.
+$script:PathDir = ''
+$OnWindows = ($PSVersionTable.PSEdition -eq 'Desktop') -or $IsWindows
+
+# npm's global bin: the prefix itself on Windows, `<prefix>/bin` everywhere else.
+function Global-Bin([string]$Prefix) {
+  if ($OnWindows) { return $Prefix }
+  return (Join-Path $Prefix 'bin')
+}
+
+function Npm-Global([string[]]$Extra) {
+  # Native stderr is not a failure signal here; the exit code is. `npm install -g` writes progress
+  # to stderr on a perfectly good install, and under $ErrorActionPreference = 'Stop' Windows
+  # PowerShell 5.1 turns the first stderr line into a terminating error (see Check-Node), so the
+  # preference is relaxed for this one native call.
+  $ErrorActionPreference = 'Continue'
+  # Kept, and printed only on failure: a good install has nothing in it anybody needs to read.
+  $script:NpmOut = & (Native 'npm') install -g @Extra $ReticlePkg 2>&1
+  $rc = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  return $rc
+}
+
+# What npm's failure means on a company network; see install.sh.
+function Npm-Failure {
+  $text = "$script:NpmOut"
+  if ($text -match 'SELF_SIGNED|UNABLE_TO_GET_ISSUER|UNABLE_TO_VERIFY|CERT_') {
+    return 'Something between this machine and npm re-signs HTTPS (a company proxy). Point Node at its certificate: $env:NODE_EXTRA_CA_CERTS = ''C:\path\to\company-ca.pem'' (or npm config set cafile <pem>), then run the same command again.'
+  }
+  if ($text -match 'ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|ECONNRESET|ENETUNREACH') {
+    return 'npm could not reach its registry. Behind a proxy: npm config set proxy http://host:port and npm config set https-proxy http://host:port. On a network that blocks npm, use your company''s mirror: npm config set registry <url>. Then run the same command again.'
+  }
+  return "npm could not install $ReticlePkg. Its output above says why; fix that, then run the same command again."
+}
+
+function Install-Cli {
+  if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+    Note-Failure 'cli_installed' 'no_npm'
+    Die @('npm was not found, and it ships with Node. Reinstall Node from nodejs.org.')
+  }
+  Say "  installing $ReticlePkg (up to a minute on a cold npm cache)"
+  $userPrefix = ''
+  if ((Npm-Global @()) -ne 0) {
+    # A global folder only an administrator can write (Node under Program Files with a custom
+    # prefix, a system package elsewhere). A folder of our own needs no elevation, and nothing else
+    # on the machine changes.
+    if ("$script:NpmOut" -match 'EACCES|EPERM') {
+      $userPrefix = Join-Path $StateDir 'npm'
+      Say "  npm's global folder needs administrator rights here; installing into $userPrefix instead"
+    }
+    if (('' -eq $userPrefix) -or ((Npm-Global @('--prefix', $userPrefix)) -ne 0)) {
+      foreach ($line in $script:NpmOut) { Say "$line" }
+      Note-Failure 'cli_installed' 'npm_install'
+      Die @(Npm-Failure)
+    }
+  }
+  $prefix = $userPrefix
+  if ('' -eq $prefix) {
+    $ErrorActionPreference = 'Continue'
+    $prefix = "$(& (Native 'npm') prefix -g 2>$null)".Trim()
+    $ErrorActionPreference = 'Stop'
+  }
+  $dir = Global-Bin $prefix
+  $shim = @('reticle.cmd', 'reticle') | ForEach-Object { Join-Path $dir $_ } | Where-Object { Test-Path $_ } | Select-Object -First 1
+  $found = Get-Command reticle -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($shim -and ((-not $found) -or ($found.Source -notlike "$dir*"))) {
+    # Installed, and the folder is not on PATH in THIS session: Node installed a minute ago (winget)
+    # leaves the open window's PATH stale, which used to end the install before any agent was
+    # registered. The session gets the folder now; the next steps say how to keep it.
+    $env:PATH = "$dir$([IO.Path]::PathSeparator)$env:PATH"
+    $script:ReticleBin = $shim
+    $script:PathDir = $dir
+  } elseif (-not $found) {
+    Note-Failure 'cli_installed' 'not_on_path'
+    Die @("npm says it installed $ReticlePkg, but no 'reticle' was found on PATH or in $dir.")
+  }
+  Ok "Installed $ReticlePkg"
+}
+
+# The prompt a person pastes into their coding agent; see install.sh, which holds the same copy and
+# the same rules. Fetched, so its wording improves without a release; this copy prints when the
+# fetch is off or fails.
+$AgentPromptUrl = if ($env:RETICLE_AGENT_PROMPT_URL) { $env:RETICLE_AGENT_PROMPT_URL } else { 'https://reticle.sh/install/agent-prompt.v1.json' }
+$FallbackTitle = 'Add Reticle to this project'
+# Lines, not a here-string: here-strings in this file broke on backticks (see Die). Single-quoted,
+# so a backtick is literal and an apostrophe is doubled.
+$FallbackPrompt = @(
+  'Instrument this app with Reticle so its user flows can be verified from inside the running app.',
+  '',
+  '1. In the app''s folder (the one with its package.json), run `reticle init` (or `npx @reticlehq/server init` if `reticle` is not on PATH). Do what its output says, including restarting a dev server that was already running. If the reticle_* tools only load after a restart you cannot do yourself, run `reticle init --relaunch` and follow what it prints.',
+  '2. Run `reticle doctor`. Its coverage row lists what Reticle cannot see yet (missing, not seen yet) and the fix for each. Close every gap this app allows:',
+  '   - signals: call reticle.signal(name, data) where each user-visible outcome is committed (saved, sent, deleted, signed in);',
+  '   - stable test ids: add data-testid to the controls your flows use;',
+  '   - file:line source mapping: keep the Reticle build plugin init added (@reticlehq/vite-plugin, @reticlehq/next or the babel plugin);',
+  '   - app state: if the app has a store, register it with reticle.registerStore(name, store).',
+  '3. Verify one real user flow end to end: drive it with reticle_act_and_wait and give the last step an `until` that names the end state (the signal you added is the strongest). Only verified: "yes" is a pass; "unknown" is not. A passing flow is saved and replays without a model.',
+  '4. Run `reticle doctor` again and close what the verdict revealed.',
+  '5. Run `reticle connect` to sign in, link this project and sync the flow to the dashboard.',
+  '6. Tell me what you changed, which gaps remain and why, the flow you verified and its verdict.'
+) -join "`n"
+
+# The same opt-outs the daemon honours for its notices fetch.
+function Outbound-Off {
+  $telemetry = "$env:RETICLE_TELEMETRY".ToLowerInvariant()
+  if (@('0', 'false', 'off') -contains $telemetry) { return $true }
+  return [bool]($env:DO_NOT_TRACK -and $env:DO_NOT_TRACK -ne '0')
+}
+
+# Every control character but the newline goes, so no escape sequence reaches the terminal, and
+# the bidirectional overrides with them. The text is only ever printed, never run.
+function Clean([string]$Text) {
+  return $Text -replace '[\x00-\x09\x0B-\x1F\x7F-\x9F\u202A-\u202E\u2066-\u2069]', ''
+}
+
+# @(title, prompt), or $null. Nothing fetched is evaluated: it is parsed, checked and printed.
+function Fetch-Prompt {
+  if (Outbound-Off) { return $null }
+  try {
+    $file = Invoke-RestMethod -Uri $AgentPromptUrl -TimeoutSec 3 -UseBasicParsing
+    if ($file -is [string]) { $file = $file | ConvertFrom-Json }
+  } catch {
+    return $null
+  }
+  if ($file -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+  if (-not ($file.version -is [int] -or $file.version -is [long]) -or $file.version -ne 1) { return $null }
+  if ($file.prompt -isnot [string] -or $file.prompt.Length -gt 4000) { return $null }
+  $prompt = (Clean $file.prompt).Trim()
+  if ('' -eq $prompt) { return $null }
+  $title = ''
+  if ($file.title -is [string]) {
+    $title = (Clean $file.title).Replace("`n", ' ').Trim()
+    if ($title.Length -gt 80) { $title = $title.Substring(0, 80) }
+  }
+  return @($title, $prompt)
+}
+
+function Next-Step([bool]$Mcp, [string]$Agents, [string]$AppHere) {
+  $fetched = Fetch-Prompt
+  if ($null -ne $fetched) { $title = $fetched[0]; $prompt = $fetched[1] } else { $title = ''; $prompt = $FallbackPrompt }
+  if ('' -eq $title) { $title = $FallbackTitle }
+  $rule = '-' * 60
+  # A console means a person; redirected output means an agent ran this, and the words name the user.
+  $app = if ([Console]::IsOutputRedirected) { "the user's app" } else { 'your app' }
+  $reticle = if ($script:ReticleBin -eq 'reticle') { 'reticle' } else { "& '$($script:ReticleBin)'" }
+  $initCmd = if ($AppHere -eq 'here') { "$reticle init in this folder" } else { "cd your-app; $reticle init" }
+  Emit ''
+  Out-Colored 'Cyan' 'Next steps'
+  Emit "Reticle is on this machine, not in $app yet."
+  Emit ''
+  if ('' -ne $script:PathDir) {
+    Emit "  0. reticle works in this window. For new windows, keep its folder on your PATH:"
+    Emit "       [Environment]::SetEnvironmentVariable('Path', '$($script:PathDir);' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User')"
+  }
+  if (-not $Mcp) {
+    Emit '  1. No coding agent was registered (--no-mcp). To register one: reticle setup mcp'
+    Emit "  2. Paste the prompt below into it. It instruments $app and proves one flow."
+    Emit "  3. No agent? Run $initCmd"
+    Emit '     then press Run Harness in the Reticle panel, or run reticle connect.'
+  } elseif ($Agents -eq '0') {
+    Emit "  1. No coding agent was found, so none has Reticle's tools. Run $initCmd"
+    Emit "     It wires $app, starts it and connects it to Reticle."
+    Emit '  2. Then press Run Harness in the Reticle panel, or run reticle connect.'
+    Emit '  3. Add a coding agent later? Run reticle setup mcp, then paste it the prompt below.'
+  } else {
+    Emit "  1. Coding agent already open? Restart it so it loads Reticle's tools."
+    Emit "  2. Paste the prompt below into it. It instruments $app and proves one flow."
+    Emit "  3. No agent? Run $initCmd"
+    Emit '     then press Run Harness in the Reticle panel, or run reticle connect.'
+  }
+  Emit ''
+  Out-Colored 'Cyan' $rule
+  Out-Colored 'Cyan' "Paste this into your coding agent  ($title)"
+  Out-Colored 'Cyan' $rule
+  Emit ''
+  Emit $prompt
+  Emit ''
+  Out-Colored 'Cyan' $rule
+}
+
+function Main {
+  if ($args -contains '-h' -or $args -contains '--help') {
+    Say 'usage: install.ps1 [--no-mcp]'
+    Quit 0
+  }
+  $started = Get-Date
+  Say 'Installing Reticle'
+  Check-Node
+  Ok ("Node " + (& node -v).TrimStart('v'))
+  $runtimeDone = Get-Date
+  Install-Cli
+  $installed = Get-Date
+  # Seconds, not milliseconds, and the same two numbers install.sh reports -- a duration silently
+  # 1000x out is worse than one that is coarse.
+  $runtimeSecs = [int]($runtimeDone - $started).TotalSeconds
+  $installSecs = [int]($installed - $runtimeDone).TotalSeconds
+  # Registration stays Node's; its closing tour is cut at its first line, because the next step
+  # below replaces it. If that line is ever reworded the cut finds nothing and the tour prints.
+  # Native stderr under $ErrorActionPreference = 'Stop' becomes a throwing ErrorRecord (see Check-Node),
+  # so it is relaxed for exactly the native call whose stderr is output, not failure.
+  $ErrorActionPreference = 'Continue'
+  $cli = if ($script:ReticleBin -eq 'reticle') { Native 'reticle' } else { $script:ReticleBin }
+  $out = & $cli setup install --runtime-secs $runtimeSecs --install-secs $installSecs @args 2>&1
+  $rc = $LASTEXITCODE
+  $ErrorActionPreference = 'Stop'
+  if ($rc -ne 0) {
+    # Node reports this failure itself; the launcher only makes it impossible to miss.
+    foreach ($line in $out) { Say "$line" }
+    Say ''
+    Write-Colored ([Console]::Error) ([Console]::IsErrorRedirected) 'Red' ([char]0x2717 + ' Reticle is on this machine, but registering it with your coding agents failed.')
+    Say 'The output above says why. Fix that, then run: reticle setup mcp'
+    Quit $rc
+  }
+  $mcp = -not ($args -contains '--no-mcp')
+  # The CLI's one machine line (see install.sh): how many agents have the tools, and whether this
+  # folder is an app. Absent from an older CLI, which keeps the generic wording.
+  $agents = ''
+  $appHere = ''
+  $waitAgents = $false
+  foreach ($line in $out) {
+    if ("$line" -match '^RETICLE_INSTALL agents=(\d+) app=([a-z]+)') { $agents = $Matches[1]; $appHere = $Matches[2] }
+    if ("$line" -match '^RETICLE_INSTALL .* wait=yes') { $waitAgents = $true }
+  }
+  if (-not $mcp) {
+    Ok 'Skipped registering with coding agents (--no-mcp)'
+  } else {
+    if ($agents -eq '0') { Say '  No coding agent found on this machine, so none was registered.' } else { Ok 'Registered with the coding agents on this machine' }
+    foreach ($line in $out) {
+      if ("$line" -match 'Reticle is installed') { break }
+      if ("$line" -match '^RETICLE_INSTALL ') { continue }
+      if ("$line".Trim() -ne '') { Say "$line" }
+    }
+  }
+  # No demo here, for the reason install.sh gives: a demo verdict read as "Reticle is in my app".
+  Next-Step $mcp $agents $appHere
+  # The last step, only for a person at a terminal (see install.sh): wait (bounded) for the agents
+  # to connect. wait=yes says the CLI has the subcommand, so an older CLI never gets it.
+  if ($waitAgents -and -not [Console]::IsOutputRedirected -and -not $env:CI) {
+    $ErrorActionPreference = 'Continue'
+    & $cli setup wait-agents
+    $ErrorActionPreference = 'Stop'
+  }
+  Quit 0
+}
+
+# LAST on purpose, exactly as in install.sh: an `irm | iex` cut off mid-download otherwise runs
+# whatever prefix arrived. This way a truncated file defines functions and runs none of them.
+try {
+  Main @args
+} catch {
+  if ("$_" -ne 'reticle-exit') { throw }
+  $global:LASTEXITCODE = $script:ReticleExitCode
+}

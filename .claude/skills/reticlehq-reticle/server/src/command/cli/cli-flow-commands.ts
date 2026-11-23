@@ -1,0 +1,352 @@
+/**
+ * CLI commands that operate on SAVED FLOWS: watch, capsules, and the gate.
+ *
+ * Split out of cli.ts, which was 653 lines — over the project's own cap, and the file a contributor
+ * opens first. These five functions form one cohesive group: they all read the flow store and report on
+ * verification state, and none of them touch daemon lifecycle, which is what the rest of cli.ts does.
+ */
+
+import {
+  GATE_OUTCOME,
+  GateExit,
+  MSG_GATE_NO_FLOWS,
+  msgGateRegression,
+  msgGateRefused,
+  gateExitWith,
+} from './answers/gate-exit.js';
+import { knownRegression } from './known-regression.js';
+import { gateHookMessage, GATE_SKIP_ENV } from './answers/gate-hook-message.js';
+import { readProjectId } from './ports/resolve/cli-port.js';
+import { changedFilesSince, type ChangedFiles } from '@/language/flows/change/git-changed.js';
+import { isAbsolute, join, sep } from 'node:path';
+import { type ProjectId, ReticleDir } from '@reticlehq/core';
+import { FlowStore } from '@/language/flows/flows.js';
+import { namedFlowsIn } from '@/language/flows/flow-store-for-session.js';
+import { RunStore } from '@/judgement/runs/artifact/run-store.js';
+import { createNodeFileSystem, type FileSystemPort } from '@/memory/project/fs/fs-port.js';
+import {
+  affectedSavedFlows,
+  toFlowSources,
+  type NamedFlow,
+} from '@/language/flows/change/flow-sources.js';
+import {
+  isInteractiveSource,
+  sourceMatchesChange,
+  unflowedFiles,
+} from '@/language/flows/change/affected.js';
+import {
+  LedgerStore,
+  regressions,
+  staleChanged,
+  unexecutedChanged,
+} from '@/features/exhaust/ledger.js';
+import { gateDecision, passingFlowNames } from '@/language/flows/change/gate.js';
+import { FlakeStore } from '@/language/flows/stores/flake-store.js';
+import { AssertionTiersStore } from '@/language/flows/stores/assertion-tiers-store.js';
+import { detectDowngrades } from '@/judgement/outcome/assertion-integrity.js';
+import { computeCoverage, flowCoverageReport } from '@/language/flows/suite/coverage.js';
+import { readFileSync, statSync } from 'node:fs';
+import { log } from '@/log.js';
+import { GateOutcome, type GateCompleted } from '@reticlehq/core/telemetry';
+/** Load the {name, steps} of every saved flow for the active project. */
+/** Explicit files plus, when --since is given, the git-changed files since that ref. */
+/**
+ * `cwd` is the tree to diff, and it is a PARAMETER because the two callers do not share one. From a
+ * terminal `process.cwd()` is the project; inside a globally-registered daemon it is `/` or `$HOME`,
+ * where `git diff` answers about the wrong repository or about none.
+ */
+export async function resolveChangedFiles(
+  files: string[],
+  since: string | undefined,
+  cwd: string,
+): Promise<ChangedFiles> {
+  // No ref means no question was asked of git, which is not a failure to answer one.
+  if (since === undefined) {
+    return { files, failed: false };
+  }
+  const changed = await changedFilesSince(since, cwd);
+  return {
+    files: [...new Set([...files, ...changed.files])],
+    failed: changed.failed,
+    ...(changed.reason === undefined ? {} : { reason: changed.reason }),
+  };
+}
+
+/**
+ * `projectId` is a PARAMETER for the same reason `reticleRoot` already is: the two together are one
+ * address, and reading half of it from a global made them disagree. Resolved through `sessionRoot`
+ * the root named the session's project while `readProjectId(process.cwd())` named the daemon's —
+ * and a daemon started outside a project has none, so the list came back EMPTY. `affected` renders
+ * that as "no saved flows exist yet" and `verify_change` as nothing covering the change: a
+ * confident negative about somebody else's project, which is worse than an error.
+ */
+export async function loadNamedFlows(
+  fs: FileSystemPort,
+  reticleRoot: string,
+  projectId: ProjectId | undefined,
+): Promise<NamedFlow[]> {
+  return await namedFlowsIn(new FlowStore(fs, reticleRoot, { now: () => Date.now() }), projectId);
+}
+
+/**
+ * `reticle gate <file...>` — exit non-zero unless passing artifacts cover the flows affected by the
+ * changed files. Flaky flows are quarantined (surfaced, not blocking). The environment-side enforcement
+ * that makes verification unavoidable. Never throws; a fault fails closed (exit 1).
+ */
+/**
+ * A changed file's text, or '' when it is gone. `git diff --name-only` answers from the repository
+ * root while the gate may run in a package below it, so a leading segment is dropped only when it is
+ * the directory the gate runs in (or a chain of them ending at `cwd`). An absolute path is read as is.
+ * Never fall through to a shorter suffix that merely happens to exist: that is another file.
+ */
+function atChangedPath<T>(cwd: string, file: string, read: (path: string) => T): T | undefined {
+  const attempt = (path: string): T | undefined => {
+    try {
+      return read(path);
+    } catch {
+      return undefined;
+    }
+  };
+  if (isAbsolute(file)) {
+    return attempt(file);
+  }
+  const parts = file.split('/');
+  const cwdParts = cwd.split(sep);
+  for (let i = 0; i < parts.length; i += 1) {
+    if (
+      i > 0 &&
+      (i > cwdParts.length || cwdParts.slice(-i).join('/') !== parts.slice(0, i).join('/'))
+    ) {
+      continue;
+    }
+    const found = attempt(join(cwd, ...parts.slice(i)));
+    if (found !== undefined) {
+      return found;
+    }
+  }
+  return undefined;
+}
+
+function readChangedFile(cwd: string, file: string): string {
+  return atChangedPath(cwd, file, (path) => readFileSync(path, 'utf8')) ?? '';
+}
+
+/** When a changed file was last modified, or undefined when it is gone. Same lookup as its text. */
+function changedFileModifiedAt(cwd: string, file: string): number | undefined {
+  return atChangedPath(cwd, file, (path) => statSync(path).mtimeMs);
+}
+
+/**
+ * The flows that still count as passing for the gate.
+ *
+ * A flow's newest pass counts only if its run is later than the newest mtime of the changed files
+ * that belong to THAT flow: the changed files that match its sources (the same suffix rule as
+ * `affectedFlows`, so a repo-root path, a package-relative stamp and an absolute stamp all agree).
+ * Edits outside its sources never invalidate it. A flow with no recorded sources cannot be
+ * attributed, so every changed file counts for it. A changed file that is gone fails closed. Only
+ * `affected` flows are judged; any other flow's newest pass stands.
+ */
+async function currentPassing(
+  fs: FileSystemPort,
+  root: string,
+  flows: readonly NamedFlow[],
+  affected: readonly string[],
+  changed: readonly string[],
+): Promise<string[]> {
+  const sourcesOf = new Map(toFlowSources(flows).map((f) => [f.name, f.sources ?? []]));
+  const passing: string[] = [];
+  const cwd = process.cwd();
+  for (const [name, at] of await new RunStore(fs, root).passingFlowTimes(passingFlowNames)) {
+    const sources = sourcesOf.get(name) ?? [];
+    const own =
+      0 === sources.length ? changed : changed.filter((f) => sourceMatchesChange(f, sources));
+    const stale =
+      affected.includes(name) &&
+      own.some((f) => !((changedFileModifiedAt(cwd, f) ?? Infinity) < at));
+    if (!stale) {
+      passing.push(name);
+    }
+  }
+  return passing;
+}
+
+export async function handleGate(
+  files: string[],
+  since: string | undefined,
+  /** Hook mode: prose for a human, and silence when there was simply nothing to check. */
+  hook = false,
+  /** Accept today's coverage levels as the best before judging, for a drop that was intended. */
+  acceptCoverage = false,
+  /**
+   * Called once with how the gate ended, on every path. `cli.ts` passes the `gate_completed`
+   * sender: telemetry already reaches this directory, so this directory does not reach back.
+   */
+  reportGateCompleted: (gate: GateCompleted) => void = () => undefined,
+): Promise<void> {
+  try {
+    const fs = createNodeFileSystem();
+    const reticleRoot = join(process.cwd(), ReticleDir.ROOT);
+    // Same deliberate degradation as the gate: a terminal caller sees git's own error anyway.
+    const changed = (await resolveChangedFiles(files, since, process.cwd())).files;
+    const allFlows = await loadNamedFlows(fs, reticleRoot, readProjectId(process.cwd()));
+    const affected = affectedSavedFlows(allFlows, changed).affected;
+    const passing = await currentPassing(fs, reticleRoot, allFlows, affected, changed);
+    const flaky = await new FlakeStore(fs, reticleRoot).flakyFlows();
+    // Anti-reward-hacking: diff each flow's CURRENT assertions against what it asserted the last
+    // time it passed. A mustHold that dropped from a real consequence to a fakeable presence check is a
+    // green bought by weakening the test — and a flow that covered a changed file but no longer exists
+    // is coverage deleted rather than satisfied. Both block.
+    const baseline = await new AssertionTiersStore(fs, reticleRoot).load();
+    const byName = new Map(allFlows.map((f) => [f.name, f]));
+    const downgraded = Object.entries(baseline)
+      .filter(([name]) => affected.includes(name) && byName.has(name))
+      .map(([name, before]) => {
+        const current = byName.get(name);
+        const after = (current?.steps ?? []).map((s, i) => ({
+          step: i,
+          ...(s.expect === undefined ? {} : { expect: s.expect }),
+        }));
+        return { flow: name, steps: detectDowngrades(before.steps, after).map((d) => d.step) };
+      })
+      .filter((d) => d.steps.length > 0);
+    // A flow with a recorded passing baseline that has since vanished, while its files changed.
+    // A flow that PASSED covering these files and has since vanished is coverage DELETED, not satisfied —
+    // and it can never appear in `affected` (that is derived from flows that still exist), so it must be
+    // matched against the baseline's own recorded sources. Missing this made deleting a flow turn the
+    // gate green, which is precisely the gaming move exists to stop.
+    const changedSet = new Set(changed);
+    const deleted = Object.entries(baseline)
+      .filter(([name, entry]) => !byName.has(name) && entry.sources.some((f) => changedSet.has(f)))
+      .map(([name]) => name);
+    // Only against a suite that exists: a project with no flows yet is NOTHING_TO_CHECK, and
+    // demanding a flow per edited component on its first day would block every stop.
+    const flowSourcesAll = toFlowSources(allFlows);
+    const unflowed =
+      0 === allFlows.length
+        ? []
+        : unflowedFiles(flowSourcesAll, changed, (file) =>
+            isInteractiveSource(readChangedFile(process.cwd(), file)),
+          );
+    // Flows exist but none carries a source stamp (a stack without source stamping, or flows saved before stamping was added): `unflowed`
+    // then names every changed component, which would read as "nothing drove it" when a flow did.
+    const flowsWithoutSources =
+      allFlows.length > 0 && flowSourcesAll.every((f) => 0 === (f.sources ?? []).length);
+    // The coverage ledger, when one exists: a level that fell below its best, and changed code the
+    // browser loaded and never ran. A project that never folded coverage has an empty ledger and
+    // neither can fire.
+    const ledgerStore = new LedgerStore(fs, reticleRoot);
+    const coverageAccepted = acceptCoverage ? await ledgerStore.acceptCurrent() : [];
+    const ledger = await ledgerStore.load();
+    const unexecuted = unexecutedChanged(ledger.code, changed);
+    // Changed files whose coverage predates the edit: their counts describe the old code, so
+    // `unexecuted` cannot judge them either way. Named rather than silently read as covered; not
+    // blocking, because a destructive exhaustive crawl after every edit is not a price a gate may set.
+    const coverageStale = staleChanged(ledger, changed, (file) =>
+      changedFileModifiedAt(process.cwd(), file),
+    ).filter((file) => !unexecuted.includes(file));
+    const result = gateDecision({
+      affected,
+      passing,
+      flaky,
+      downgraded,
+      deleted,
+      unflowed,
+      coverageRegressed: regressions(ledger),
+      unexecuted,
+    });
+    // Verified-surface coverage over flows: how much of the saved suite this run actually exercised.
+    const coverage = computeCoverage(
+      { testids: [], signals: [], flows: allFlows.map((f) => f.name) },
+      { testids: [], signals: [], flows: passing },
+    );
+    // A gate over an empty suite has not passed — it had nothing to check. Same rule the suite
+    // verdict already applies to `reticle verify`; see flowCoverageReport.
+    const flowCoverage = flowCoverageReport(coverage.flows);
+    const pass = result.pass && flowCoverage.outcome === undefined;
+    // What the platform knows decides too (a regression, a refused key), so the line is written
+    // once the exit code is: it said "pass": true over an exit of 1 or 3.
+    const known = await knownRegression(reticleRoot);
+    const regressed = known.broken;
+    let local: GateExit = GateExit.FAIL;
+    if (pass) {
+      local = GateExit.PASS;
+    } else if (result.pass && flowCoverage.outcome !== undefined) {
+      local = GateExit.NOTHING_TO_CHECK;
+    }
+    // Fails closed in CI, not in an agent's stop hook, where it would block over a key, not a change.
+    const code = gateExitWith(local, regressed?.length, !hook && known.refused !== undefined);
+    // What the gate judged, sent before a hook's skip can turn the exit code into a pass.
+    reportGateCompleted({ outcome: GATE_OUTCOME[code], flowsChecked: affected.length });
+    log('reticle_gate', {
+      pass: GateExit.PASS === code,
+      uncovered: result.uncovered,
+      quarantined: result.quarantined,
+      ...(result.downgraded.length > 0 ? { downgraded: result.downgraded } : {}),
+      ...(result.deleted.length > 0 ? { deletedCoverage: result.deleted } : {}),
+      ...(result.unflowed.length > 0 ? { unflowed: result.unflowed } : {}),
+      ...(result.unflowed.length > 0 && flowsWithoutSources ? { flowsWithoutSources } : {}),
+      ...(result.coverageRegressed.length > 0
+        ? { coverageRegressed: result.coverageRegressed }
+        : {}),
+      ...(result.unexecuted.length > 0 ? { unexecuted: result.unexecuted } : {}),
+      ...(coverageStale.length > 0 ? { coverageStale } : {}),
+      ...(coverageAccepted.length > 0 ? { coverageAccepted } : {}),
+      coverage: flowCoverage,
+    });
+    // Two non-zero codes, because two callers want opposite things from the same run. CI wants any
+    // problem to fail. A Stop hook wants to block a real regression and NOT block a project that
+    // has simply not recorded a flow yet — which is every project on its first day, and measured
+    // before this change as an exit 1 that would have blocked every stop. See GateExit.
+    // A regression the platform already knows fails the build here too, with `reticle runs
+    // regression`'s code, so the gate is the one command CI needs. Best-effort: unlinked or offline
+    // changes nothing.
+    if (regressed !== undefined && 0 < regressed.length) {
+      log('reticle_gate_regression', { broken: regressed });
+    }
+    if (known.refused !== undefined) {
+      process.stderr.write(`${msgGateRefused(known.refused)}\n`);
+    }
+    if (GateExit.NOTHING_TO_CHECK === code && !hook) {
+      process.stderr.write(`${MSG_GATE_NO_FLOWS}\n`);
+    }
+    if (GateExit.REGRESSION === code && !hook && regressed !== undefined) {
+      process.stderr.write(`${msgGateRegression(regressed)}\n`);
+    }
+    if (GateExit.PASS !== code) {
+      process.exitCode = code;
+      if (hook) {
+        // An honest escape hatch, because the alternative to one is not compliance — it is somebody
+        // deleting the hook, and a deleted gate protects nothing. Recorded either way.
+        if (process.env[GATE_SKIP_ENV] !== undefined) {
+          process.stderr.write(
+            `Reticle: gate skipped via ${GATE_SKIP_ENV}. This change is unverified.\n`,
+          );
+          process.exitCode = GateExit.PASS;
+          return;
+        }
+        const message = gateHookMessage(code, {
+          uncovered: result.uncovered,
+          quarantined: result.quarantined,
+          // A downgrade is reported per flow with its step indices; the hook names the flow.
+          downgraded: result.downgraded.map((d) => d.flow),
+          deleted: result.deleted,
+          unflowed: result.unflowed,
+          flowsWithoutSources,
+          coverageRegressed: result.coverageRegressed.map(
+            (r) => `${r.level} ${String(r.was)}% -> ${String(r.now)}%`,
+          ),
+          unexecuted: result.unexecuted,
+          regressed: regressed?.length ?? 0,
+        });
+        if (message !== undefined) {
+          process.stderr.write(`${message}\n`);
+        }
+      }
+    }
+  } catch (error) {
+    log('reticle_gate_failed', { error: error instanceof Error ? error.message : String(error) });
+    // No flow count: the gate broke before it judged, so a count would describe nothing.
+    reportGateCompleted({ outcome: GateOutcome.ERROR });
+    process.exitCode = GateExit.FAIL;
+  }
+}

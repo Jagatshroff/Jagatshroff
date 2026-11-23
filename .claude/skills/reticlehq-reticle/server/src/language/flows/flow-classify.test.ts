@@ -1,0 +1,185 @@
+import { describe, expect, it } from 'vitest';
+import { FLOW_FILE_VERSION, AnchorKind } from '@reticlehq/core';
+import type { FlowFile, FlowStep, Predicate } from '@reticlehq/core';
+import { ReticleTool } from '@reticlehq/core';
+import { classifyFlowAssertions, FlowAssertionGrade } from './flow-classify.js';
+
+function step(expect?: Predicate): FlowStep {
+  const s: FlowStep = { tool: ReticleTool.ACT, anchor: { kind: AnchorKind.TESTID, value: 'x' } };
+  if (expect !== undefined) {
+    s.expect = expect;
+  }
+  return s;
+}
+
+function flow(steps: FlowStep[], success?: Predicate): FlowFile {
+  const f: FlowFile = { version: FLOW_FILE_VERSION, name: 'f', createdAt: 0, steps };
+  if (success !== undefined) {
+    f.success = success;
+  }
+  return f;
+}
+
+describe('classifyFlowAssertions', () => {
+  it('flags a flow that acts but asserts nothing as assertion-free', () => {
+    const c = classifyFlowAssertions(flow([step(), step()]));
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTION_FREE);
+    expect(c.hasConsequenceAssertion).toBe(false);
+    expect(c.totalSteps).toBe(2);
+    expect(c.warning).toContain('asserts no observable consequence');
+  });
+
+  it('flags element-only checks as presence-only (a healed wrong locator could pass)', () => {
+    const c = classifyFlowAssertions(
+      flow([step(), step({ kind: 'element', query: { testid: 'panel' } })]),
+    );
+    expect(c.grade).toBe(FlowAssertionGrade.PRESENCE_ONLY);
+    expect(c.hasConsequenceAssertion).toBe(false);
+    expect(c.weakSteps).toBe(1);
+    // The note names what the flow checks (#1840), then why a presence check is weak.
+    expect(c.warning).toContain('This flow checks element (1) on the page');
+    expect(c.warning).toContain('presence checks');
+  });
+
+  // Replay evaluates these (assertStepExpect); the coupling itself is guarded in
+  // step-consequence.test.ts, which is where the false green that made this necessary is written up.
+  it('treats a step signal assertion as a real consequence', () => {
+    const c = classifyFlowAssertions(flow([step({ kind: 'signal', name: 'order:placed' })]));
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.hasConsequenceAssertion).toBe(true);
+    expect(c.consequenceSteps).toBe(1);
+  });
+
+  it('and a step network assertion', () => {
+    const c = classifyFlowAssertions(
+      flow([step({ kind: 'net', urlContains: '/api/order', status: 200 })]),
+    );
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.consequenceSteps).toBe(1);
+  });
+
+  it('a step STATE assertion is a consequence — assertStepState really does check it', () => {
+    const c = classifyFlowAssertions(
+      flow([step({ kind: 'state', path: 'order.id', equals: 'x' })]),
+    );
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.consequenceSteps).toBe(1);
+    expect(c.warning).toBeUndefined();
+  });
+
+  it('counts a consequence success end-condition even with no step expects', () => {
+    const c = classifyFlowAssertions(
+      flow([step(), step()], { kind: 'signal', name: 'checkout:done' }),
+    );
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.successIsConsequence).toBe(true);
+  });
+
+  it('an element-only success is still presence-only', () => {
+    const c = classifyFlowAssertions(
+      flow([step()], { kind: 'element', query: { testid: 'thanks' } }),
+    );
+    expect(c.grade).toBe(FlowAssertionGrade.PRESENCE_ONLY);
+    expect(c.successIsConsequence).toBe(false);
+  });
+
+  it('counts expects on act_sequence sub-steps', () => {
+    const seq: FlowStep = {
+      tool: ReticleTool.ACT_SEQUENCE,
+      anchor: { kind: AnchorKind.TESTID, value: 'x' },
+      steps: [step(), step({ kind: 'state', path: 'saved', equals: true })],
+    };
+    const c = classifyFlowAssertions(flow([seq]));
+    expect(c.hasConsequenceAssertion).toBe(true);
+    expect(c.consequenceSteps).toBe(1);
+  });
+});
+
+/** flow variant that also declares a business intent. */
+function intentFlow(steps: FlowStep[], intent: string, success?: Predicate): FlowFile {
+  return { ...flow(steps, success), intent };
+}
+
+describe('classifyFlowAssertions — business intent + outcome oracle', () => {
+  it('a flow with no intent is intentVerified=false and carries no intent', () => {
+    const c = classifyFlowAssertions(flow([step({ kind: 'signal', name: 'deploy:shipped' })]));
+    expect(c.intent).toBeUndefined();
+    expect(c.intentVerified).toBe(false);
+  });
+
+  it('intent + a consequence success outcome → intentVerified (the goal can actually fail)', () => {
+    const c = classifyFlowAssertions(
+      intentFlow([step()], 'ship a deploy to production', {
+        kind: 'signal',
+        name: 'deploy:shipped',
+      }),
+    );
+    expect(c.intent).toBe('ship a deploy to production');
+    expect(c.intentVerified).toBe(true);
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.warning).toBeUndefined();
+  });
+
+  it('intent without any observable outcome → NOT verified, with the intent-gap warning', () => {
+    const c = classifyFlowAssertions(intentFlow([step()], 'ship a deploy to production'));
+    expect(c.intentVerified).toBe(false);
+    expect(c.warning).toContain('declares a business intent but asserts no observable outcome');
+  });
+
+  it('intent with only a presence-only check is NOT verified (a healed locator could fake it)', () => {
+    const c = classifyFlowAssertions(
+      intentFlow([step()], 'open the deploy modal', {
+        kind: 'element',
+        query: { testid: 'deploy-modal' },
+      }),
+    );
+    expect(c.intentVerified).toBe(false);
+    expect(c.warning).toContain('checks element (1) on the page');
+    expect(c.warning).not.toContain('asserts no observable outcome');
+  });
+
+  // #1801. The flow checks page text, and a replay evaluates it. "Asserts no observable outcome"
+  // read as "the checks were lost": an agent told the user not to trust a flow that replays.
+  it('intent with text checks says what the flow checks and what it does not', () => {
+    const text = (contains: string): Predicate => ({ kind: 'text', contains });
+    const c = classifyFlowAssertions(
+      intentFlow([step(text('Saved')), step(text('2 items'))], 'save a draft'),
+    );
+    expect(c.intentVerified).toBe(false);
+    expect(c.warning).toContain('checks text (2) on the page');
+    expect(c.warning).toContain('no step checks a request, a signal or app state');
+    expect(c.warning).not.toContain('asserts no observable outcome');
+  });
+});
+
+/*
+ * A `request` step judges what the server answered: its status and its body. That is a consequence,
+ * as much as a network expect on a click. Counted as nothing, a flow of request steps with a stated
+ * intent was graded "asserts no observable outcome" and replayed `unknown` on a correct app.
+ */
+describe('classifyFlowAssertions — request steps', () => {
+  const requestFlow = (response?: FlowStep['response']): FlowFile => ({
+    version: FLOW_FILE_VERSION,
+    name: 'api-rules',
+    createdAt: 0,
+    intent: 'The API refuses an unknown sort',
+    steps: [
+      {
+        tool: 'reticle_request',
+        anchor: { kind: AnchorKind.TESTID, value: 'GET /api/links?sort=bogus' },
+        request: { method: 'GET', url: '/api/links?sort=bogus' },
+        ...(response === undefined ? {} : { response }),
+      },
+    ],
+  });
+
+  it('counts a request step with a declared response as a consequence', () => {
+    const c = classifyFlowAssertions(requestFlow({ status: 400 }));
+    expect(c.grade).toBe(FlowAssertionGrade.ASSERTED);
+    expect(c.intentVerified).toBe(true);
+  });
+
+  it('does not count a request step that declares no response', () => {
+    expect(classifyFlowAssertions(requestFlow()).hasConsequenceAssertion).toBe(false);
+  });
+});

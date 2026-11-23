@@ -1,0 +1,91 @@
+---
+title: reticle help
+description: Print the short, grouped list of Reticle commands; every command with help all; one command in detail with --help.
+icon: circle-question
+---
+
+`reticle help` prints a short list of the commands most people need, grouped, one line each, to stdout and exits `0`.
+
+```bash
+npx @reticlehq/server help
+npx @reticlehq/server --help
+npx @reticlehq/server -h
+```
+
+All three are the same command.
+
+| You type | You get |
+| --- | --- |
+| `reticle help` | The short list, grouped |
+| `reticle help all` (or `--help all`) | Every command, one line each, including the ones the short list leaves out |
+| `reticle <command> --help` (or `reticle help <command>`) | That command's flags and detail |
+
+`--help` works anywhere on the line, so `reticle init --help` is a help request, never an unknown argument, and never runs the command.
+
+## The short list
+
+```text
+usage:  reticle <command>   (or npx @reticlehq/server <command>)
+
+Get started
+  init        Wire Reticle into the app in this folder
+  connect     Sign in and link this project to the dashboard
+  try         Watch Reticle drive a URL once and say which journeys work
+
+Check your app
+  verify      Check saved flows, or one claim with --expect, against the running app; exit 0 = pass
+  gate        Fail unless passing checks cover the flows your changes touch
+
+Reticle on this machine
+  status      Is Reticle running, is your app connected, are you signed in
+  doctor      Find what is wrong with the setup, and what is missing from coverage
+  open        Open the app in your browser, or reuse a tab that is already connected
+  stop        Stop Reticle; --force frees its port even without a recorded pid
+  restart     Stop Reticle, then start it and wait until it is listening
+  update      Install the latest version and restart
+
+Account
+  logout      Sign out (of one host; others stay signed in)
+  feedback    Tell us what worked and what didn't; prints exactly what it sends
+  telemetry   Show or change anonymous usage metrics
+
+All commands: reticle help all     One command: reticle <command> --help
+```
+
+| Group                   | Commands                                                |
+| ----------------------- | ------------------------------------------------------- |
+| Get started             | `init`, `connect`, `try`                                |
+| Check your app          | `verify`, `gate`                                        |
+| Reticle on this machine | `status`, `doctor`, `open`, `stop`, `restart`, `update` |
+| Account                 | `logout`, `feedback`, `telemetry`                       |
+
+## Only in `help all`
+
+`sync`, `runs`, `config`, `affected`, `report`, `context`, `hook`, `mcp`, `serve`, `drive`, `setup`, `license`, `rollback` and `version`. They all work the same as always; they are left out of the short list because most people never type them. See the [CLI reference](/cli) for one row per command, including the renamed and removed ones.
+
+## Errors print it too
+
+Any usage error prints the offending thing first, then the short list on stderr, and exits `1`:
+
+```text
+{"t":"2026-08-15T18:42:48.476Z","event":"reticle_usage_error","message":"unknown command 'nonsense-cmd'"}
+unknown command 'nonsense-cmd'
+
+usage:  reticle <command>   (or npx @reticlehq/server <command>)
+... the short list ...
+```
+
+Two audiences, two channels: the structured line for logs and scripts, the plain text for the person who just typed the command.
+
+## Exit codes
+
+| Code | Meaning                                           |
+| ---- | ------------------------------------------------- |
+| `0`  | Help was requested                                |
+| `1`  | Help was printed because something else was wrong |
+
+<Note>
+  A bare `reticle` with no arguments is **not** help. In a wired project it is [`reticle
+  serve`](/cli/serve). In a folder that Reticle has not wired, it gives a first verdict on the app:
+  see [the CLI reference](/cli).
+</Note>

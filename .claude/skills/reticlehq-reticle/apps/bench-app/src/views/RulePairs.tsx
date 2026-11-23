@@ -1,0 +1,385 @@
+import { useEffect, useRef, useState } from 'react';
+import { useApp } from '../store/store.js';
+import { emit, Sig } from '../lib/reticle-bridge.js';
+
+/**
+ * The shapes that narrowed rules must tell apart in a real browser.
+ *
+ * #1627, #1629 and #2127 each made a rule report less often, and only unit tests covered those
+ * changes (#2141). A rule that reports less can hide a real defect as a pass. Each panel gives one
+ * rule a gate in both directions: one control the rule must report, and one it must not.
+ *
+ *  - `write-field-ignored`: a save that echoes the same id with the old values (report), and a
+ *    duplicate that answers a new record with its own id, or a price echoed as `18.500` for `18.5`
+ *    (silent).
+ *  - `action-had-no-effect`: a dead button while a click counter moves its store path (report), and a button
+ *    whose only effect is a store path that was quiet before (silent).
+ *  - `pagination-not-fetched`: a bare `1 of 6` label that moves while the app asks for page 1 again
+ *    (report), and a `0 of 6 selected` count that moves with the same request (silent).
+ *  - `partial-failure-in-ok-response`: a batch write that answers 200 with one failed item (report),
+ *    and a read of a job list that holds old failed jobs (silent).
+ *  - a `net` miss over a `fetch` saved before connect(): `unknown`, not `no` (#1660), and the same
+ *    ping through `window.fetch` passes.
+ *  - `write-field-ignored` beside an optimistic lock: a PUT whose echo bumps `lock_version` and keeps
+ *    the title (silent), and the same PUT whose echo returns an old title (report).
+ *  - reach: a switch inside a closed `<details>`, a switch inside a `display: none` panel, and a
+ *    button under a full-screen overlay (the spec adds the overlay). A person cannot click any of
+ *    them, so a request they send must not give `yes`. A switch that a person can reach sends the
+ *    same request and must still give `yes`.
+ *  - `signal-contradicted` over a declared 409: a `form:submit` signal fired before the invite was
+ *    sent (silent), and an `invite:sent` signal fired after the 409 (report) (#2172).
+ *  - `stale-response-applied`: same-path reads that update different store keys (silent), and the
+ *    same race when both answers update `shipments.rows` (report) (#2175).
+ *  - `dialog_declined`: a publish behind `confirm()`, which Reticle declines, so its request never
+ *    goes (unknown). The dead button is the other direction: no dialog, no effect (no).
+ *  - `state-vs-render` beside a canvas (#1525): a store change that the canvas draws (silent), and a
+ *    store change that it does not draw (silent, and the coverage line names the canvas). The canvas
+ *    mounts only when asked, so "Remember" above still has no canvas on the page (report).
+ */
+const API = 'http://localhost:8787/api/rule-pairs';
+/**
+ * `fetch` as it was when this module loaded. `main.tsx` imports the app before it calls
+ * `installReticle()`, so this is the browser's own `fetch`, saved before connect() patched it. A
+ * client library that stores `window.fetch` when it loads does the same (#1660).
+ */
+const savedFetch = window.fetch.bind(window);
+/** Two routes for one ping, so the call that goes through the patch never names the saved one. */
+const PING_SAVED = 'ping/saved';
+const PING_PATCHED = 'ping/patched';
+const PROFILE = { id: 'profile-1', name: 'New name', plan: 'pro' };
+const TOTAL = 6;
+/** Not a delete: a destructive label is refused before the click, so no dialog would open. */
+const PUBLISH_QUESTION = 'Publish this profile?';
+/**
+ * Counts every click on the page, as an analytics or "last interaction" store does. Earlier clicks
+ * move this path before the dead click, and the dead click moves it inside its own window. So the
+ * path is background churn that is IN the window, which is the shape #1629 must still report. A
+ * timer cannot do that: an act window can be shorter than any interval.
+ */
+function countClick(): void {
+  useApp.setState({ rulePairsClicks: useApp.getState().rulePairsClicks + 1 });
+}
+
+async function post(path: string): Promise<void> {
+  await fetch(`${API}/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(PROFILE),
+  });
+}
+
+/** The text the invite panel shows when the server refuses a duplicate email. */
+const DUPLICATE_EMAIL = 'Another account already uses this email.';
+
+async function invite(): Promise<Response> {
+  return fetch(`${API}/invite`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'ana@example.com' }),
+  });
+}
+
+/** A compare-and-set update. The server answers with `lock_version` one higher. */
+const LOCKED_DOC = { id: 'doc-1', title: 'Q3 plan', lock_version: 3 };
+
+async function putLocked(outcome: string): Promise<void> {
+  await fetch(`${API}/lock/${outcome}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(LOCKED_DOC),
+  });
+}
+
+/** Draw `bars` as a column chart. The pixels are the only render: no DOM node shows the count. */
+function drawBars(canvas: HTMLCanvasElement | null, bars: number): void {
+  const ctx = canvas?.getContext('2d');
+  if (null === ctx || undefined === ctx) {
+    return;
+  }
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, 240, 120);
+  ctx.fillStyle = '#2f7d5b';
+  for (let i = 0; i < bars; i += 1) {
+    ctx.fillRect(10 + i * 40, 20, 30, 100);
+  }
+}
+
+/** A chart drawn on a canvas, as an editor, a chart or a game renders. */
+function CanvasPanel(): React.ReactElement {
+  const canvas = useRef<HTMLCanvasElement>(null);
+  useEffect(() => drawBars(canvas.current, useApp.getState().rulePairsBars), []);
+  return (
+    <>
+      <canvas ref={canvas} data-testid="rule-pairs-canvas" width={240} height={120} />
+      <button
+        data-testid="rule-pairs-canvas-draw"
+        onClick={() => {
+          const bars = useApp.getState().rulePairsBars + 1;
+          useApp.setState({ rulePairsBars: bars });
+          drawBars(canvas.current, bars);
+        }}
+      >
+        Add a bar
+      </button>
+      <button
+        data-testid="rule-pairs-canvas-tally"
+        onClick={() => useApp.setState({ rulePairsTally: useApp.getState().rulePairsTally + 1 })}
+      >
+        Count
+      </button>
+    </>
+  );
+}
+
+async function readPage(list: string): Promise<void> {
+  await fetch(`${API}/${list}?page=1`);
+}
+
+async function readOptions(query: string): Promise<string> {
+  const response = await fetch(`${API}/options?${query}`);
+  const data = (await response.json()) as { value?: unknown };
+  return 'string' === typeof data.value ? data.value : '';
+}
+
+export function RulePairs(): React.ReactElement {
+  const [saved, setSaved] = useState('');
+  const [page, setPage] = useState(1);
+  const [selected, setSelected] = useState(0);
+  const [batch, setBatch] = useState('');
+  const [invited, setInvited] = useState('');
+  const genderOptions = useApp((state) => state.rulePairsGenderOptions);
+  const stateOptions = useApp((state) => state.rulePairsStateOptions);
+  const shipments = useApp((state) => state.shipments);
+  const [chart, setChart] = useState(false);
+
+  useEffect(() => {
+    void readPage('pages');
+    void readPage('rows');
+    document.addEventListener('click', countClick, true);
+    return () => document.removeEventListener('click', countClick, true);
+  }, []);
+
+  return (
+    <div className="view">
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Echo</h3>
+        <button
+          data-testid="rule-pairs-save"
+          onClick={() => void post('profile').then(() => setSaved('Saved'))}
+        >
+          Save profile
+        </button>
+        <button
+          data-testid="rule-pairs-duplicate"
+          onClick={() => void post('derive').then(() => setSaved('Duplicated'))}
+        >
+          Duplicate profile
+        </button>
+        <button
+          data-testid="rule-pairs-price"
+          onClick={() =>
+            void fetch(`${API}/price`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id: 'item-1', price: '18.5' }),
+            }).then(() => setSaved('Price saved'))
+          }
+        >
+          Save price
+        </button>
+        <button
+          data-testid="rule-pairs-lock-kept"
+          onClick={() => void putLocked('kept').then(() => setSaved('Plan saved'))}
+        >
+          Save plan
+        </button>
+        {/* The defect, on purpose: the server keeps the old title and the app says saved. */}
+        <button
+          data-testid="rule-pairs-lock-lost"
+          onClick={() => void putLocked('lost').then(() => setSaved('Plan saved again'))}
+        >
+          Save plan again
+        </button>
+        <output data-testid="rule-pairs-saved">{saved}</output>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Effect</h3>
+        {/* The defect, on purpose: this button has no handler. */}
+        <button data-testid="rule-pairs-dead">Archive</button>
+        <button
+          data-testid="rule-pairs-publish"
+          onClick={() => {
+            if (window.confirm(PUBLISH_QUESTION)) {
+              void fetch(`${API}/publish`, { method: 'POST' });
+            }
+          }}
+        >
+          Publish
+        </button>
+        <button
+          data-testid="rule-pairs-remember"
+          onClick={() => useApp.setState({ rulePairsChoice: 'remembered' })}
+        >
+          Remember
+        </button>
+        <button data-testid="rule-pairs-canvas-open" onClick={() => setChart(true)}>
+          Show chart
+        </button>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Saved fetch</h3>
+        <button
+          data-testid="rule-pairs-ping-saved"
+          onClick={() => void savedFetch(`${API}/${PING_SAVED}`, { method: 'POST' })}
+        >
+          Ping through a saved fetch
+        </button>
+        <button
+          data-testid="rule-pairs-ping-patched"
+          onClick={() => void fetch(`${API}/${PING_PATCHED}`, { method: 'POST' })}
+        >
+          Ping through window.fetch
+        </button>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Batch</h3>
+        {/* The defect, on purpose: the app says done although one item failed. */}
+        <button
+          data-testid="rule-pairs-batch"
+          onClick={() =>
+            void fetch(`${API}/batch`, { method: 'POST' }).then(() => setBatch('All items held'))
+          }
+        >
+          Hold all
+        </button>
+        <button
+          data-testid="rule-pairs-jobs"
+          onClick={() => void fetch(`${API}/jobs`).then(() => setBatch('Jobs refreshed'))}
+        >
+          Refresh jobs
+        </button>
+        <output data-testid="rule-pairs-batch-status">{batch}</output>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Reach</h3>
+        <details>
+          <summary>Players</summary>
+          <button role="switch" aria-checked="false" onClick={() => void post('toggle')}>
+            Stream eligible
+          </button>
+        </details>
+        <button role="switch" aria-checked="false" onClick={() => void post('toggle')}>
+          Stream public
+        </button>
+        <button onClick={() => void post('toggle')}>Publish roster</button>
+        <div hidden>
+          <button role="switch" aria-checked="false" onClick={() => void post('toggle')}>
+            Stream archived
+          </button>
+        </div>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Response targets</h3>
+        <button
+          data-testid="rule-pairs-options-gender"
+          onClick={() =>
+            void readOptions('kind=gender').then((rulePairsGenderOptions) =>
+              useApp.setState({ rulePairsGenderOptions }),
+            )
+          }
+        >
+          Load gender options
+        </button>
+        <output data-testid="rule-pairs-gender-options">{genderOptions}</output>
+        <button
+          data-testid="rule-pairs-options-state"
+          onClick={() =>
+            void readOptions('kind=state').then((rulePairsStateOptions) =>
+              useApp.setState({ rulePairsStateOptions }),
+            )
+          }
+        >
+          Load state options
+        </button>
+        <output data-testid="rule-pairs-state-options">{stateOptions}</output>
+        <button
+          data-testid="rule-pairs-shipments-all"
+          onClick={() =>
+            void readOptions('status=all').then((rows) => useApp.setState({ shipments: { rows } }))
+          }
+        >
+          Load all shipments
+        </button>
+        <button
+          data-testid="rule-pairs-shipments-held"
+          onClick={() =>
+            void readOptions('status=held').then((rows) => useApp.setState({ shipments: { rows } }))
+          }
+        >
+          Load held shipments
+        </button>
+        <output data-testid="rule-pairs-shipments">{shipments.rows}</output>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Invite</h3>
+        {/* Correct: the submit signal fires before the invite is sent, and the 409 is shown. */}
+        <button
+          data-testid="rule-pairs-invite-early"
+          onClick={() => {
+            emit(Sig.FORM_SUBMIT);
+            void invite().then(() => setInvited(DUPLICATE_EMAIL));
+          }}
+        >
+          Invite
+        </button>
+        {/* The defect, on purpose: the app says the invite was sent although the server refused it. */}
+        <button
+          data-testid="rule-pairs-invite-claimed"
+          onClick={() =>
+            void invite().then(() => {
+              emit(Sig.INVITE_SENT);
+              setInvited('Invitation sent');
+            })
+          }
+        >
+          Invite and claim
+        </button>
+        <output data-testid="rule-pairs-invited">{invited}</output>
+      </div>
+      <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+        <h3>Pagination</h3>
+        {/* The defect, on purpose: the label moves and the app asks for page 1 again. */}
+        <button
+          data-testid="rule-pairs-next"
+          onClick={() => {
+            setPage(page + 1);
+            void readPage('pages');
+          }}
+        >
+          Next
+        </button>
+        {/* One text node, so the label change is one DOM text event. */}
+        <output data-testid="rule-pairs-page">{`${String(page)} of ${String(TOTAL)}`}</output>
+        <button
+          data-testid="rule-pairs-select"
+          onClick={() => {
+            setSelected(selected + 1);
+            void readPage('rows');
+          }}
+        >
+          Select row
+        </button>
+        <output data-testid="rule-pairs-selected">
+          {`${String(selected)} of ${String(TOTAL)} selected`}
+        </output>
+      </div>
+      {/* Mounted only when asked, so the page above keeps the layout the earlier pairs click in. */}
+      {chart ? (
+        <div className="panel panel-pad" style={{ maxWidth: 560 }}>
+          <h3>Canvas</h3>
+          <CanvasPanel />
+        </div>
+      ) : null}
+    </div>
+  );
+}

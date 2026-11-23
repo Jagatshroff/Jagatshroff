@@ -1,0 +1,436 @@
+// The harness contract, as code. Read apps/e2e/harness-rules.md for why each rule exists.
+//
+// Every unreliable gate result in this repo's history came from the harness being a client of the
+// system it measures, and inheriting its failure modes. SvelteKit was written up as an install
+// failure when the daemon had died. The daemon's own idle shutdown fired during a long dependency
+// install and three fixtures were scored as install failures. Two contradictory conclusions about
+// MCP stability were filed a week apart, and one of them was the harness killing its own proxy.
+//
+// None of those were product defects. All of them were reported as product defects, because the
+// harness had no way to say "the transport was gone, so I cannot attribute this".
+//
+// Self-check: `node apps/e2e/gate-harness.mjs --self-check`
+import { spawn, execFileSync } from 'node:child_process';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { pidOnPort } from './port-pid.mjs';
+
+/** Reticle's default bridge port — the one every doc, error message and config example names. */
+export const DEFAULT_BRIDGE_PORT = 4400;
+/** Tests default to their own bridge; fixtures and specs must use the same override. */
+export const TEST_BRIDGE_PORT = Number(process.env.RETICLE_PORT ?? 14400);
+
+/**
+ * How often a gate-owned daemon says it is alive.
+ *
+ * Two seconds, against the product's 30. A connect window is measured in seconds, so a beat that
+ * lands once every thirty cannot tell you whether the bridge was up for it — and the cost of the
+ * finer cadence is a few extra lines in a log that already rotates.
+ */
+const GATE_HEARTBEAT_MS = '2000';
+
+/** Disables the daemon's idle self-shutdown. A gate owns its daemon; nothing else may end it. */
+export const IDLE_SHUTDOWN_DISABLED = '0';
+
+/** How long a freshly spawned daemon gets to actually BIND before we call the start failed. */
+const DAEMON_BIND_TIMEOUT_MS = 30_000;
+const DAEMON_POLL_MS = 200;
+/** Escalation schedule for freeing a port: polite first, then not. */
+const FREE_PORT_ATTEMPTS = 12;
+const FREE_PORT_SIGKILL_AFTER = 3;
+const FREE_PORT_SETTLE_MS = 400;
+
+/**
+ * Every process holding `port`, split by whether it is the LISTENER or merely connected to it.
+ *
+ * This distinction is the whole point of this module. `lsof -ti tcp:4400` returns both, so the
+ * recipe everyone reaches for —
+ *
+ *   lsof -ti tcp:4400 | xargs kill -9
+ *
+ * — kills the daemon AND every `reticle mcp` proxy attached to it. Measured: listener pid 70244 and
+ * proxy pid 70245 both returned; the kill took the proxy with it and every subsequent tool call
+ * hung unanswered, with nothing in ~/.reticle/proxy-4400.log because the process that writes it was
+ * the one that died. An agent in that state is not degraded, it is gone, and no log says so.
+ */
+/**
+ * Stop a spawned process AND whatever it started, on either kind of machine.
+ *
+ * A dev server is a wrapper: `npm run dev` starts vite, `create-next-app` starts next. Killing the
+ * pid we hold leaves the real server listening, and the next scaffold in the gate then fails to
+ * bind — a cascade whose first visible symptom is an unrelated port conflict three scaffolds later.
+ *
+ * POSIX gets the process GROUP (the negative pid, which is why these are spawned detached).
+ * Windows has no process groups and `process.kill(-pid)` throws there, so it gets `taskkill /T`,
+ * which walks the child tree instead. Same guarantee, two mechanisms, one call site for callers.
+ */
+export function killTree(pid) {
+  if (pid === undefined) return;
+  try {
+    if ('win32' === process.platform) {
+      execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' });
+    } else {
+      process.kill(-pid, 'SIGTERM');
+    }
+  } catch {
+    /* already gone, or never had children — either way there is nothing left to stop */
+  }
+}
+
+export function portHolders(port) {
+  // Windows has no lsof, and `lsof()` below answers "nothing matched" for a tool that is absent —
+  // an honest answer to the wrong question. Every caller then believed the port was free, so a
+  // registry or daemon left behind by a failed run was never cleared and the NEXT run inherited it.
+  // That is how one broken prepack became "no token from verdaccio" a run later. `pidOnPort` is the
+  // netstat equivalent this repo already had, in a module written for exactly this gap.
+  if ('win32' === process.platform) {
+    const pid = pidOnPort(port);
+    return pid === null ? [] : [{ pid, listener: true, command: commandOf(pid) }];
+  }
+  const listeners = new Set(lsof(['-nP', `-iTCP:${String(port)}`, '-sTCP:LISTEN', '-t']));
+  const all = lsof(['-nP', `-iTCP:${String(port)}`, '-t']);
+  return all.map((pid) => ({
+    pid,
+    listener: listeners.has(pid),
+    command: commandOf(pid),
+  }));
+}
+
+function lsof(args) {
+  try {
+    return execFileSync('lsof', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line !== '');
+  } catch {
+    // lsof exits non-zero when nothing matches. That is an answer, not an error.
+    return [];
+  }
+}
+
+function commandOf(pid) {
+  try {
+    return execFileSync('ps', ['-p', pid, '-o', 'command='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+  } catch {
+    return 'unknown';
+  }
+}
+
+/** Stop only listeners whose PIDs the caller recorded as belonging to this run. */
+export async function freePortSafely(port, { onNote = () => {}, ownedPids = [] } = {}) {
+  const owned = new Set(ownedPids.map(Number));
+  for (let attempt = 0; attempt < FREE_PORT_ATTEMPTS; attempt += 1) {
+    const listeners = portHolders(port).filter((holder) => holder.listener);
+    if (listeners.length === 0) return { freed: true, survivors: [] };
+    const foreign = listeners.filter((holder) => !owned.has(Number(holder.pid)));
+    if (foreign.length > 0) {
+      onNote(`port ${String(port)} belongs to another process; leaving it running: ` +
+        foreign.map((holder) => `pid ${holder.pid} (${holder.command})`).join(', '));
+      throw new Error(`Port ${String(port)} is occupied by another process; its owner was left running. Choose a different test port.`);
+    }
+    kill(listeners.map((holder) => holder.pid), attempt >= FREE_PORT_SIGKILL_AFTER);
+    await sleep(FREE_PORT_SETTLE_MS);
+  }
+  const survivors = portHolders(port).filter((holder) => holder.listener);
+  return { freed: survivors.length === 0, survivors };
+}
+
+function kill(pids, hard) {
+  for (const pid of pids) {
+    // A client socket this process holds on the port (a keep-alive fetch to the app it just
+    // polled) lists it as a holder, and signalling it ends the run as "Terminated" mid-cleanup.
+    if (Number(pid) === process.pid || Number(pid) === process.ppid) continue;
+    try {
+      if ('win32' === process.platform) {
+        killTree(pid);
+      } else {
+        process.kill(Number(pid), hard ? 'SIGKILL' : 'SIGTERM');
+      }
+    } catch {
+      // Already gone between the listing and the signal. Fine.
+    }
+  }
+}
+
+/** Report occupied ports. A matching command line does not prove process ownership. */
+export async function sweepBatteryOrphans(ports = [], { onNote = () => {} } = {}) {
+  const held = [];
+  for (const port of ports) {
+    const holders = portHolders(port).filter((holder) => holder.listener);
+    if (holders.length === 0) continue;
+    held.push({ port, holders });
+    onNote(`port ${String(port)} is held by ` +
+      holders.map((holder) => `pid ${holder.pid} (${holder.command})`).join(', '));
+  }
+  return { killed: [], held };
+}
+
+/** Reap a fixture wrapper and its descendants, without looking up or killing port owners. */
+export function stopProcessTree(pid) {
+  if (!Number.isInteger(Number(pid)) || Number(pid) <= 1) return;
+  if (process.platform === 'win32') { killTree(Number(pid)); return; }
+  let rows = [];
+  try {
+    rows = execFileSync('ps', ['-axo', 'pid=,ppid='], { encoding: 'utf8' })
+      .trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
+  } catch { /* the recorded wrapper can still be stopped */ }
+  const owned = new Set([Number(pid)]);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const [child, parent] of rows) {
+      if (owned.has(parent) && !owned.has(child)) { owned.add(child); changed = true; }
+    }
+  }
+  kill([...owned].reverse(), false);
+  return [...owned];
+}
+
+/** True when something answers `/status` on this port — a real daemon, not merely an open socket. */
+export async function transportAlive(port, { timeoutMs = 1_000 } = {}) {
+  try {
+    const res = await fetch(`http://localhost:${String(port)}/status`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Start a daemon this run OWNS for its whole lifetime, and prove it bound the port.
+ *
+ * Two rules in one function, because they fail together:
+ *
+ * 1. **Idle shutdown off.** The daemon exits after 5 minutes idle (30 with an agent attached), and
+ *    `isUselessDaemon` will end one that has never served a tool call. A gate that spends six
+ *    minutes on `pnpm install` before its first call is exactly that daemon. This already happened:
+ *    the shutdown fired mid-install and the apps that booted afterwards hit ERR_CONNECTION_REFUSED
+ *    and were scored as install failures.
+ * 2. **Bind, not spawn.** `reticle serve` reports `reticle_daemon_spawned` and exits 0 while the
+ *    child dies on EADDRINUSE (see issue #115). Waiting on `/status` is the only honest signal.
+ *
+ * Never let a daemon be spawned implicitly by a tool call: one spawned inside an agent's shell
+ * command is SIGTERMed when that command ends, `detached` or not.
+ */
+export async function startOwnedDaemon(port, { cliPath, cwd, env = {}, stdio = 'ignore' } = {}) {
+  await freePortSafely(port);
+  const child = spawn(process.execPath, [cliPath, 'serve', '--port', String(port)], {
+    cwd,
+    detached: true,
+    stdio,
+    env: {
+      ...process.env,
+      RETICLE_IDLE_SHUTDOWN_MS: IDLE_SHUTDOWN_DISABLED,
+      // A cadence the gate can actually read. The product default is 30s, which is right for a real
+      // user's daemon (median life 28 minutes) and useless here: measured over one battery window,
+      // port 4400 saw 13 daemon starts and produced 2 heartbeats, because a spec's daemon rarely
+      // lives long enough to beat once. A liveness signal that does not fire inside the window you
+      // are judging cannot support rule 4.
+      RETICLE_HEARTBEAT_MS: GATE_HEARTBEAT_MS,
+      RETICLE_TELEMETRY: '0',
+      // A gate daemon is never a user, and `CI` is the only thing an event has to say so. It is set
+      // by the runner and by nothing else, so a battery driven from a laptop or a cloud sandbox
+      // reported itself as a person at a machine.
+      CI: process.env.CI ?? 'true',
+      ...env,
+    },
+  });
+  const deadline = Date.now() + DAEMON_BIND_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (await transportAlive(port)) {
+      const state = env.RETICLE_STATE_DIR ?? process.env.RETICLE_STATE_DIR ?? join(homedir(), '.reticle');
+      const daemonPid = Number(readFileSync(join(state, `daemon-${port}.pid`), 'utf8'));
+      return { child, port, stop: () => freePortSafely(port, { ownedPids: [daemonPid] }) };
+    }
+    await sleep(DAEMON_POLL_MS);
+  }
+  const holders = portHolders(port);
+  throw new Error(
+    `the daemon never bound port ${String(port)} within ${String(DAEMON_BIND_TIMEOUT_MS)}ms. ` +
+      (holders.length === 0
+        ? 'Nothing is holding the port, so it failed to start — read ~/.reticle/daemon-' +
+          String(port) +
+          '.log.'
+        : `Held by: ${holders.map((h) => `pid ${h.pid} (${h.command})`).join(', ')}`),
+  );
+}
+
+/**
+ * Refuse to blame the app when the transport was gone.
+ *
+ * The rule that would have prevented the SvelteKit report: a fixture is only allowed to FAIL if the
+ * bridge was alive for its whole window. Otherwise the verdict is INCONCLUSIVE and names the
+ * transport, because a fixture that never got a bridge was never tested.
+ *
+ * Deliberately three-valued. Collapsing "the app is broken" and "we could not look" into one boolean
+ * is the same mistake `decideVerified` exists to avoid in the product — the harness should not make
+ * it either.
+ */
+export const Attribution = {
+  PASS: 'pass',
+  FAIL: 'fail',
+  INCONCLUSIVE: 'inconclusive',
+};
+
+/**
+ * Why a connected-but-empty session is a FAIL, not a PASS.
+ *
+ * The install gate used to treat "a session connected" as success. An app can connect with
+ * `registerCapabilities({ testids: [], signals: [], stores: [] })`, so `hasCapabilities` stays
+ * false and `reticle_state` has nothing to read. That is the end state the gate exists to catch:
+ * connected is not verifiable. Callers that do not pass `hasCapabilities` (the soak, which only
+ * asks whether the link stayed up) keep the old connected-is-enough meaning.
+ */
+const BECAUSE_SESSION_UNOBSERVABLE =
+  'a session connected but hasCapabilities is false, so the app cannot answer a state question';
+
+export function attributeOutcome({ connected, transportAliveThroughout, hasCapabilities }) {
+  if (connected) {
+    if (false === hasCapabilities) {
+      return { outcome: Attribution.FAIL, because: BECAUSE_SESSION_UNOBSERVABLE };
+    }
+    return { outcome: Attribution.PASS, because: 'a session connected' };
+  }
+  if (!transportAliveThroughout) {
+    return {
+      outcome: Attribution.INCONCLUSIVE,
+      because:
+        'no session appeared, but the bridge was not listening for the whole window — this says ' +
+        'nothing about the app. Re-run with the daemon owned by the harness before filing anything.',
+    };
+  }
+  return {
+    outcome: Attribution.FAIL,
+    because: 'the bridge was up for the whole window and no session ever appeared',
+  };
+}
+
+/**
+ * Probes that must miss IN A ROW before the bridge counts as down.
+ *
+ * Any single miss used to mark the whole window down. On Windows install cells the negative control
+ * then went INCONCLUSIVE ("transport stayed available") with the gate's own daemon up and its idle
+ * shutdown off: one `/status` that missed its deadline while the runner compiled the app and drove a
+ * browser. A bridge that is gone misses every probe, so a run of misses still reports it.
+ */
+const TRANSPORT_DOWN_AFTER_MISSES = 3;
+const TRANSPORT_PROBE_TIMEOUT_MS = 2_000;
+
+/**
+ * Watch the bridge for the duration of a fixture's window, so `attributeOutcome` has an input that
+ * is measured rather than assumed. Returns a stop() that reports whether it was up the whole time.
+ * Probes run one at a time, so a slow answer cannot overlap the next and reorder the misses.
+ */
+export function watchTransport(
+  port,
+  {
+    intervalMs = 500,
+    probe = (p) => transportAlive(p, { timeoutMs: TRANSPORT_PROBE_TIMEOUT_MS }),
+  } = {},
+) {
+  let stopped = false;
+  let everDown = false;
+  let misses = 0;
+  void (async () => {
+    while (!stopped) {
+      const up = await probe(port);
+      if (stopped) return;
+      misses = up ? 0 : misses + 1;
+      if (misses >= TRANSPORT_DOWN_AFTER_MISSES) everDown = true;
+      await sleep(intervalMs, undefined, { ref: false });
+    }
+  })();
+  return {
+    stop() {
+      stopped = true;
+      return { aliveThroughout: !everDown };
+    },
+  };
+}
+
+// ── self-check ────────────────────────────────────────────────────────────────────────────────
+// The smallest thing that fails if the listener/client distinction breaks — which is the exact bug
+// that produced a false "MCP never recovers" finding. Stands up a listener and a client on the same
+// port and asserts they are told apart.
+async function selfCheck() {
+  const net = await import('node:net');
+  const assert = await import('node:assert/strict');
+  const PORT = 45_231;
+
+  const server = net.createServer((s) => s.on('data', () => {}));
+  await new Promise((r) => server.listen(PORT, '127.0.0.1', r));
+  // The client must be a SEPARATE process. `lsof -t` reports pids, not sockets, so one process
+  // holding both ends collapses to a single pid and the distinction under test disappears — which
+  // is also why the real hazard only shows up between the daemon and the proxy.
+  const client = spawn(
+    process.execPath,
+    ['-e', `require('node:net').connect(${String(PORT)},'127.0.0.1',()=>setTimeout(()=>{},60000))`],
+    { stdio: 'ignore' },
+  );
+  await new Promise((r) => {
+    const started = Date.now();
+    const poll = setInterval(() => {
+      if (portHolders(PORT).length > 1 || Date.now() - started > 5_000) {
+        clearInterval(poll);
+        r();
+      }
+    }, 50);
+  });
+
+  const holders = portHolders(PORT);
+  const listeners = holders.filter((h) => h.listener);
+  const clients = holders.filter((h) => !h.listener);
+
+  assert.ok(holders.length >= 1, 'lsof found no holder of a port we are demonstrably holding');
+  assert.equal(listeners.length >= 1, true, 'the listening socket was not classified as a listener');
+  assert.ok(
+    clients.length >= 1,
+    'the client socket was not seen at all — a blind kill would have taken it and this check ' +
+      'would not have noticed',
+  );
+  assert.equal(
+    attributeOutcome({ connected: false, transportAliveThroughout: false }).outcome,
+    Attribution.INCONCLUSIVE,
+    'a fixture with no bridge must never be attributed a failure',
+  );
+  assert.equal(
+    attributeOutcome({ connected: false, transportAliveThroughout: true }).outcome,
+    Attribution.FAIL,
+  );
+  assert.equal(
+    attributeOutcome({
+      connected: true,
+      transportAliveThroughout: true,
+      hasCapabilities: false,
+    }).outcome,
+    Attribution.FAIL,
+    'a session that connected with nothing to observe is a FAIL, not a pass',
+  );
+  assert.equal(
+    attributeOutcome({
+      connected: true,
+      transportAliveThroughout: true,
+      hasCapabilities: true,
+    }).outcome,
+    Attribution.PASS,
+  );
+  assert.equal(
+    attributeOutcome({ connected: true, transportAliveThroughout: true }).outcome,
+    Attribution.PASS,
+    'callers that do not ask about capabilities keep the connected-is-enough meaning',
+  );
+
+  client.kill('SIGKILL');
+  await new Promise((r) => server.close(r));
+  console.log('gate-harness self-check: ok (listener and client sockets are distinguishable)');
+}
+
+if (process.argv.includes('--self-check')) {
+  await selfCheck();
+}

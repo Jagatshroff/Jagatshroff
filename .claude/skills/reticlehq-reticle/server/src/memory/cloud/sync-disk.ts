@@ -1,0 +1,384 @@
+/**
+ * The filesystem half of a sync cycle: what `.reticle/` looks like to the protocol.
+ *
+ * Kept apart from `sync-cycle.ts` on purpose. The cycle is the interesting part — what to send, what
+ * to skip, what to do when the network is down — and it stays provable only because it never touches
+ * a disk. This is the boring part, and boring is what it should be: read a file, tolerate its
+ * absence, never throw.
+ *
+ * EVERY READ IS FORGIVING. A half-written impact.json from a process that died mid-flush must cost
+ * one unsynced record, not a crashed sync. There is no state here worth defending against a parse
+ * error — the file will be rewritten on the next tool call anyway.
+ */
+import { shareableRun } from '@reticlehq/core/artifacts';
+import { agentContextFor } from '@/memory/journal/episode-log.js';
+import {
+  agentCaptureOff,
+  agentCaptureOffIn,
+  sharesRequests,
+} from '@/memory/intent/record-request.js';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { stepShotDir } from '@/memory/project/dir/reticle-dir.js';
+import { IntentDir, ReticleDir, STEP_SCREENSHOT } from '@reticlehq/core';
+import {
+  DERIVED_RECORDS,
+  type CloudSyncState,
+  type PulledIssues,
+  type SyncSink,
+  type SyncSource,
+} from './sync-cycle.js';
+import { subjectFor } from '@/memory/intent/intent-subject.js';
+
+const JSON_SUFFIX = '.json';
+
+/** Read + parse, or undefined for absent/unreadable/malformed. Never throws. */
+function readJson(path: string): unknown {
+  try {
+    return existsSync(path) ? JSON.parse(readFileSync(path, 'utf8')) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Write atomically. tmp + rename, because two daemons can serve one repo at once and a half-written
+ * cursor file is one the next read discards — which would silently re-pull the whole decision
+ * history, or worse, skip it.
+ */
+function writeJson(path: string, value: unknown): void {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const tmp = `${path}.${String(process.pid)}.tmp`;
+    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+    renameSync(tmp, path);
+  } catch {
+    // Bookkeeping that cannot be written must never break a sync. The next cycle re-derives it; the
+    // worst case is one redundant upload, which the server dedupes anyway.
+  }
+}
+
+/** Every `*.json` directly inside a directory, parsed. Absent directory reads as empty. */
+function readJsonDir(dir: string): unknown[] {
+  try {
+    if (!existsSync(dir)) {
+      return [];
+    }
+    return readdirSync(dir)
+      .filter((f) => f.endsWith(JSON_SUFFIX))
+      .map((f) => readJson(join(dir, f)))
+      .filter((v) => v !== undefined);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Flows: one directory deeper under the app's own project id, and also flat in `.reticle/flows/`,
+ * which the flow store still saves and loads (a flow saved with no project id, or from before flows
+ * were kept per project). Reading only the subfolders skipped every flat flow while the cycle
+ * reported ok. At any depth: a namespaced name (`onboarding/signup`) is a folder of its own, and
+ * reading one level down left every such flow on the machine.
+ */
+function readFlowFiles(root: string): Array<{ path: string; flow: unknown }> {
+  const walk = (dir: string): Array<{ path: string; flow: unknown }> => {
+    try {
+      return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          return walk(path);
+        }
+        if (!entry.name.endsWith(JSON_SUFFIX)) {
+          return [];
+        }
+        const flow = readJson(path);
+        return flow === undefined ? [] : [{ path, flow }];
+      });
+    } catch {
+      return [];
+    }
+  };
+  return walk(join(root, ReticleDir.FLOWS_SUBDIR));
+}
+const readFlows = (root: string): unknown[] => readFlowFiles(root).map(({ flow }) => flow);
+
+/**
+ * Keep this machine's edit of `name` as `<name>-conflict-<n>` in a file beside it, and write the
+ * platform's version in its place. Answers the copy's name, or undefined when the flow is not here.
+ */
+function keepConflictCopy(root: string, name: string, theirs: unknown): string | undefined {
+  const held = readFlowFiles(root).find(
+    ({ flow }) =>
+      'object' === typeof flow && null !== flow && (flow as { name?: unknown }).name === name,
+  );
+  if (held === undefined || 'object' !== typeof theirs || null === theirs) {
+    return undefined;
+  }
+  const stem = held.path.slice(0, -JSON_SUFFIX.length);
+  let n = 1;
+  while (existsSync(`${stem}-conflict-${String(n)}${JSON_SUFFIX}`)) {
+    n += 1;
+  }
+  const copy = `${name}-conflict-${String(n)}`;
+  writeJson(`${stem}-conflict-${String(n)}${JSON_SUFFIX}`, {
+    ...(held.flow as object),
+    name: copy,
+  });
+  writeJson(held.path, theirs);
+  return copy;
+}
+
+const DERIVED_FILE = Object.fromEntries(
+  DERIVED_RECORDS.map((record) => [record.kind, record.file]),
+) as Record<(typeof DERIVED_RECORDS)[number]['kind'], string>;
+
+/** The directory the sharded intent store writes into, beside the legacy flat file. */
+const INTENT_SUBDIR = ReticleDir.INTENT_SUBDIR;
+const INTENT_INDEX = IntentDir.INDEX_FILE;
+
+/**
+ * Every intent this project holds, flat file and shards merged.
+ *
+ * The store was split into one file per subject so that writing one record stops rewriting all of
+ * them. Sync was not told, and kept reading `intent.json` alone — which the migration deliberately
+ * does not delete. The result was the worst shape a sync bug can take: not an error, but a corpus
+ * that looked healthy on the dashboard and had silently stopped moving, because every intent
+ * captured after the migration stayed on the engineer's laptop.
+ *
+ * Shards WIN on a collision, matching the store's own rule: an id present in both has been migrated
+ * and possibly edited since, and letting the flat copy overwrite that would revert the edit on every
+ * cycle. `index.json` is derived from the shards and is skipped — sending it would duplicate every
+ * record as a summary of itself.
+ *
+ * Returns undefined when there is no memory at all, so a project with nothing to say sends nothing
+ * rather than an empty envelope the server has to store.
+ */
+/** The longest reason the platform keeps for a statement. */
+const MAX_REASON = 2000;
+
+function readIntent(reticleRoot: string): unknown {
+  const legacy = readJson(join(reticleRoot, ReticleDir.INTENT_FILE));
+  const merged: Record<string, unknown> = {
+    ...((legacy as { intents?: Record<string, unknown> } | undefined)?.intents ?? {}),
+  };
+  let shards = 0;
+  for (const entry of safeReaddir(join(reticleRoot, INTENT_SUBDIR))) {
+    if (INTENT_INDEX === entry) {
+      continue;
+    }
+    // `<subject>/intent.json` is the layout; a bare `<subject>.json` is an interim shard the store
+    // has not migrated yet, and is still this project's memory until it has.
+    const path = entry.endsWith(JSON_SUFFIX)
+      ? join(reticleRoot, INTENT_SUBDIR, entry)
+      : join(reticleRoot, INTENT_SUBDIR, entry, IntentDir.SHARD_FILE);
+    const shard = readJson(path) as { intents?: Record<string, unknown> } | undefined;
+    // A hand-edited or half-written shard costs one subject, never the whole sync.
+    if (shard?.intents === undefined) {
+      continue;
+    }
+    shards++;
+    for (const [id, record] of Object.entries(shard.intents)) {
+      merged[id] = record;
+    }
+  }
+  if (legacy === undefined && 0 === shards) {
+    return undefined;
+  }
+  /*
+   * Stamp the SUBJECT before sending, on anything that does not already carry one.
+   *
+   * The subject ladder lives here, in the engine, and knows how to read a flow, a route and a
+   * binding predicate. The server had no access to it and had reimplemented a far weaker version —
+   * flow-or-nothing — so records this ladder files correctly arrived at the dashboard as
+   * `unsorted`. Measured: most of the records the engine can place were landing in the bucket of
+   * last resort, which is what made a coverage map read as one pile with six labels.
+   *
+   * Computed HERE rather than duplicated there, because two rules for one question is how the
+   * answers start disagreeing — and the one with the evidence should be the one that decides.
+   * Records that already name a subject keep it: an agent's explicit choice outranks inference.
+   */
+  const placed = Object.fromEntries(
+    Object.entries(merged).map(([id, given]): [string, unknown] => {
+      // The record's `why` is what the platform keeps as `reason`.
+      const why = (given as { why?: unknown }).why;
+      // The run that proved it, under the name the platform reads (it does not read `provenBy`).
+      const run = (given as { provenBy?: { runId?: unknown } }).provenBy?.runId;
+      const record = {
+        ...(given as object),
+        ...('string' === typeof why && 0 < why.length ? { reason: why.slice(0, MAX_REASON) } : {}),
+        ...('string' === typeof run && 0 < run.length ? { provedBy: run } : {}),
+      };
+      const held = record as { subject?: unknown; surface?: unknown; binding?: unknown };
+      if ('string' === typeof held.subject && held.subject.length > 0) {
+        return [id, record];
+      }
+      const subject = subjectFor({
+        surface: held.surface as { route?: string; flow?: string } | undefined,
+        binding: held.binding,
+      });
+      return [id, { ...held, subject }];
+    }),
+  );
+  return { version: 1, intents: placed };
+}
+
+/** Directory listing that tolerates absence — an unmigrated project has no `intent/`. */
+function safeReaddir(dir: string): string[] {
+  try {
+    return readdirSync(dir);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * A run with the agent's model and the claim that closed its turn, from the agent hooks' records
+ * (see `agentContextFor`). Filled only where the run says nothing. The claim goes into the prompt
+ * context, so it leaves the machine under the same share decision as the request: a context the
+ * run did not have takes the project's setting.
+ */
+function withAgentContext(payload: unknown, reticleRoot: string): unknown {
+  if ('object' !== typeof payload || null === payload) {
+    return payload;
+  }
+  const run = payload as {
+    agent?: { model?: unknown };
+    context?: { closingClaim?: unknown; shared?: unknown };
+  };
+  const found = agentContextFor(reticleRoot, run);
+  let out: Record<string, unknown> = { ...run };
+  if (found.model !== undefined && run.agent !== undefined && run.agent.model === undefined) {
+    out = { ...out, agent: { ...run.agent, model: found.model } };
+  }
+  if (found.claim !== undefined && run.context?.closingClaim === undefined) {
+    const shared =
+      'boolean' === typeof run.context?.shared
+        ? run.context.shared
+        : sharesRequests(dirname(reticleRoot), reticleRoot);
+    out = {
+      ...out,
+      context: {
+        statements: [],
+        ...run.context,
+        closingClaim: found.claim.text,
+        closingClaimAt: found.claim.at,
+        shared,
+      },
+    };
+  }
+  return out;
+}
+
+/**
+ * A run with nothing the agent hooks kept: no prompt context. Agent capture is off, so the files
+ * that the hooks wrote before the switch went off do not leave the machine either.
+ */
+function withoutAgentCapture(payload: unknown): unknown {
+  if ('object' !== typeof payload || null === payload) {
+    return payload;
+  }
+  const { context: _context, ...rest } = payload as { context?: unknown };
+  return rest;
+}
+
+/** What the cycle reads, backed by a real `.reticle` directory. */
+export function diskSource(reticleRoot: string, env: NodeJS.ProcessEnv = process.env): SyncSource {
+  return {
+    runs: () => {
+      const captureOff = agentCaptureOff(env) || agentCaptureOffIn(dirname(reticleRoot));
+      return (
+        readJsonDir(join(reticleRoot, ReticleDir.RUNS_SUBDIR))
+          .map((payload) => {
+            const id = (payload as { runId?: unknown } | null)?.runId;
+            // The prompt context leaves the machine only when the project opted in.
+            const sent = captureOff
+              ? withoutAgentCapture(payload)
+              : shareableRun(withAgentContext(payload, reticleRoot));
+            return 'string' === typeof id ? { runId: id, payload: sent } : undefined;
+          })
+          // A run artifact with no id cannot be diffed against the server's list, so sending it
+          // would mean re-sending it every cycle forever. Dropped rather than uploaded repeatedly.
+          .filter((r): r is { runId: string; payload: unknown } => r !== undefined)
+      );
+    },
+    flows: () => readFlows(reticleRoot),
+    // Flat directory of `<id>.json`, which is exactly what readJsonDir walks — unlike flows, which
+    // sit one level deeper under the app's project id.
+    capsules: () => readJsonDir(join(reticleRoot, ReticleDir.CAPSULES_SUBDIR)),
+    // Intent is the only derived record that is no longer one file. See readIntent.
+    derived: (kind) =>
+      'intent' === kind ? readIntent(reticleRoot) : readJson(join(reticleRoot, DERIVED_FILE[kind])),
+    // The file name comes from a run artifact on disk, so it is held to one segment of the run's
+    // own directory before it is read.
+    screenshot: (runId, file) => {
+      try {
+        if (basename(file) !== file) {
+          return undefined;
+        }
+        return new Uint8Array(readFileSync(join(stepShotDir(reticleRoot, runId), file)));
+      } catch {
+        return undefined;
+      }
+    },
+  };
+}
+
+/** A frame's file name ends in its tool: `<seq>-frame.jpg`. */
+const FRAME_FILE_SUFFIX = `-${STEP_SCREENSHOT.FRAME_TOOL}.jpg`;
+
+/**
+ * The screenshot reader a sync policy allows: none with `screenshots` off, and none for a frame with
+ * `video` off. A frame held back this way is offered again each cycle, so turning video on sends it.
+ */
+export function policyScreenshots(
+  read: SyncSource['screenshot'],
+  policy: { screenshots: boolean; video: boolean },
+): Pick<SyncSource, 'screenshot'> {
+  if (!policy.screenshots || read === undefined) {
+    return {};
+  }
+  if (policy.video) {
+    return { screenshot: read };
+  }
+  return {
+    screenshot: (runId, file) => (file.endsWith(FRAME_FILE_SUFFIX) ? undefined : read(runId, file)),
+  };
+}
+
+/** What the cycle writes back into `.reticle/`. */
+export function diskSink(reticleRoot: string): SyncSink {
+  return {
+    writeIssues: (issues: PulledIssues): void => {
+      // MERGED, not replaced. A pull returns only what changed since the cursor, so overwriting
+      // would drop every earlier decision the moment one new decision arrived.
+      const held = readCloudIssues(reticleRoot);
+      writeJson(join(reticleRoot, ReticleDir.ISSUES_FILE), {
+        triage: { ...held.triage, ...issues.triage },
+      });
+    },
+    writeState: (state: CloudSyncState): void => {
+      writeJson(join(reticleRoot, ReticleDir.CLOUD_STATE_FILE), state);
+    },
+    resolveFlowConflict: (name, theirs) => keepConflictCopy(reticleRoot, name, theirs),
+  };
+}
+
+/** This machine's side of the conversation, or a blank one on first run. */
+export function readCloudState(reticleRoot: string): CloudSyncState {
+  const raw = readJson(join(reticleRoot, ReticleDir.CLOUD_STATE_FILE));
+  return 'object' === typeof raw && null !== raw ? raw : {};
+}
+
+/** The decisions pulled back from the dashboard, for the HUD and for the next run to read. */
+export function readCloudIssues(reticleRoot: string): PulledIssues {
+  const raw = readJson(join(reticleRoot, ReticleDir.ISSUES_FILE));
+  const triage = 'object' === typeof raw && null !== raw ? (raw as PulledIssues).triage : undefined;
+  return { triage: 'object' === typeof triage && null !== triage ? triage : {} };
+}

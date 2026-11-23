@@ -1,0 +1,1048 @@
+import { describe, expect, it } from 'vitest';
+import { mutualPairs, nameCollisions, reaches } from '../../scripts/directory-reach.mjs';
+
+import { join } from 'node:path';
+import { REPO_ROOT } from './machine/repo-root.js';
+
+/**
+ * Which directories in this package reach for which other ones.
+ *
+ * The directories are now gathered into four groups, by who the code is for:
+ *
+ *   portal/  the live link to a running app -- the socket, what we know about a tab, driving it
+ *   agent/       what an agent talks to -- the tool surface, the MCP door, what a drive produced
+ *   command/     what a person runs -- the command line, the daemon's life, setup, updates
+ *   features/    the things Reticle does with what it sees -- flows, journal, crawl, and the rest
+ *
+ * Grouping made the package legible. It did not make it less tangled, and this file exists so
+ * nobody mistakes the first for the second. Two numbers are frozen: who reaches for whom, and how
+ * many pairs reach for EACH OTHER -- which is the one that says whether a piece could ever leave,
+ * because two directories that both need the other cannot be read, moved or tested apart.
+ *
+ * Neither number may grow. Both may shrink, and shrinking is the work going well.
+ *
+ * A freeze rather than a rule about which group SHOULD depend on which, because a rule strict enough
+ * to be worth having would be red on the day it was written, and a check that is red on day one
+ * teaches people to switch it off rather than to fix anything.
+ *
+ * Imports are RESOLVED, not pattern-matched. An earlier version looked for `../name/`, which reads
+ * a cross-group import as landing in the group rather than in the directory inside it, and quietly
+ * counted a third of the graph as absent.
+ */
+
+/**
+ * The graph itself lives in `scripts/directory-reach.mjs`, not here.
+ *
+ * There are three callers now -- this guard, the browser package's, and `safe-to-group.mjs`,
+ * which predicts what both will say. Three copies of one graph computation is three chances for
+ * the prediction to disagree with the test it predicts, which would be worse than having no
+ * prediction at all.
+ */
+const SERVER = join(REPO_ROOT, 'server');
+
+/**
+ * BEFORE MOVING FILES, ask `node scripts/safe-to-group.mjs <dir> <name...>`.
+ *
+ * This test is the authority and it answers only AFTER a move, which made the first round of
+ * directory grouping a sequence of move, rewrite every import, run this, revert. Three of the
+ * first four candidate groups had to be reverted that way -- each one an expensive route to a
+ * fact that was sitting in the import graph the whole time.
+ *
+ * That script answers the same question first. A group is unsafe exactly when some directory it
+ * reaches OUT to also reaches back IN to it, which is a mutual pair by definition and the only
+ * way a grouping can raise the count below. It is a prediction of this test; this test still
+ * decides.
+ *
+ * What each directory reaches for today. Adding an entry is a decision, which is the point.
+ *
+ * Before adding one, the question worth asking is whether the thing being reached for is in the
+ * right place. Most of the reaches removed from this repo so far turned out to be a file filed
+ * somewhere odd rather than a dependency anybody needed.
+ */
+const REACHES_FOR: Record<string, readonly string[]> = {
+  /**
+   * Everything about how an assertion becomes a verdict: the grade it earns, where the claim
+   * came from, and the verdict itself. Twelve files by that name sat loose in a directory of
+   * 138, and the name was already doing the grouping.
+   *
+   * It is NOT a sink like `facts`, and the ledger is worse than that one's: three edges in,
+   * none freed. `assert` reads a session to know what was observed and `act` to know what was
+   * done, which is what an assertion is made of, so those two are inherent rather than
+   * incidental. What it buys is a directory of twelve files that are one subject, out of a
+   * directory that is the largest in the repository.
+   *
+   * `safe-to-group` said SAFE before the move and the mutual-pair count did not change, which
+   * is the property this file actually protects. If a fourth edge ever appears here, the
+   * question to ask is whether `assert` has stopped being one subject.
+   */
+  assert: ['act', 'session'],
+  /**
+   * Four directories reach `session/facts/`, and the edge COUNT went up while the coupling
+   * went down. That is worth stating, because this list counts edges and cannot weigh them.
+   *
+   * `facts` holds what is known ABOUT a session and computes nothing: the handshake's facts,
+   * the ambient observed state, which tab a ref came from, and how a reconnect is recognised.
+   * It reaches out to NOTHING -- a pure sink. So `tools`, `bridge`, `crawl` and `session`
+   * itself now depend on a dependency-free group of four files instead of on `session`, a
+   * 34-file directory that depends on a great deal.
+   *
+   * The ledger: four edges in, one out. `crawl -> session` is GONE, which is what
+   * `safe-to-group` predicted before anything moved, and the mutual-pair count did not move --
+   * the property this file actually protects.
+   *
+   * Depending on a sink is weaker coupling than depending on a hub, and a directory that
+   * imports nothing can be read, moved and tested alone. If a later reading disagrees, the
+   * thing to re-examine is whether `facts` stayed a sink: the moment it reaches out to
+   * anything, this trade stops being one.
+   */
+  // One way, and it stays one way: the OpenVerification adapter reads a live session to answer the
+  // protocol's eight questions, and nothing in `session` knows the adapter exists. The mutual-pair
+  // count is unchanged by it, which is the test that matters -- a grouping that raises that number
+  // is a shorter directory listing bought with a real property.
+  realm: ['session'],
+  /**
+   * The act LEAVES, and why this grouping is allowed where an earlier one was not.
+   *
+   * A first attempt moved the whole act cluster, `act-tools.ts` included, and the mutual-pair
+   * count went 32 -> 34: the tool registry and the act tools need each other, so splitting them
+   * bought a shorter directory listing with a real property, and it was reverted.
+   *
+   * What moved instead is only the files that import NO sibling. That makes the edge strictly
+   * one-way by construction -- `tools` reaches for `act`, and `act` can never reach back, because
+   * nothing in it imports upward. The three reaches below are the ones these files already had
+   * under their old home; they are the same edges, now attributed to the directory that owns them.
+   */
+  // `hooks` for whether the Harness may press an outward control: who is acting is only known there.
+  act: ['page-commands', 'capsule', 'input', 'read', 'session', 'hooks', 'facts'],
+  /**
+   * The read leaves: what a snapshot or a query LOOKS like, with no opinion about what it means.
+   *
+   * Same construction as `act` -- nothing here imports a sibling, so `tools -> read` can never
+   * become mutual.
+   */
+  read: [],
+  /**
+   * What this build could not see, and what it lacks to see it: an absent capability, a coverage
+   * identity, an action that produced nothing observable, a missing source marker.
+   *
+   * The protocol calls this coverage, and it is the half of a verdict every other test format
+   * leaves out. Reaches for nothing.
+   */
+  gaps: [],
+  /**
+   * The two kinds of form field a replay cannot just re-type: a secret, which must not be
+   * recorded, and a file, which has to be found again on disk.
+   */
+  fields: ['tools'],
+  /**
+   * What `reticle doctor` prints: the rows, the project line, the hint about Chromium.
+   *
+   * Worth its own name for a reason the guard made visible. Moving these OUT of `cli` removed
+   * `pool -> cli` and `tools -> cli` entirely: neither wanted the command-line at all, both
+   * wanted a row to print. That is this guard's own thesis -- most reaches it has removed turned
+   * out to be a file filed somewhere odd rather than a dependency anybody needed.
+   */
+  /**
+   * The doctor rows. Two of them moved here from the flat cli directory to sit beside
+   * doctor-project-line, and they bring with them the two things a row reads: the session it
+   * describes and the version it prints. The cli directory stopped reaching for version at all
+   * in the same move, because that reach was only ever these files.
+   */
+  // `doctor`: an agent session's first answer carries doctor's keychain note for a differently
+  // signed macOS build, read by the same function doctor prints it with (a leaf; no pair).
+  agent: ['doctor'],
+  // Both commands use the same MCP connection hint from `answers` (#1963).
+  doctor: ['answers', 'session', 'version'],
+  status: ['answers'],
+  /**
+   * Getting something running and waiting for it: the bridge port, the daemon, the dev server,
+   * the relaunch. Everything `reticle init` does between writing files and having a session.
+   */
+  bringup: ['binding', 'cli', 'daemon', 'mcp'],
+  /**
+   * What the daemon remembers between sessions: which projects have registered, what a previous
+   * connection looked like, whether an address smells like somebody's dev server.
+   *
+   * Moving it out removed `command -> session` and `mcp -> session`. Neither wanted a live
+   * session; both wanted the memory of one.
+   *
+   * `features/memory` merged in here when the memory category landed: two directories with one
+   * basename are ONE node to this graph, so their reaches were already being counted together —
+   * putting the files in the directory that already had the name is what makes the ledger honest
+   * rather than what changes it. These are the union, and nothing started or stopped needing
+   * anything.
+   *
+   * `flows` for `reticle_memory { action: "push-flow" }`: it uploads the flow the SESSION's project
+   * saved, so it needs the same per-session flow store every flow tool resolves through. Reading the
+   * file directly would be a second, unmigrated reader of the flow format.
+   *
+   * `hooks` for the calling MCP client's name: a memory read is credited to the agent that made it,
+   * the same name `journal` and `runs` credit a drive to. Every read reached the dashboard as
+   * `reticle-mcp` before (persona drive, 2026-10-11).
+   */
+  recall: ['args', 'cloud', 'flows', 'fs', 'hooks', 'project', 'tools'],
+  /**
+   * The filesystem, as a port.
+   *
+   * Thirteen directories reach for it, and until now every one of them reached for `project` to
+   * get there -- a file filed in the feature that happened to need it first. Extracting it
+   * removed `cloud -> project` and `command -> project` outright: neither wanted a project, both
+   * wanted to read a file.
+   *
+   * Reaches for nothing itself, which is what a port should do.
+   */
+  fs: [],
+  /**
+   * Starting the CLI as a child process and waiting for it.
+   *
+   * Predicted to free three reaches before it was moved, and it freed exactly those three:
+   * `mcp -> cli`, `setup -> cli` and `terminal -> cli` are gone. None of them wanted the
+   * command-line surface; each wanted to start a process. Mutual pairs 29 -> 27.
+   */
+  // `surface` is new here because `http-server.ts` and `loopback-agent.ts` stopped being loose
+  // files at `src` root and gained a home. The graph skips root files, so every edge those two
+  // already had materialised at once — this is that, not a dependency anybody added. The plan that
+  // ordered these moves named the mechanism in advance, and the number that matters did not move:
+  // the mutual-pair count is unchanged, so nothing here started needing something that needs it back.
+  // `surface` left with `daemon-status-probe.ts`: `loopback-agent` was reached for that probe and
+  // nothing else here. `binding` replaces it, because the skew warning still asks for the status.
+  launch: ['machine', 'identity', 'version', 'binding'],
+  /** The mouth and ears: the tool surface and the MCP server, plus the HTTP door they answer on. */
+  surface: [
+    'bridge',
+    // The POST that carries a tool call names the proxy's project, and the diagnosis reads that
+    // directory from the same async context the Harness uses for who is driving.
+    'hooks',
+    'telemetry',
+    'version',
+  ],
+  /**
+   * Where `.reticle/` is for a given project, and the id derived from it.
+   *
+   * Freed `capsule -> project` and `visual -> project`: neither wanted the project feature, both
+   * wanted to know which directory to write into.
+   */
+  dir: ['fs'],
+  /**
+   * Finding the config a command should read, before any command has run.
+   *
+   * Freed four reaches on `cli`. `license`, `project` and `session` never wanted the
+   * command-line; they wanted to know where the configuration is.
+   */
+  config: ['resolve'],
+  /**
+   * What version this daemon is, as a fact rather than as a comparison.
+   *
+   * `version/` is about SKEW -- is the page's build the same as ours, and what to say when it is
+   * not. Six directories reached it only to learn our own version number, which is not a
+   * comparison at all. Freed `command -> version`, `telemetry -> version` and `update -> version`.
+   */
+  identity: [],
+  /**
+   * Which port the daemon is on, resolved once for everybody who needs to reach it.
+   *
+   * Extracted out of `ports/`, a grouping made earlier in this same audit. Seven directories
+   * reached `ports` and wanted only this file; the port HOLDER and the sibling scan are a
+   * different question that only the CLI asks. Grouping by theme buried a high-demand file
+   * behind two low-demand ones, and the fan-in measure is what caught it afterwards.
+   */
+  resolve: [],
+  /**
+   * What a previous connection to this project looked like.
+   *
+   * Extracted out of `recall/` for the same reason, and named `prior` rather than `memory`
+   * because `features/memory` already exists -- caught by the basename-uniqueness guard added
+   * earlier in this audit, on a collision introduced by this audit.
+   */
+  prior: [],
+  browser: [],
+  peer: [],
+  tape: [],
+  /**
+   * Who is attached to a session, and who may drive it. Reaches for NOTHING -- not even its own
+   * parent -- which is the strongest form a group can take: `session` needs it, and it needs
+   * nobody, so the edge cannot ever become mutual however either side grows.
+   */
+  presence: [],
+  /**
+   * The person in the loop: their review marks, their messages to the agent, and what the panel
+   * is told to show them. Reaches for nothing.
+   */
+  human: [],
+  /**
+   * What a flow's result MEANS -- whether an assertion still has integrity, who a failure belongs
+   * to, why a role drifted. Reaches for nothing, like `presence`, so both edges into it are
+   * permanently one-way.
+   */
+  outcome: [],
+  /**
+   * Which port a daemon binds, who already holds one, and which siblings are up.
+   *
+   * Seven directories reach for it, which is the argument for its existing: a question that many
+   * parts of a program ask is a thing, and it was seven files in the middle of the CLI. It
+   * reaches for nothing itself.
+   */
+  ports: [],
+  /**
+   * Talking to the person at the terminal: asking, interrupting, showing progress, recording what
+   * was said. Named `terminal` and not `console`, which in a JavaScript codebase means the API.
+   *
+   * It reaches for four things and that is honest -- it prints daemon state, port state and
+   * telemetry notices, because that is what a setup transcript is made of.
+   */
+  terminal: ['binding', 'daemon', 'launch', 'resolve', 'telemetry'],
+  /** A recorded flow and what became of it: the tape, the rewind, the flake, the halt. */
+  recording: [],
+  /** What a human wrote on a step, and where they pointed when they wrote it. */
+  'annotate-notes': [],
+  /*
+   * Six reaches came off this list when `bridge.test-harness.ts` was renamed to
+   * `bridge.test-harness.ts` — `flows`, `fs`, `project`, `stores`, `tape` and `tools`.
+   *
+   * None of them were the bridge's. They were a TEST HARNESS's, counted as production code because
+   * its name did not match the `.test.` pattern this scanner and `prepare-dist.mjs` both read. The
+   * rename was to stop the harness shipping in the tarball; that it also halved this list is the
+   * more interesting half, because the coupling recorded here was partly an artifact of scaffolding
+   * being mistaken for the thing it scaffolds.
+   */
+  bridge: [
+    // The event bus. See the note on `cloud` below for why many directories reach it.
+    'hooks',
+    'facts',
+    'identity',
+    'impact',
+    // A production nonce decides whether a HELLO opens a production session, and with what scope.
+    'production',
+    // Whether a session may follow its own navigation to an origin the bridge was not built with.
+    'origin',
+    'session',
+    'telemetry',
+    'version',
+  ],
+  capsule: ['dir', 'fs'],
+  cli: [
+    // The link to a running daemon, shared with `reticle compare`.
+    'daemon-link',
+    // `reticle status` (status-fields.ts) prints its facts through the renderer in `status`.
+    'status',
+    // `doctor` prints, per agent, whether its prompt hook is installed: `hook` holds that table.
+    'hook',
+    // `reticle try` asks the platform for its free drive through the same call the HUD's Run
+    // Harness button makes (platform-drives.ts), so the two grants cannot drift apart.
+    'platform',
+    // doctor reads the document the dev server serves (served-document.ts) to judge its CSP.
+    'dev-server',
+    // `reticle gate` ratchets on the coverage ledger and blocks changed code that never ran.
+    'exhaust',
+    // `verify <url> --against <reference>` drives two builds and reports what differs (#2190).
+    'compare',
+    // `verify <url> --expect` opens the url when no tab is on it, by the same rule `reticle open`
+    // uses (decideOpen), so the two commands cannot disagree about which tab counts.
+    'launch',
+    // The first-use checks compare Node.js to the `engines` floor with the one version compare.
+    'version',
+    'answers',
+    'binding',
+    'suite',
+    'change',
+    'stores',
+    'artifact',
+    'auth',
+    'bridge',
+    'browser',
+    'cloud',
+    'daemon',
+    'doctor',
+    'flows',
+    'fs',
+    'identity',
+    // `reticle report` folds a session's action ledger from disk, with no daemon to ask. The ledger
+    // reader lives in `journal`; a second copy of it here would be a second opinion on its format.
+    'journal',
+    // `reticle report --hook` keeps the agent while its Harness drive runs: it reads the drive
+    // record the daemon writes (`dir` names the file, `harness` its status, origin and poll call),
+    // so the hook and the daemon cannot disagree about either.
+    'harness',
+    'dir',
+    'mcp',
+    'outcome',
+    // `status` and `setup mcp` read which agents connected, by name, from the record the proxy writes.
+    'peer',
+    'ports',
+    'prior',
+    'project',
+    'resolve',
+    'runs',
+    'session',
+    'setup',
+    'tape',
+    'tools',
+    'update',
+  ],
+  /**
+   * The event bus, and the one directory it is CORRECT for several others to reach.
+   *
+   * `hooks` is a pure SINK: it imports nothing from this package, so no reach into it can ever
+   * become a mutual pair — the same argument `facts` makes above, and the property this file
+   * actually protects. Three directories reach it, and each is a place where something BECAME TRUE:
+   * `tools` decided a verdict, `bridge` saw a session attach, `cloud` finished a sync. Routing them
+   * through one courier would mean a courier that has to know about all three, which is a hub where
+   * there is currently a sink.
+   *
+   * If a FOURTH kind of caller appears, the question is whether the new event is a moment something
+   * became true or an internal step wearing an event's clothes — the bar stated in `hook-events.ts`.
+   */
+  // `dir` for DRIVE_RECORD_SUFFIX, as `telemetry` below: the unsent-run count read a refused
+  // drive's `.drive.json` as a run, so `reticle sync` and the dashboard asked for a sync that had
+  // nothing to send, forever.
+  // `journal` for the agent hooks' records a synced run takes its model and closing claim from.
+  // `journal` imports nothing from `cloud`, so this adds no mutual pair.
+  cloud: ['cli', 'dir', 'fs', 'hooks', 'intent', 'journal'],
+  command: [
+    'answers',
+    // `reticle hook`, dispatched first in `cli.ts` so that telemetry never sees a prompt.
+    'hook',
+    // `serve`, `stop` and `restart`, lifted out of cli.ts when that file reached the thousand-line
+    // cap with zero headroom. One idea -- does a daemon exist, and did the command that changed
+    // that report what is actually the case -- so it moved as a unit rather than by line count.
+    'lifecycle',
+    'lifetime',
+    'binding',
+    'drive',
+    // `reticle compare` drives two builds of one app and lists what differs.
+    'two-builds',
+    // `reticle grade` grades a finished run from snapshots of the app's stored data.
+    'finished-run',
+    'cli',
+    'daemon',
+    'change',
+    'fs',
+    'identity',
+    'launch',
+    'license',
+    'mcp',
+    'resolve',
+    'init',
+    /**
+     * `setup`, for one thing: the crash guard.
+     *
+     * `cli.ts` is the composition root and already reaches nineteen directories; this is the
+     * twentieth, and it is deliberate rather than accidental. The guard that turns a bug of ours
+     * into one sentence has to be installed for the WHOLE process — a fault can fire in any phase,
+     * and an earlier attempt that installed it inside the runtime phase caught nothing in two
+     * different environments because init had already returned. What it cleans up is the detached
+     * dev server `setup-command.ts` owns, so the installer lives there and the entry point calls it.
+     *
+     * It adds no mutual pair: `setup` does not reach `command`, and must not start.
+     */
+    'setup',
+    'telemetry',
+  ],
+  // `exhaustive` is crawl's mode: the explorer and ledger it runs, the fill values the harness
+  // already chooses (and the RETICLE_SECRET_* names replay reads), and the mocks that break a write.
+  // `edges` and `fs`: the exhaustive run (crawl-exhaustive.ts) drives the edge cases and writes the
+  // ledger. It lives here, not in `exhaust`, because `edges` reads `exhaust` and a caller inside
+  // `exhaust` would make the two need each other.
+  crawl: [
+    'args',
+    'project',
+    'tools',
+    'facts',
+    'exhaust',
+    'flows',
+    'harness',
+    'input',
+    'edges',
+    'fs',
+  ],
+  /**
+   * The app-wide coverage ledger. It persists to `.reticle/coverage.json` through the same three
+   * project-memory directories every other store uses, and reads routes the way crawl does.
+   */
+  // `facts` and `session`: a full page load replaces the session, and the explorer must follow it
+  // (session-port.ts) with the same reconnect wait `navigate { reload }` uses.
+  exhaust: ['dir', 'fs', 'project', 'facts', 'session'],
+  // Two builds are explored with the same breadth-first explorer the exhaustive crawl uses.
+  // `outside` holds what `reticle compare` reads beside the page tree: the network and console
+  // lines, and the values the app's scripts compare fields with.
+  compare: ['exhaust', 'outside'],
+  // The grade rules read the state sources that `compare --state` declares.
+  grade: ['outside'],
+  // `reticle grade`: the rules are in `grade`; the step and flags in the `cli` parser; the host
+  // reads of state sources are the ones `two-builds` uses, so both commands read the same way.
+  'finished-run': ['cli', 'grade', 'outside', 'two-builds'],
+  // `reticle compare`: the rules are in `compare`; this directory reaches the daemon over the same
+  // MCP client and lease calls `cli` uses, with the pairing token (`bridge`) and the caller's
+  // project `.reticle` (`project`).
+  'two-builds': ['bridge', 'compare', 'daemon-link', 'outside', 'project'],
+  // The CLI's link to a running daemon (MCP over HTTP/SSE, the lease calls, the result readers),
+  // split out of `adhoc-verdict.ts` so `reticle compare` and its tool do not reach the browser
+  // launcher. `runs` names the client, `bridge` the token, `tools` the lease sentences.
+  'daemon-link': ['bridge', 'runs', 'tools'],
+  // Edge cases, driven on the explorer's states and judged by the explorer's own checks.
+  edges: ['exhaust'],
+  // `ports`: port-state.ts names the process that holds the bridge port, so every surface says the
+  // same thing about a daemon that holds it and does not answer (#1937).
+  /**
+   * `init` is one function: `portFromEnv`, the CLI's single reader of `RETICLE_PORT`. `splitBrainNote`
+   * branches its advice on it, because the variable outranks `.reticle.json`; a second parser here
+   * would be a second opinion on what counts as a port.
+   */
+  daemon: ['lifetime', 'binding', 'ports', 'telemetry', 'init'],
+  domain: ['args', 'dir', 'flows', 'oracles', 'project', 'tools'],
+  flows: [
+    // Steps that reach past the page (open a page, send a request). The folder imports nothing back.
+    'steps',
+    'machine',
+    'navigation',
+    'suite',
+    'change',
+    'args',
+    'stores',
+    'act',
+    'annotate-notes',
+    'cli',
+    'cloud',
+    'dir',
+    // One sentence about what a dead transport means, shared with the crawl that learned it first:
+    // a full-document navigation rejects the command that caused it, and replay has to tell that
+    // apart from the app failing. Restating the recogniser here is how the two halves drift.
+    'facts',
+    'fields',
+    'fs',
+    // A saved flow's replay marks itself, so the Harness's outward-action gate does not hold back
+    // steps somebody recorded on purpose; the drive context lives in hooks.
+    'hooks',
+    'intent',
+    'journal',
+    'outcome',
+    // WHICH agent made a saved flow, for the same reason `runs` reaches it: a flow's author is the
+    // MCP client's own claim, and that claim is only read in one place.
+    'peer',
+    'project',
+    'recording',
+    'runs',
+    'session',
+    'tape',
+    // A replay that starts while the page reconnects waits for it with the same wait the tools
+    // use (resolve-within.ts). `timing` reaches nothing, so this adds no mutual pair (#2168).
+    'timing',
+    'tools',
+    // Every replayed step leaves a screenshot, taken by the same function every action uses.
+    'visual',
+  ],
+  // `project` for where this project's work stands with the platform, shown beside Sync now.
+  impact: ['cloud', 'project', 'session'],
+  // `read` for `shapeQueryResult`: the scrolling find answers in the SAME shape as a plain find,
+  // and sharing the shaper is what stops `scroll: true` being a different tool wearing one name.
+  // One way only — `read` reaches nothing, which is the property that keeps it movable.
+  input: ['args', 'pool', 'telemetry', 'tools'],
+  // `telemetry` for the one free-text redactor (credentials and personal data out of what a person
+  // wrote), shared with feedback reports: a relayed user request is the same kind of text.
+  intent: ['dir', 'fs', 'machine', 'project', 'telemetry', 'tools'],
+  /**
+   * `reticle hook prompt`: the agent's prompt hook. It finds the project from the folder the
+   * prompt was sent in (`config`), and keeps the prompt with the one recorder `reticle_intent`
+   * uses (`intent`), so the two writers cannot keep the request in two shapes. It writes
+   * `.reticle/.gitignore` with the daemon's own rule (`on-disk`, reading the old file through `fs`),
+   * because the hook can run before any daemon has, and a prompt must never land unignored.
+   */
+  // `journal` for the episode log's record version: the post-tool hook writes into the same files.
+  // `journal` imports nothing from `hook`, so this adds no mutual pair.
+  hook: ['config', 'fs', 'intent', 'journal', 'on-disk'],
+  // What a run artifact is FOR once it exists -- stored, compared, and read back as established
+  // fact -- as against the rest of `runs`, which produces one. Named `artifact`, singular, and it
+  // must stay singular: `core/src/artifacts` is a different package and a different node, and
+  // "correcting" the spelling would give two directories one basename, which is how the reach
+  // graph silently collapsed `cli/cloud` into `features/cloud` with every test still passing.
+  // `hooks` for the episode a run belongs to (`episode-stamp.ts`, a leaf that imports nothing).
+  artifact: ['dir', 'flows', 'fs', 'hooks'],
+  // `reticle login` and what it leaves on the machine: the credential store, the signed-in
+  // session, and the browser device flow. Named `auth` and deliberately NOT `cloud`, though every
+  // file in it is about the cloud -- `features/cloud` already owns that basename, and the reach
+  // graph keys on basename, so a second `cloud` would merge the two into one node and every test
+  // would still pass. That has happened here once already.
+  auth: ['machine', 'cloud'],
+  // How the MCP layer's failures reach the agent: recognising a refusal that arrived dressed as
+  // a success, and reporting that the tools are gone. What `tools` wanted from `mcp` was these
+  // two files and nothing else, which is why lifting them broke the `mcp <-> tools` pair.
+  faults: ['telemetry'],
+  // `hooks` for the same reason `tools`, `bridge` and `cloud` reach it: a verdict landing is what
+  // tells a drive to publish its run, and the bus is a sink that can never reach back.
+  journal: ['on-disk', 'artifact', 'dir', 'fs', 'hooks', 'project', 'runs'],
+  license: ['config'],
+  mcp: [
+    // The handshake names the coding agent on each connection, for the HUD's "Connected:" line.
+    'hooks',
+    'binding',
+    'daemon',
+    'faults',
+    'identity',
+    // The proxy records which agent connected, from the `initialize` request it forwards.
+    'peer',
+    'prior',
+    'proxy',
+    'resolve',
+    'telemetry',
+    'tools',
+    'version',
+  ],
+  pool: ['browser', 'input', 'telemetry'],
+  // `runs` dropped out: what project wanted from it was the artifact, which is what broke the
+  // project <-> runs mutual pair and took the count from 24 to 23.
+  project: ['args', 'artifact', 'cloud', 'config', 'dir', 'fs', 'machine', 'tools'],
+  // The MCP proxy: the transport half of `mcp`, which reaches nothing of its siblings and was
+  // therefore extractable without tangling anything. Reaches out to two, reached in from two,
+  // and no pair among them is mutual -- which is the only thing that would have raised the count.
+  // `telemetry` arrived with `mcp-post-transport`, which is the proxy's POST leg and had been
+  // filed beside the proxy rather than in it. Moving it in adds an edge and removes a lie about
+  // where that code lives; the count is unchanged either way.
+  proxy: ['binding', 'daemon', 'identity', 'telemetry'],
+  // `agent`: the resume block reads the app notes the agent layer learns (a leaf; no pair).
+  // `input` and `timing` for `verify` between flows (#2060): the live port reads the driven page
+  // (`DrivenPage`), and waits for the run's tab with the wait that replay uses
+  // (`resolveSessionWithin`). Neither directory reaches `runs`, so no pair is added.
+  runs: [
+    'agent',
+    'artifact',
+    'cloud',
+    'dir',
+    'flows',
+    'hooks',
+    'input',
+    'intent',
+    'project',
+    'telemetry',
+    'timing',
+    'tools',
+  ],
+  session: [
+    // A command the Harness sends is marked as the Harness's, so the HUD can say who is driving;
+    // the async context that knows lives in `hooks`, beside the journal that reads it too.
+    'hooks',
+    // Ending a session reports what it claimed and what held, folded from its own journal by the
+    // one gap fold the context tool and `reticle report` also use.
+    'artifact',
+    'page-commands',
+    'dev-server',
+    'args',
+    'timing',
+    'facts',
+    'bridge',
+    'config',
+    'daemon',
+    'gaps',
+    // Every impact push carries the drive running on its tab, or the HUD's Stop button is cleared
+    // by the next push the drive's own tool calls make.
+    'harness',
+    'human',
+    // The listing and each verdict compare the page SDK with this daemon's own version.
+    'identity',
+    'impact',
+    'input',
+    'journal',
+    'mcp',
+    'ports',
+    'presence',
+    'prior',
+    // A production session passes every act through the production policy before it is sent.
+    'production',
+    'recall',
+    'resolve',
+    'telemetry',
+    'tools',
+    'version',
+  ],
+  // `mcp` dropped out when the proxy files left it: what setup actually wanted from that
+  // directory was the proxy, and nothing else. The extraction made an existing dependency
+  // legible rather than adding one -- see `would FREE` in scripts/safe-to-group.mjs.
+  // `resolve` is here because `setup-command` reports the project id in its result, and
+  // `readProjectId` lives there. One way, and the same edge `mcp` and `tools` already had -- it
+  // is the only module that exports it, so the alternative was a second copy of the reader.
+  setup: ['binding', 'bringup', 'daemon', 'launch', 'probe', 'resolve', 'terminal'],
+  telemetry: [
+    // The run count skips a Harness drive's own record (`DRIVE_RECORD_SUFFIX`), named once beside
+    // the runs directory it sits in rather than spelled again here.
+    'dir',
+    'cli',
+    'daemon',
+    'identity',
+    'license',
+    'peer',
+    'prior',
+    'resolve',
+    'session',
+    'tools',
+    'update',
+    // Every event says where the machine stands with the platform (`account-envelope.ts`): the
+    // sign-in reader in `cloud` and the folder a link is written in, in `project`. Read, never
+    // reimplemented: a second reading of the session file is a second thing that can disagree.
+    'cloud',
+    'project',
+    // Which agent client an event came from: the connection the call came over, in `hooks`.
+    'hooks',
+    // The Harness funnel names a drive's origin and status from the registry that records them.
+    'harness',
+  ],
+  /**
+   * The three flow stores that read and write .reticle/ on disk, moved out of a 35-file directory
+   * because each one imports no sibling. They reach the filesystem port and the flow shapes they
+   * persist, and nothing in flows is reached back through them.
+   */
+  stores: ['dir', 'fs', 'outcome', 'project', 'recording'],
+  /**
+   * Deadlines, and the clock they are measured against. Three files that import nothing at all,
+   * which is what let them out of a 27-file directory. stall-clock belongs with them by subject
+   * and stayed behind: it is mutual with telemetry, and this rule does not move a file that would
+   * carry a knot with it.
+   */
+  timing: [],
+  /**
+   * What a caller may pass. Two files that import nothing at all: the spellings one tool accepts
+   * from the tool next door, and the bounds a numeric input has to sit inside. Nine directories
+   * reach them, which is the argument for a name rather than against one.
+   */
+  args: [],
+  /**
+   * The daemon half of `reticle init`: the capabilities the init package cannot know for itself,
+   * and what happens after the files are written. Both were flat in setup/, and taking them out
+   * is why setup no longer reaches bridge, proxy or telemetry at all — those three reaches were
+   * these two files and nothing else.
+   */
+  // `hook` for `hookBinFor`: the bin init writes into each agent hook, the same one the hook's fast
+  // path runs from. `hook` imports nothing from `init`, so this adds no mutual pair.
+  init: ['binding', 'bridge', 'bringup', 'hook', 'proxy', 'setup', 'telemetry', 'terminal'],
+  /**
+   * A file changed: which flows must re-verify, what the gate does about it, and how a
+   * save-heavy editor's burst becomes one flush. Four files that import nothing whatsoever,
+   * which is what let them out of a 32-file directory.
+   */
+  change: [],
+  /**
+   * The whole set rather than one flow: running the suite in parallel over the lease pool,
+   * handing it to the hosted runner instead, how much of the declared surface it covered, and
+   * what the flake ledger learned from the run.
+   */
+  suite: ['cloud', 'fs', 'stores', 'tools'],
+  /**
+   * `reticle drive`. It attaches to a daemon that is already running rather than binding the
+   * port itself, which is the whole reason the two files exist and why they reach the daemon,
+   * the port probe and the mcp surface.
+   */
+  drive: ['binding', 'daemon', 'mcp'],
+  /**
+   * This project's dev server: the literal command that starts it, read from the project's own
+   * scripts, and which of the usual ports already have something listening. Named dev-server
+   * rather than dev because command/dev already owns that basename, and the reach graph keys on
+   * the basename alone -- two directories called dev are one node to it, and a mutual pair
+   * between them could not be reported at all.
+   */
+  'dev-server': ['recall', 'resolve'],
+  /**
+   * The address the daemon lives at: a port this machine will actually let us bind, the IPv6
+   * loopback alias that makes `localhost` reach it on every platform, and the three-state answer
+   * to what is already on the bridge port. Eight directories reach these three files and they
+   * import nothing at all, which is why they were the most-reached flat files in the package.
+   * Naming them also untangled init, which no longer reaches daemon for anything else.
+   */
+  // `surface` arrived with `daemon-status-probe.ts`, the /status half of `probePresence`. It used
+  // to sit in `launch/`, where it read as a launcher helper and was nothing of the kind: every one
+  // of its callers passes it straight to `probePresence`, which lives here. Moving it took SEVEN
+  // reaches out of this package (`bringup`, `cli`, `drive`, `init`, `lifecycle`, `mcp` and
+  // `terminal` all reached `launch` for that one function and nothing else) and added four, so the
+  // sentence above — that these files import nothing at all — is no longer true of this one, and
+  // the trade was worth making anyway.
+  binding: ['surface'],
+  /**
+   * How long a daemon lasts: the log event when the child cannot start, the pid of a predecessor
+   * that died without exiting, the beat that turns silence in the log into evidence, whether this
+   * one was ever useful to anybody, and how long an idle one is given before it shuts itself
+   * down. Five files, none of which imports anything.
+   */
+  /**
+   * `serve`, `stop`, `restart` -- and six reaches, which deserve their own sentence because the
+   * number looks like a finding and is not one.
+   *
+   * Every one of these six is already in `command`'s list above. Nothing here reaches for anything
+   * cli.ts was not reaching for yesterday: the code moved, and the edges moved with it. A split
+   * always shows up as new PAIRS in a guard that counts directory-to-directory edges, even when the
+   * package's total tangle is unchanged -- and this is that case, not a new dependency anybody
+   * acquired.
+   *
+   * What the split did do is make the reach legible. Six collaborators for three commands reads as
+   * a lot until you name them: probe the port (`binding`), read and signal the pid (`daemon`),
+   * read why a start failed (`lifetime`), ask the daemon what it serves (`launch`), open a socket
+   * to see if anything answers (`mcp`), and free the port before rebinding it (`cli`). That is one
+   * job -- decide whether a daemon exists and report honestly -- done against six facts about the
+   * machine.
+   *
+   * The genuine finding underneath is one directory over: `probePresence` is handed the identical
+   * `{ tcpOpen: probeDaemon, status: fetchStatus }` pair at EIGHT call sites, and two of the six
+   * edges here exist only to carry those two functions to it. A pre-wired `livePresence(port)`
+   * would delete the duplication and two of these reaches at once. Not done here because its home
+   * is a real decision -- putting it in `binding` coupled that directory to `mcp` and `launch`,
+   * which is moving the problem -- and a release branch is the wrong place to make it.
+   */
+  lifecycle: ['binding', 'cli', 'daemon', 'lifetime', 'mcp'],
+  lifetime: [],
+  /**
+   * Facts and chores about the computer this daemon is running on: the `process.platform` values
+   * it actually branches on, where the checkout is, and how to delete a temp directory on an OS
+   * that does not release handles promptly. Three files at the package root that import nothing.
+   */
+  machine: [],
+  /**
+   * What the journal leaves on the filesystem: the shape of the file the learned ambient map is
+   * kept in, which `.reticle/` entries are local state that must never be committed, and how
+   * long any of it is kept. Three files that reach the directory layout and the filesystem port
+   * and nothing else.
+   */
+  'on-disk': ['dir', 'fs'],
+  /**
+   * Finding out what is actually there. The daemon cannot know what a page contains, which
+   * loopback address a dev server really answers on when the announced one misses, or whether a
+   * live server belonging to this project has already announced itself. Three files that import
+   * nothing and are reached only by setup.
+   */
+  probe: [],
+  /**
+   * Going somewhere, and what that is honest to report afterwards. A navigation is the action
+   * nobody can fully confirm: navigate-result is the envelope that says so, reload-result is
+   * what the reload form of it reports, navigate-arrival is how we decide it arrived. The
+   * complete family — nothing about navigation is left flat beside it.
+   */
+  navigation: ['session'],
+  /**
+   * The last thing a command says. What `gate` means by its exit code, what `open` says when it
+   * launched a URL and no session ever appeared, and the sentence `status` owes the user
+   * because `init` promised it. Each is one command's human-facing answer, which is a different
+   * job from doing the work and drifts if it lives next to it.
+   */
+  answers: ['session'],
+  /**
+   * A command sent to the page: whether this page should be asked for it at all, and the
+   * in-flight table that correlates the reply, times out the ones that never come back and
+   * fails the rest when the socket drops.
+   *
+   * Named page-commands rather than commands because `command/` already exists one level up and
+   * two directory names a single letter apart are a trap for a reader even where the basename
+   * guard is satisfied.
+   */
+  'page-commands': [],
+  // The platform's side of the Harness: a driver for the loop next door, and nothing else.
+  platform: ['harness'],
+  // The Harness's drive plan: planned from flows, run lane by lane through the loop next door.
+  // Handed its browser, model and tools as ports, so like `harness` it reaches nothing else.
+  script: ['harness'],
+  // The exploratory Harness: the survey, the hunt before grading and the two-way comparison. Reads
+  // the goal check next door and is handed its tools, so like `script` it reaches nothing else.
+  explore: ['harness'],
+  tools: [
+    // `reticle_verify { action: "compare" }` runs the CLI's own compare, so the two answer the same.
+    'two-builds',
+    // The episode log: every call, its result and its effect, written at the one dispatch point.
+    // `journal` imports nothing from `tools`, so this adds no mutual pair.
+    'journal',
+    // What an agent's own call is shaped into on the way out (compact envelope, notices). A leaf:
+    // `agent` imports nothing back, so this adds no mutual pair.
+    'agent',
+    // A lease that never dialled reads the served page's CSP, the same reader doctor uses.
+    'dev-server',
+    // `reticle_coverage { app: true }` folds a session into the app-wide ledger.
+    'exhaust',
+    // `reticle_map` reads each session's journal as driven steps. A leaf: `app-graph` imports
+    // nothing from this package, so this adds no mutual pair.
+    'app-graph',
+    'hooks',
+    'navigation',
+    'lifetime',
+    'args',
+    'timing',
+    'stores',
+    'assert',
+    'facts',
+    'act',
+    'annotate-notes',
+    // The model-driven drive: the loop, the model binding and the timeout, and nothing else.
+    //
+    // Strictly one-way BY CONSTRUCTION, which is why the binding to the tool surface lives here in
+    // `tools` rather than beside the loop. `harness` imports nothing from this package at all — it
+    // is handed a toolset and a driver — so it is a sink, and `tools -> harness` can never become a
+    // mutual pair. Putting the two files that know about TOOLS inside it would have made one on the
+    // first commit.
+    'artifact',
+    'browser',
+    'capsule',
+    'crawl',
+    'daemon',
+    'dir',
+    'domain',
+    'faults',
+    'flows',
+    'fs',
+    'gaps',
+    'harness',
+    // The platform's Harness driver, chosen with the local ones when a drive is built.
+    'platform',
+    // The drive plan, planned and run when no journey is named.
+    'script',
+    // The survey before a drive and the hunt before its goals are graded.
+    'explore',
+    'impact',
+    'input',
+    'intent',
+    'recall',
+    'oracles',
+    'pool',
+    'prior',
+    // A production drive judges a native click too, and its lease asks the service for a ticket.
+    'production',
+    'project',
+    'read',
+    'recording',
+    // `reticle_reconcile` consults the reference `Witness` — the observer OUTSIDE the app, which is
+    // a realm-level thing and belongs there. The tool used to inline its own `fetch` instead, so the
+    // class bound to the protocol's SPI had no production caller and could drift from the behaviour
+    // that actually ships. One edge is the price of there being one implementation.
+    'realm',
+    'resolve',
+    'runs',
+    'session',
+    'tape',
+    'telemetry',
+    'update',
+    'version',
+    'visual',
+  ],
+  update: ['machine', 'identity', 'project', 'telemetry'],
+  version: ['identity', 'project', 'tools'],
+  // A step screenshot is filed under the run it belongs to: `runs` names that run (the verify
+  // being replayed, else the drive's own id), `hooks` says whether the Harness is the one driving,
+  // and `artifact` is where the run reads its screenshots back.
+  visual: [
+    'args',
+    'artifact',
+    'dir',
+    'fs',
+    'input',
+    'runs',
+    'tools',
+    // A step screenshot of a page that cannot draw itself reuses the SDK-behind sentence.
+    'version',
+  ],
+};
+
+/**
+ * The pairs that reach for each other -- the shape that makes a directory unmovable.
+ *
+ * A count rather than a list: the list is derivable and printed on failure.
+ *
+ * The definition, because a figure nobody can reproduce is a figure nobody can correct: for each
+ * mutual pair, count the non-test files in A that import anything under B, and the same for B into
+ * A. The pair HINGES when either direction has exactly one such file, because moving that one file
+ * would break the pair.
+ *
+ * Asserted with equality rather than `<=`, which makes it a RECORD instead of a ceiling. A bound
+ * only says "no worse"; equality forces the number down in the same commit that earns it, and
+ * forces somebody to look when it moves either way.
+ *
+ * Most of what remains is two structures, and neither is a misfiling: the tool registry (`tools.ts`
+ * must know every feature's tool module to advertise it) and `tool-kit`, which is a leaf by the
+ * import-no-sibling rule and a hub by the only measure that counts here — it reaches into eight
+ * directories. So the next reduction is a SPLIT of one of those, not another lift, and that is a
+ * refactor of code thirteen directories depend on. `scripts/safe-to-group.mjs` scores a candidate.
+ */
+const MUTUAL_PAIRS_TODAY = 21;
+
+/**
+ * Two directories may not share a name.
+ *
+ * The reach graph identifies a directory by its BASENAME, so `command/cli/cloud` and
+ * `features/cloud` are one node to it. That is not a rounding error: reaches into one are
+ * attributed to the other, a mutual pair between them is unreportable, and the count below --
+ * the number this whole audit is steered by -- quietly measures a graph that does not exist.
+ *
+ * Found by walking into it. A grouping created a second `cloud/`, every reach test still passed,
+ * and the only symptom was that the new directory appeared to have no reaches at all: they had
+ * been credited to its namesake. A guard that can be silently defeated by naming is worse than
+ * one that is missing, because it goes on reporting a number.
+ *
+ * Keyed on the basename rather than fixed by using full paths deliberately. Full paths would make
+ * the reach list unreadable -- `surface/tools -> portal/session` twice a line -- and unique
+ * short names are worth having for their own sake. This is the price of that, made loud.
+ */
+describe('directory names in this package are unique', () => {
+  it('has no two directories sharing a basename', () => {
+    const clashes = nameCollisions(SERVER);
+    expect(
+      clashes,
+      'The reach graph identifies a directory by its basename, so these are one node to it -- ' +
+        'their reaches are merged and a mutual pair between them cannot be reported. Rename one, ' +
+        'or put the files in the directory that already has the name.',
+    ).toEqual([]);
+  });
+});
+
+describe('the directories in this package know only what they are allowed to know', () => {
+  it('finds the directories at all — a check over nothing passes about nothing', () => {
+    // Grouping the directories moved every one of them. A scan that silently stopped resolving
+    // would report an empty graph, and every check below would pass by having read no code.
+    expect(reaches(SERVER).size).toBeGreaterThan(20);
+  });
+
+  it('gains no new reach into another directory', () => {
+    const found = reaches(SERVER);
+    const added: string[] = [];
+    for (const [one, targets] of found) {
+      for (const other of targets) {
+        if (!(REACHES_FOR[one] ?? []).includes(other)) {
+          added.push(`${one} -> ${other}`);
+        }
+      }
+    }
+    expect(
+      added.sort(),
+      'A directory here started reaching for one it did not before. Ask first whether the thing it ' +
+        'wants is in the right place: most reaches removed from this package so far were a file ' +
+        'filed somewhere odd rather than a dependency anybody needed. If it is really necessary, ' +
+        'add it to REACHES_FOR.',
+    ).toEqual([]);
+  });
+
+  it('does not describe reaches that are gone', () => {
+    // The other direction, and a separate check because one equality for both would go red when a
+    // reach is REMOVED -- and a check that punishes the work going well gets switched off.
+    const found = reaches(SERVER);
+    const stale: string[] = [];
+    for (const [one, targets] of Object.entries(REACHES_FOR)) {
+      for (const other of targets) {
+        if (true !== found.get(one)?.has(other)) {
+          stale.push(`${one} -> ${other}`);
+        }
+      }
+    }
+    expect(
+      stale.sort(),
+      'These reaches no longer exist. Take them out: this list is meant to be read as what is still ' +
+        'tangled.',
+    ).toEqual([]);
+  });
+
+  it('has no more pairs that need each other than it had', () => {
+    const pairs = mutualPairs(SERVER);
+    expect(
+      pairs.length,
+      `Two directories that each need the other cannot be read, moved or tested apart. There are ` +
+        `now ${String(pairs.length)}, and the recorded number is ${String(MUTUAL_PAIRS_TODAY)}:\n` +
+        pairs.map((p) => `  ${p}`).join('\n'),
+      // EQUAL, not "at most". A `<=` here is slack, and slack gets spent: this number dropped from
+      // 32 to 30 when one grouping untangled two pairs, and nothing would have gone red if the next
+      // change had quietly put them back. An improvement that is not recorded is an improvement
+      // somebody else pays for twice.
+      //
+      // So both directions fail. Up means a grouping made coupling worse -- revert it rather than
+      // raising the number. Down means something got untangled: lower the constant in the same
+      // commit, and the gain is locked in.
+    ).toBe(MUTUAL_PAIRS_TODAY);
+  });
+});

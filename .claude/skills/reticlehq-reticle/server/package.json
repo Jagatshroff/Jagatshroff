@@ -1,0 +1,95 @@
+{
+  "name": "@reticlehq/server",
+  "version": "3.10.11",
+  "mcpName": "io.github.reticlehq/reticle",
+  "description": "Reticle CLI, bridge and MCP server: a coding agent drives your running web app from the inside and gets a verdict with evidence, for change verification, access control, accessibility, performance and SEO checks.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "reticle": "./bin/reticle.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/command/cli.d.ts",
+      "default": "./dist/command/cli.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -b && node ../scripts/alias-dist.mjs",
+    "dev": "tsc -b --watch",
+    "typecheck": "tsc -b",
+    "lint": "eslint src",
+    "test:unit": "node ../scripts/guard-tests.mjs unit",
+    "test:guards": "node ../scripts/guard-tests.mjs guards",
+    "test:coverage": "vitest run src --passWithNoTests --coverage.enabled --coverage.provider=v8 --coverage.reporter=text-summary --coverage.include='src/**/*.ts' --coverage.exclude='src/**/*.test.ts'",
+    "prepack": "node ../scripts/prepare-dist.mjs --clean dist && tsc -b --force && node ../scripts/alias-dist.mjs && node ../scripts/prepare-dist.mjs dist && node ../scripts/stamp-issuer-key.mjs && node ../scripts/pack-docs.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@reticlehq/browser": "workspace:*",
+    "@reticlehq/core": "workspace:*",
+    "@reticlehq/engine": "workspace:*",
+    "@reticlehq/init": "workspace:*",
+    "open-verification": "workspace:*",
+    "ws": "^8.22.1",
+    "zod": "^4.6.6"
+  },
+  "devDependencies": {
+    "@types/pngjs": "^6.0.5",
+    "@types/ws": "^8.18.2",
+    "yaml": "^2.9.1"
+  },
+  "optionalDependencies": {
+    "pixelmatch": "^8.0.0",
+    "playwright": "^1.64.1",
+    "pngjs": "^7.0.0"
+  },
+  "license": "Apache-2.0",
+  "author": "Reticle contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/reticlehq/reticle.git",
+    "directory": "server"
+  },
+  "homepage": "https://github.com/reticlehq/reticle#readme",
+  "bugs": "https://github.com/reticlehq/reticle/issues",
+  "files": [
+    "bin",
+    "dist",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "SKILL.md",
+    "docs"
+  ],
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "testing",
+    "verification",
+    "cli"
+  ],
+  "reticle": {
+    "changelog": "3.10.11 refuses a click on a target that a modal or other element covers, so a click a person could not make is never sent; the refusal names the cover. A drive whose write request was blocked is no longer auto-saved as a flow that sends the write for real.",
+    "breakingChanges": []
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.11"
+  },
+  "peerDependencies": {
+    "playwright": ">=1.50"
+  },
+  "peerDependenciesMeta": {
+    "playwright": {
+      "optional": true
+    }
+  }
+}

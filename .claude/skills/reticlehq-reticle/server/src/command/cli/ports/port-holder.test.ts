@@ -1,0 +1,299 @@
+import { describe, expect, it } from 'vitest';
+import {
+  describeForeignHolder,
+  findListenerCwd,
+  findListeningPorts,
+  parseCommandLineRoot,
+  parsePortHolder,
+  parseListeningPorts,
+  parseProcessCwd,
+} from './port-holder.js';
+import { isReticleDaemonCommand } from '@/command/daemon/daemon-argv.js';
+
+/**
+ * Naming the process that holds the port.
+ *
+ * `doctor` is what a user runs when the agent cannot reach the bridge, and the commonest real cause
+ * is that something else is on 4400. It already stopped saying "nothing is listening" for that case
+ * — it says "held by another process" — but it does not say WHICH, so the reader's next move is a
+ * shell command they have to know. Worse, the obvious one (`lsof -ti tcp:4400 | xargs kill -9`)
+ * kills the agent's own `reticle mcp` proxy, because that proxy holds a CLIENT connection to the
+ * port and `-ti` does not filter to listeners.
+ *
+ * So the field selector below is `-sTCP:LISTEN`, and the parser is pure and tested against real
+ * `lsof -F pc` output rather than trusted.
+ */
+describe('parsePortHolder', () => {
+  it('reads pid and command from lsof -F pc output', () => {
+    expect(parsePortHolder('p90502\ncnode\n')).toEqual({ pid: 90502, command: 'node' });
+  });
+
+  it('takes the FIRST listener when several are reported', () => {
+    // Dual-stack (IPv4 + IPv6) reports the same process twice; a second `p` record starts a new one.
+    expect(parsePortHolder('p90502\ncnode\np90777\ncother\n')).toEqual({
+      pid: 90502,
+      command: 'node',
+    });
+  });
+
+  it('survives a command with spaces', () => {
+    expect(parsePortHolder('p12\ncPython 3.12\n')?.command).toBe('Python 3.12');
+  });
+
+  it('returns null for empty output — nothing is listening, which is not an error', () => {
+    expect(parsePortHolder('')).toBeNull();
+    expect(parsePortHolder('\n')).toBeNull();
+  });
+
+  it('returns null rather than guessing when the pid is not a number', () => {
+    expect(parsePortHolder('pnotanumber\ncnode\n')).toBeNull();
+  });
+
+  it('returns null when lsof reported a pid but no command', () => {
+    // Half an answer is not an answer: "(pid 90502, undefined)" is worse than saying nothing.
+    expect(parsePortHolder('p90502\n')).toBeNull();
+  });
+});
+
+describe('describeForeignHolder', () => {
+  it('names the pid and command, and does not suggest the command that kills the agent', () => {
+    const text = describeForeignHolder(4400, { pid: 90502, command: 'node' });
+    expect(text).toContain('4400');
+    expect(text).toContain('90502');
+    expect(text).toContain('node');
+    // The trap from the field: `lsof -ti tcp:4400 | xargs kill -9` also kills `reticle mcp`.
+    expect(text).not.toMatch(/-ti\b/);
+  });
+
+  it('does not claim to know whose process it is when the lookup found nothing', () => {
+    const text = describeForeignHolder(4400, null);
+    expect(text).toContain('could not identify');
+    expect(text).not.toContain('pid');
+    // The null case has no evidence for this, and it is the likeliest thing to be wrong.
+    expect(text, 'an unknown holder is not a known stranger').not.toContain(
+      'is not a Reticle daemon',
+    );
+  });
+});
+
+/**
+ * Our own wedged daemon must not be reported as somebody else's process.
+ *
+ * Found by stress-testing: `SIGSTOP` a daemon and it keeps accepting TCP while never answering
+ * `/status`, so it classifies FOREIGN. Measured on :4411 with `~/.reticle/daemon-4411.pid` holding
+ * the frozen process's exact pid:
+ *
+ *   reticle doctor → 'port 4411 is held by pid 65704 ("node"), which is not a Reticle daemon'
+ *
+ * It was ours. The advice that follows sends the reader hunting a stranger that does not exist and
+ * never mentions the fix that works. Worse, `reticle status` reported `running: true` for the same
+ * daemon at the same instant — the two commands contradicting each other about one process.
+ */
+describe('a wedged daemon of our own', () => {
+  it('is named as ours when the holder pid is the pid we recorded', () => {
+    const msg = describeForeignHolder(4411, { pid: 65704, command: 'node' }, 65704);
+    expect(msg).toContain('YOUR Reticle daemon');
+    expect(msg).toContain('not responding');
+    expect(msg, 'do not call our own daemon a stranger').not.toContain('is not a Reticle daemon');
+    expect(msg, 'name the fix that works').toContain('reticle stop');
+  });
+
+  it('still calls a genuine stranger a stranger', () => {
+    const msg = describeForeignHolder(4411, { pid: 999, command: 'python' }, 65704);
+    expect(msg).toContain('is not a Reticle daemon');
+    expect(msg).toContain('999');
+  });
+
+  /**
+   * "Stop that process" is a description of an outcome, not a way to reach it, and the reader
+   * supplying their own way to reach it is how the `-ti` pipeline gets typed. Now that a command
+   * exists for it (#114), name it.
+   */
+  it('names the command that frees the port instead of leaving the reader to invent one', () => {
+    const msg = describeForeignHolder(4411, { pid: 999, command: 'python' }, 65704);
+    expect(msg).toContain('reticle serve --restart --force');
+    expect(msg).not.toMatch(/-ti\b/);
+  });
+
+  /**
+   * A daemon that did not answer the short probe can be busy, not stuck. On a busy machine one
+   * answered `doctor` seconds after `status` gave up on it. The sentence must not tell the agent
+   * to stop a daemon that other agents use.
+   */
+  it('says a silent Reticle daemon may be busy, and names restart only if it stays silent', () => {
+    for (const ourPid of [null, 65704]) {
+      const msg = describeForeignHolder(
+        4411,
+        { pid: 65704, command: 'node', reticleDaemon: true },
+        ourPid,
+      );
+      expect(msg).toContain('did not answer in time');
+      expect(msg).toContain('may be busy');
+      expect(msg).not.toMatch(/wedged|\bkill\b|Run `reticle serve --restart`/);
+      expect(msg).toMatch(/If it stays silent, run `reticle (serve --restart|stop)`/);
+    }
+  });
+
+  it('keeps the old wording when we have no recorded pid to compare', () => {
+    expect(describeForeignHolder(4411, { pid: 999, command: 'python' }, null)).toContain(
+      'is not a Reticle daemon',
+    );
+  });
+
+  /**
+   * The Windows case, which is a large share of users and never runs in CI — the
+   * `windows` job builds and unit-tests, and no daemon ever starts on it.
+   *
+   * There is no `lsof` there, so the holder lookup ALWAYS returns null and the null branch is the
+   * only one a Windows user can ever reach. It asserted "is not a Reticle daemon" — with no
+   * evidence, on the command people run because something is already broken, in the one situation
+   * (FOREIGN: accepts TCP, never answers /status) whose commonest cause is our own wedged daemon.
+   */
+  it('names our recorded pid when the holder cannot be looked up at all', () => {
+    const msg = describeForeignHolder(4411, null, 65704);
+    expect(msg, 'do not assert what the null case cannot know').not.toContain(
+      'is not a Reticle daemon',
+    );
+    expect(msg, 'the pid we recorded is the one lead we have').toContain('65704');
+    expect(msg, 'name the fix that works').toContain('reticle stop');
+  });
+});
+
+/**
+ * The working directory of a listener — how the daemon tells which checkout served a page when
+ * every worktree declares the same projectId. Parsed from real `lsof -a -p <pid> -d cwd -Fn` output.
+ */
+describe('parseProcessCwd', () => {
+  it('reads the cwd path from lsof -Fn output', () => {
+    expect(parseProcessCwd('p79345\nfcwd\nn/Users/me/repo/.claude/worktrees/pr-7\n')).toBe(
+      '/Users/me/repo/.claude/worktrees/pr-7',
+    );
+  });
+
+  it('keeps a path with spaces whole', () => {
+    expect(parseProcessCwd('p1\nfcwd\nn/Users/me/My Projects/app\n')).toBe(
+      '/Users/me/My Projects/app',
+    );
+  });
+
+  it('is null when lsof printed no name record', () => {
+    expect(parseProcessCwd('p1\nfcwd\n')).toBeNull();
+    expect(parseProcessCwd('')).toBeNull();
+  });
+});
+
+describe('findListenerCwd', () => {
+  it('asks for the LISTENER on the port, then that pid’s cwd', () => {
+    const calls: string[][] = [];
+    const exec = (command: string, args: readonly string[]): string | null => {
+      calls.push([command, ...args]);
+      return args.includes('-sTCP:LISTEN') ? 'p4242\ncnode\n' : 'p4242\nfcwd\nn/wt/pr-7\n';
+    };
+
+    // Pinned: on a Windows runner the default platform takes the PowerShell branch.
+    expect(findListenerCwd(5174, exec, 'darwin')).toBe('/wt/pr-7');
+    expect(calls[0]).toContain('-sTCP:LISTEN');
+    expect(calls[1]).toEqual(['lsof', '-a', '-p', '4242', '-d', 'cwd', '-Fn']);
+  });
+
+  it('is null when nothing listens, or lsof cannot run', () => {
+    expect(findListenerCwd(5174, () => null, 'darwin')).toBeNull();
+  });
+
+  it('on Windows, asks PowerShell for the listener and reads the project from its command line', () => {
+    // Windows has no lsof, so the zero-install first call never opened the app there.
+    const calls: { command: string; args: readonly string[]; timeoutMs?: number }[] = [];
+    const exec = (command: string, args: readonly string[], timeoutMs?: number): string => {
+      calls.push({ command, args, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+      return '"C:\\Program Files\\nodejs\\node.exe" C:\\work\\shop\\node_modules\\vite\\bin\\vite.js\r\n';
+    };
+    expect(findListenerCwd(5173, exec, 'win32')).toBe('C:\\work\\shop');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.command).toBe('powershell');
+    expect(calls[0]?.args.join(' ')).toContain('-LocalPort 5173');
+    expect(calls[0]?.timeoutMs).toBeGreaterThan(2_000);
+  });
+
+  it('on Windows, is null when PowerShell cannot answer', () => {
+    expect(findListenerCwd(5173, () => null, 'win32')).toBeNull();
+  });
+});
+
+describe('parseCommandLineRoot', () => {
+  it('takes the folder that holds node_modules, after a quoted node path', () => {
+    expect(
+      parseCommandLineRoot(
+        '"C:\\Program Files\\nodejs\\node.exe" C:\\work\\shop\\node_modules\\.pnpm\\vite@6\\node_modules\\vite\\bin\\vite.js',
+      ),
+    ).toBe('C:\\work\\shop');
+  });
+
+  it('starts at the last drive before node_modules, so an unquoted node path is not part of it', () => {
+    expect(
+      parseCommandLineRoot(
+        'C:\\nodejs\\node.exe D:\\My Apps\\shop\\node_modules\\next\\dist\\bin\\next dev',
+      ),
+    ).toBe('D:\\My Apps\\shop');
+  });
+
+  it('is null when the command line names no node_modules: no evidence, so nothing opens', () => {
+    expect(parseCommandLineRoot('C:\\Python312\\python.exe -m http.server 8000')).toBeNull();
+    expect(parseCommandLineRoot('')).toBeNull();
+  });
+});
+
+/**
+ * #1937: `restart` and the MCP proxy stop a holder only when its command line is a Reticle daemon.
+ * The agent's own MCP proxy and a stranger must never match.
+ */
+describe('isReticleDaemonCommand', () => {
+  it('matches the daemon the proxy starts', () => {
+    expect(isReticleDaemonCommand('node /x/dist/cli.js _daemon --port 4400 --headless')).toBe(true);
+  });
+
+  it('does not match the MCP proxy or a stranger', () => {
+    expect(isReticleDaemonCommand('node /x/dist/cli.js mcp --port 4400')).toBe(false);
+    expect(isReticleDaemonCommand('node /x/my_daemon.js --port 4400')).toBe(false);
+    expect(isReticleDaemonCommand('python -m http.server 4400')).toBe(false);
+  });
+});
+
+/** Every port on the machine with a listener. Parsed from real `lsof -nP -iTCP -sTCP:LISTEN -Fn` output. */
+describe('parseListeningPorts', () => {
+  it('reads each port once, on every bind address', () => {
+    const output =
+      'p615\nf10\nn*:56264\nf11\nn*:56264\np680\nf10\nn127.0.0.1:7000\nf11\nn[::1]:5173\n';
+    expect(parseListeningPorts(output)).toEqual([56264, 7000, 5173]);
+  });
+
+  it('reads nothing from empty output', () => {
+    expect(parseListeningPorts('')).toEqual([]);
+  });
+});
+
+describe('findListeningPorts', () => {
+  it('lists only listeners', () => {
+    let asked: readonly string[] = [];
+    const ports = findListeningPorts((_command, args) => {
+      asked = args;
+      return 'p1\nf9\nn*:3020\n';
+    }, 'darwin');
+    expect(ports).toEqual([3020]);
+    expect(asked).toContain('-sTCP:LISTEN');
+  });
+
+  it('reads nothing when the lookup cannot run', () => {
+    expect(findListeningPorts(() => null, 'linux')).toEqual([]);
+  });
+
+  /** No lookup there names a working directory without a slow PowerShell start for each port. */
+  it('does not run on Windows', () => {
+    let ran = false;
+    const ports = findListeningPorts(() => {
+      ran = true;
+      return 'n*:3020\n';
+    }, 'win32');
+    expect(ports).toEqual([]);
+    expect(ran).toBe(false);
+  });
+});

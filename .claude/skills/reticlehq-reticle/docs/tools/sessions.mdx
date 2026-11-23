@@ -1,0 +1,108 @@
+---
+title: reticle_sessions
+description: List every connected browser tab, with the health fields that tell you whether it can actually be driven.
+icon: list-check
+---
+
+<Warning>
+  **reticle_sessions is not advertised.** The default surface is the merged ten, so an agent does not see
+  this name. Call **`reticle_session { action: "list" }`** instead. Everything below describes what that call does;
+  only the spelling changed. A call to the old name is answered with the new one, but an
+  `allowedTools` allowlist or an MCP permission rule naming it refuses before Reticle is asked.
+</Warning>
+
+`reticle_sessions` lists every browser tab currently connected to the Reticle daemon, with the health fields that decide whether it can actually be driven. Reach for it first when a tool says no session is connected, and after every [`reticle_navigate`](/tools/navigate) that came back `confirmed: false`.
+
+```json
+{}
+```
+
+Real response from a healthy session:
+
+```json
+{
+  "sessions": [
+    {
+      "sessionId": "sba6117a6-24ec-494d-8c2c-e2958cff2e7f",
+      "url": "http://localhost:4310/",
+      "title": "Reticle · Mission Control",
+      "adapters": ["react"],
+      "sdkVersion": "3.8.0",
+      "hasCapabilities": true,
+      "hidden": false,
+      "lastSeenMs": 155,
+      "throttled": false,
+      "focused": true,
+      "attachment": { "connectedSinceMs": 18654, "outages": 0 },
+      "realInputAvailable": false,
+      "leased": false
+    }
+  ]
+}
+```
+
+A backgrounded tab adds a `recommendation` telling you what to do about it, and `attachment` grows a `lastOutage` once the connection has dropped at least once:
+
+```json
+{
+  "hidden": false,
+  "throttled": true,
+  "attachment": {
+    "connectedSinceMs": 1217047,
+    "outages": 3,
+    "lastOutage": { "startedMs": 1786818483776, "durationMs": 967 }
+  },
+  "recommendation": "tab is not hidden but has not reported health recently ... Timing-sensitive work (animations, debounces, gestures) is what degrades: pass `refuseWhenThrottled: true` to refuse rather than act over events that may not land. Lease a separate context only if a drive here actually fails; ..."
+}
+```
+
+## When nothing is connected
+
+An empty list is not silent. It comes back with a `why` that separates the two causes, and refuses to guess between them:
+
+```json
+{
+  "sessions": [],
+  "why": "no browser session connected. Two things to weigh, and neither of them is proof. (1) Nothing is listening on the ports Reticle scans, so the dev server may not be running: START IT YOURSELF, in the background, using the command in `next_action`, and tell the human in one line that it is running. (2) There is no `.reticle.json` in the directory this daemon is running in, which is the file `reticle init` writes, so the app may carry no Reticle SDK. Check the app's OWN directory before re-running it. ..."
+}
+```
+
+That string is trimmed. The full text also lists the exact ports it scanned, says a server on any other port is invisible to the scan (ask for the app's URL and open it with `reticle open <url>`), and warns that in a monorepo the daemon often runs at the root while the app lives in a subdirectory.
+
+The empty list also carries `next_action`, the same answer as a command to run. In a project that was never wired, it carries `next_step` too. Nothing was installed and no file changed. `lease` is the call that checks the running app now with nothing installed: do it first. `consent` is the question to ask before `reticle init` wires the app. Run `init` only when the user agrees.
+
+## The fields that decide whether driving will work
+
+| Field | Why it matters |
+| --- | --- |
+| `throttled` | The tab is hidden, or has not reported health recently. A hidden tab clamps timers and animation frames, so an action can land on a page that never advances; a throttled tab that is not hidden is usually just quiet and often still driveable |
+| `hidden` / `focused` | Why it's throttled, and what to do about it |
+| `hasCapabilities` | Whether the app registered testids, signals and stores. `false` means [`reticle_look { action: "state" }`](/tools/state) has nothing to read |
+| `adapters` | `["react"]` means you get component names and source pointers |
+| `realInputAvailable` | `true` when native CDP input is available, under `reticle drive` |
+| `outages` | How often the connection has dropped. Non-zero is worth investigating |
+| `sdkVersion` | The page's SDK version |
+| `sdkBehind` | Present when the page SDK is a minor release or more behind the daemon. Newer commands and fixes are missing. It says how to update |
+| `versionSkew` | Present when the page SDK and the daemon differ. Fix it before you trust a verdict |
+| `instrumentation` | `injected` when a hosted verifier put the SDK into the page from outside. Absent means the app installed it |
+
+<Warning>
+  A hidden tab (`hidden: true`, which also sets `throttled`) is the most common cause of "the click
+  did nothing". Focus the tab, or drive a dedicated context. It is not your app being broken. It is
+  the browser saving battery on a tab nobody is looking at.
+</Warning>
+
+## Confirm after navigating
+
+[`reticle_navigate`](/tools/navigate) can only report that a navigation was dispatched. `sessions` is how you confirm one arrived: a session at the new URL means the page loaded **and** is instrumented. No session means one of those two is false, and you find out now rather than after three confusing failures.
+
+## Scoping
+
+You rarely need to pass `sessionId` to other tools. Reticle scopes to your project, prefers the active tab, and refuses rather than guesses when the choice is ambiguous. A refusal you can act on beats a silent pick of the wrong tab.
+
+Pass it explicitly when you genuinely mean one specific tab, such as when testing two apps at once.
+
+<Note>
+Sessions accumulate. A stale entry pointing at a dev server you have since restarted will sit there
+looking plausible. `reticle_session { action: "end" }` clears one out.
+</Note>

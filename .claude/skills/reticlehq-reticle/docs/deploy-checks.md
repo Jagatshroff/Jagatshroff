@@ -1,0 +1,129 @@
+---
+title: Deploy checks
+description: 'Enforce verification at the moment code becomes a preview URL, as a Vercel or Netlify check on the PR.'
+icon: circle-check
+---
+
+To gate a PR on Reticle, run `npx @reticlehq/server verify <preview-url>` in CI when the preview deploy succeeds. It exits **0** when every saved flow passes and **1** otherwise, so the job's own pass/fail becomes the check on the PR.
+
+The strongest place to enforce verification is the moment code becomes a preview URL. Every deploy already makes one. Today you run Reticle from a CI job on the deploy event (Recipe A). A hosted check provider that needs no workflow file does not exist yet (Recipe B).
+
+That makes the non-developer story complete: the SDK is auto-injected by the build plugin, flows are minted from toolbar recordings with auto-proposed consequences, and verification runs at publish, **without anyone writing a test.**
+
+> **Recipe A works today; Recipe B does not exist yet.** `reticle verify` exits 0/1 and persists a run artifact right now. What is _not_ built is a hosted Reticle app that registers itself as a Vercel or Netlify check provider. Until it exists, use the CI recipe.
+
+Using Reticle in CI or in a pipeline? Talk to a founder: [book a call](https://calendar.app.google/h9NRDbBBQetyTzWM6) or write to [hey@reticle.sh](mailto:hey@reticle.sh).
+
+## The shape
+
+```
+git push → preview deploy → Reticle verifies the preview URL → check passes/fails on the PR
+```
+
+`reticle verify <preview-url>` is the whole integration surface:
+
+- exits **0** when every saved flow passes, **1** otherwise (the only contract a check needs),
+- prints a legible ✓/✗ report for the PR log,
+- persists a `ReticleVerificationRun` artifact (`.reticle/runs/<id>.json`) so `reticle gate` and `reticle_run_export` can consume the same verdict.
+
+## Recipe A: CI (works today, any provider)
+
+```yaml
+# .github/workflows/verify.yml
+name: reticle
+on: [deployment_status]
+jobs:
+  verify:
+    if: github.event.deployment_status.state == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      # setup-node must come AFTER pnpm/action-setup, or its pnpm cache has no pnpm to find.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: npm install -g @reticlehq/server
+      # Install the Chromium that Reticle's own Playwright uses, not the latest one.
+      - run: cd "$(npm root -g)/@reticlehq/server" && npx playwright install --with-deps chromium
+      # Reticle drives the preview and owns its own browser + daemon.
+      - run: reticle verify "${{ github.event.deployment_status.target_url }}" --timeout 60000
+```
+
+The job's own pass/fail becomes the PR check. Nothing else is required.
+
+**Non-loopback previews need pairing.** For a real preview URL (not `localhost`), Reticle injects `reticle.connect()` with a one-time token and allow-lists the preview origin, so the app does not need to be rebuilt per environment. Confirm the SDK actually runs on the deployed build: a production build that tree-shakes the dev-only SDK will connect to nothing, and `verify` will (correctly) fail with _"no app connected."_
+
+## The Reticle GitHub Action
+
+The Action replays your saved flows on each preview and posts one check with a verdict for each flow. On `deployment_status`, it reads the preview URL from the event, so you type no URL.
+
+```yaml
+# .github/workflows/reticle.yml
+name: reticle
+on: [deployment_status]
+jobs:
+  verify:
+    if: github.event.deployment_status.state == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: reticlehq/reticle/action@v3.10.11
+        with:
+          api-key: ${{ secrets.RETICLE_API_KEY }}
+          # Only for a Vercel preview behind Deployment Protection.
+          vercel-bypass-secret: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+```
+
+A Vercel preview behind Deployment Protection needs a [Protection Bypass for Automation](https://vercel.com/docs/deployment-protection/methods-to-bypass-deployment-protection/protection-bypass-automation) secret. Netlify has no bypass secret for its password protection, so turn off protection for deploy previews. The [Action README](https://github.com/reticlehq/reticle/tree/main/action) gives each input.
+
+## Recipe B: the Checks API pattern (what a hosted Reticle would do)
+
+Both providers expose the same shape, which is why this is one integration rather than two:
+
+| Provider | Hook | Result surface |
+| --- | --- | --- |
+| Vercel | Deployment webhook → run the check → report back | Checks on the deployment / PR |
+| Netlify | Deploy-succeeded webhook → run the check → report back | Deploy summary / PR |
+
+The flow is: receive the deploy webhook → `reticle verify <target_url>` → post the verdict (and the `repair.failurePackets[]` from the run artifact) back as the check output. The artifact is stable and versioned precisely so a host platform can render it without parsing logs.
+
+## Pair it with the local gate
+
+The deploy check catches what reaches a preview. `reticle gate` catches it earlier: an agent that edits a covered file cannot "finish" without re-verifying:
+
+```bash
+npx @reticlehq/server gate --since origin/main    # exit 1 unless passing artifacts cover the affected flows
+```
+
+Use both: `gate` in the agent's Stop hook (see the [agent cheat sheet](agent-cheatsheet.md)), `verify` at the deploy. They read the same run artifacts, so a green gate locally and a green check on the PR mean the same thing.
+
+## Honest limits
+
+- **`verify` needs one connected session.** If several tabs of the app are open against the same daemon it refuses rather than guessing which to drive.
+- **It replays flows sequentially against one tab**, so flows must not depend on each other's leftover state (a flow that logs in contaminates the next one). Author self-contained flows, or use `reticle_verify { action: "flows", parallel }`, which gives each flow an isolated context.
+- **No saved flows means nothing to verify.** `verify` fails rather than reporting a vacuous pass.
+
+## FAQ
+
+### verify says 'no app connected' on my preview URL. Why?
+
+Almost always because the deployed build tree-shook the dev-only SDK out, so there is nothing in the page dialling the bridge. `reticle.connect()` is meant to be dev-gated, and a production build honours that gate. Either build the preview with the dev guard satisfied, or accept that `verify` is correctly reporting that it cannot see the app. It is not a false alarm: with no SDK there is no program to read.
+
+### Does it work on a real preview URL, or only localhost?
+
+Both. For a non-loopback origin Reticle injects `reticle.connect()` with a one-time pairing token and allow-lists the preview origin, so you do not rebuild per environment. The bridge refuses to bind a non-loopback host without a token, which is the point.
+
+### One of my flows logs in and the next one starts logged in. How do I stop that?
+
+`verify` replays flows sequentially against one tab, so leftover state carries. Either author each flow to be self-contained, or use `reticle_verify { action: "flows", parallel: 4 }` (`parallel` is how many flows run at once), which gives every flow its own isolated browser context with its own cookies and storage.
+
+### Should I run reticle gate as well as reticle verify?
+
+If you want an agent to be unable to call a change finished without re-verifying, yes. They catch the same regression at different moments: `gate` runs locally against the files the agent just edited, `verify` runs against the deployed preview. They read the same run artifacts, so a green gate locally and a green check on the PR mean the same thing.
+
+### verify exited 1 but I cannot see which flow failed.
+
+The verdict is in the run artifact, not only in the log. Each run writes `.reticle/runs/<id>.json` with `repair.failurePackets[]` naming what broke and where; `reticle_run({ tool: "reticle_run_export", args: { format: "report" } })` prints it as a ✓/✗ report. The artifact is stable and versioned precisely so a CI surface can render it without parsing log lines. Each entry in `checks[]` carries `intent`, a sentence a person can read: the agent's own `intent` when it gave one, else a sentence built from the predicate in the failure voice ("No PATCH request to /assignee was made"), marked `intentDerived: true`. A failed `allOf` also carries `failedPart`, the index of the part that failed, so a title can name the one thing that did not happen.

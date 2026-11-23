@@ -1,0 +1,1936 @@
+#!/usr/bin/env bash
+#
+# dcg uninstaller
+#
+# Run from a reviewed local checkout whose provenance you trust:
+#   bash ./uninstall.sh
+# Releases do not currently publish signed uninstaller assets.
+#
+# Options:
+#   --yes            Skip confirmation prompt
+#   --keep-config    Keep configuration files (~/.config/dcg/)
+#   --keep-history   Keep history.db (in ~/.config/dcg or ${XDG_STATE_HOME:-~/.local/state}/dcg), backups, and ~/.local/share/dcg/
+#   --purge          Remove everything (overrides keep flags)
+#   --quiet          Suppress non-error output
+#
+
+# This is a bash script. Piped into another shell (`| sh` where sh is dash,
+# `| zsh`), it would fail or misbehave later, so stop here with the fix.
+# Keep this block POSIX sh: it runs before anything bash-specific is parsed.
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf '%s\n' \
+    "dcg uninstaller: this script needs bash. From your reviewed local checkout, run:" \
+    '  bash ./uninstall.sh' >&2
+  exit 1
+fi
+
+set -euo pipefail
+
+# Keep this resolver in sync with install.sh and the Rust CLI.
+claude_config_dir() {
+    local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+    case "$dir" in
+        '~') dir="$HOME" ;;
+        '~/'*) dir="$HOME/${dir#\~/}" ;;
+    esac
+    case "$dir" in /*) ;; *) dir="$PWD/$dir" ;; esac
+    printf '%s\n' "$dir"
+}
+
+# Defaults
+YES=0
+KEEP_CONFIG=0
+KEEP_HISTORY=0
+PURGE=0
+QUIET=0
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m' # No Color
+
+# Logging functions
+log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
+ok() { [ "$QUIET" -eq 1 ] && return 0; echo -e "${GREEN}✓${NC} $*"; }
+warn() { [ "$QUIET" -eq 1 ] && return 0; echo -e "${YELLOW}⚠${NC} $*"; }
+err() { echo -e "${RED}✗${NC} $*" >&2; }
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --yes|-y)
+            YES=1
+            shift
+            ;;
+        --keep-config)
+            KEEP_CONFIG=1
+            shift
+            ;;
+        --keep-history)
+            KEEP_HISTORY=1
+            shift
+            ;;
+        --purge)
+            PURGE=1
+            shift
+            ;;
+        --quiet|-q)
+            QUIET=1
+            shift
+            ;;
+        *)
+            err "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# Purge overrides keep flags
+if [ "$PURGE" -eq 1 ]; then
+    KEEP_CONFIG=0
+    KEEP_HISTORY=0
+fi
+
+# Find dcg binary location
+find_dcg_binary() {
+    # Check common locations
+    local locations=(
+        "$HOME/.local/bin/dcg"
+        "/usr/local/bin/dcg"
+        "/usr/bin/dcg"
+    )
+
+    for loc in "${locations[@]}"; do
+        if [ -x "$loc" ]; then
+            echo "$loc"
+            return 0
+        fi
+    done
+
+    # Fall back to which
+    command -v dcg 2>/dev/null || true
+}
+
+json_settings_has_dcg_command_hook() {
+    local settings="$1"
+    local event_name="$2"
+    local matcher="${3:-}"
+
+    if [ ! -f "$settings" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q '"command".*dcg' "$settings" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$settings" "$event_name" "$matcher" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+event_name = sys.argv[2]
+matcher = sys.argv[3]
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(settings_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+entries = hooks.get(event_name)
+if not isinstance(entries, list):
+    sys.exit(1)
+
+for entry in entries:
+    if not isinstance(entry, dict):
+        continue
+    if matcher and entry.get("matcher") != matcher:
+        continue
+    inner_hooks = entry.get("hooks")
+    if not isinstance(inner_hooks, list):
+        continue
+    if any(isinstance(hook, dict) and is_dcg_command(hook.get("command")) for hook in inner_hooks):
+        sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
+json_copilot_has_dcg_hook() {
+    local hook_file="$1"
+
+    if [ ! -f "$hook_file" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q 'dcg' "$hook_file" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$hook_file" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hook_file = sys.argv[1]
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(hook_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+
+# Match the event key case-insensitively: Copilot's schema is camelCase
+# `preToolUse`, but dcg <= 0.8.0 could leave a PascalCase `PreToolUse`
+# entry behind (#253).
+pre_tool_lists = [v for k, v in hooks.items() if k.lower() == "pretooluse" and isinstance(v, list)]
+if not pre_tool_lists:
+    sys.exit(1)
+
+for pre_tool in pre_tool_lists:
+    for entry in pre_tool:
+        if not isinstance(entry, dict):
+            continue
+        if is_dcg_command(entry.get("bash")) or is_dcg_command(entry.get("powershell")):
+            sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
+json_cursor_has_dcg_hook() {
+    local hooks_json="$1"
+    local hook_script="${2:-$HOME/.cursor/hooks/dcg-pre-shell.py}"
+
+    if [ ! -f "$hooks_json" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        grep -q 'dcg' "$hooks_json" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$hooks_json" "$hook_script" <<'PYEOF'
+import json
+import shlex
+import sys
+
+hooks_file = sys.argv[1]
+expected_hook = sys.argv[2]
+
+def is_dcg_cursor_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    return parts[0] == expected_hook
+
+try:
+    with open(hooks_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(1)
+
+if not isinstance(settings, dict):
+    sys.exit(1)
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+entries = hooks.get("beforeShellExecution")
+if not isinstance(entries, list):
+    sys.exit(1)
+
+for entry in entries:
+    if isinstance(entry, dict) and is_dcg_cursor_command(entry.get("command")):
+        sys.exit(0)
+
+sys.exit(1)
+PYEOF
+}
+
+yaml_hermes_has_dcg_hook() {
+    local cfg_file="$1"
+
+    if [ ! -f "$cfg_file" ]; then
+        return 1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        # Best-effort: a literal "dcg" mention in the pre_tool_call section
+        # is at least suggestive. We avoid claiming a hit without python3.
+        grep -q 'pre_tool_call' "$cfg_file" 2>/dev/null && grep -q 'dcg' "$cfg_file" 2>/dev/null
+        return $?
+    fi
+
+    python3 - "$cfg_file" <<'PYEOF'
+import os
+import shlex
+import sys
+try:
+    import yaml
+except ImportError:
+    sys.exit(1)
+
+cfg_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError):
+    sys.exit(1)
+
+if not isinstance(cfg, dict):
+    sys.exit(1)
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(1)
+pre_tool_call = hooks.get("pre_tool_call")
+if not isinstance(pre_tool_call, list):
+    sys.exit(1)
+for entry in pre_tool_call:
+    if isinstance(entry, dict) and is_dcg_command(entry.get("command")):
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+}
+
+# Remove dcg hook from Claude Code settings
+unconfigure_claude_code() {
+    local settings
+    # Preserve literal trailing newlines in the active directory name.
+    settings="$(claude_config_dir; printf .)"
+    settings="${settings%$'\n.'}"
+    settings="${settings%/}/settings.json"
+
+    if [ ! -f "$settings" ]; then
+        return 0
+    fi
+
+    # Check if dcg is configured
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse"; then
+        return 0
+    fi
+
+    # Use python3 to remove the hook safely
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$settings" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    Uninstall correctness is critical here: a substring check would
+    drop hooks for unrelated tools whose path or name happens to
+    contain "dcg" (e.g. /opt/dcgrep/bin/scan, ~/.local/bin/dcgworkflow,
+    custom-dcg-helper.sh). Since this code can DELETE entries, false
+    positives correspond to data loss for the user's other tooling.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+if 'hooks' not in settings:
+    sys.exit(0)
+if not isinstance(settings['hooks'], dict):
+    sys.exit(0)
+if 'PreToolUse' not in settings['hooks']:
+    sys.exit(0)
+
+pre_tool_use = settings['hooks']['PreToolUse']
+if not isinstance(pre_tool_use, list):
+    sys.exit(0)
+
+# Filter out ONLY dcg hooks (basename match)
+new_hooks = []
+removed = False
+for entry in pre_tool_use:
+    if not isinstance(entry, dict):
+        new_hooks.append(entry)
+        continue
+    hooks = entry.get('hooks', [])
+    if not isinstance(hooks, list):
+        new_hooks.append(entry)
+        continue
+    filtered = [
+        h for h in hooks
+        if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+    ]
+    if len(filtered) != len(hooks):
+        removed = True
+    if filtered:
+        entry['hooks'] = filtered
+        new_hooks.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+settings['hooks']['PreToolUse'] = new_hooks
+
+with open(settings_file, 'w') as f:
+    json.dump(settings, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit Claude Code settings"
+        warn "Please manually remove dcg from $settings"
+        return 1
+    fi
+}
+
+# Remove dcg hook from Gemini CLI settings
+unconfigure_gemini() {
+    local settings="$HOME/.gemini/settings.json"
+
+    if [ ! -f "$settings" ]; then
+        return 0
+    fi
+
+    # Check if dcg is configured
+    if ! json_settings_has_dcg_command_hook "$settings" "BeforeTool"; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$settings" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+if 'hooks' not in settings:
+    sys.exit(0)
+if not isinstance(settings['hooks'], dict):
+    sys.exit(0)
+if 'BeforeTool' not in settings['hooks']:
+    sys.exit(0)
+
+before_tool = settings['hooks']['BeforeTool']
+if not isinstance(before_tool, list):
+    sys.exit(0)
+
+# Filter out ONLY dcg hooks (basename match)
+new_hooks = []
+removed = False
+for entry in before_tool:
+    if isinstance(entry, dict):
+        hooks = entry.get('hooks', [])
+        if not isinstance(hooks, list):
+            new_hooks.append(entry)
+            continue
+        filtered = [
+            h for h in hooks
+            if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+        ]
+        if len(filtered) != len(hooks):
+            removed = True
+        if filtered:
+            entry['hooks'] = filtered
+            new_hooks.append(entry)
+    else:
+        new_hooks.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+settings['hooks']['BeforeTool'] = new_hooks
+
+with open(settings_file, 'w') as f:
+    json.dump(settings, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit Gemini CLI settings"
+        return 1
+    fi
+}
+
+# Remove dcg from one GitHub Copilot hook file while preserving coexisting
+# platform commands and hook entries.
+unconfigure_copilot_file() {
+    local hook_file="$1"
+    if [ ! -f "$hook_file" ]; then
+        return 0
+    fi
+
+    if ! json_copilot_has_dcg_hook "$hook_file"; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$hook_file" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hook_file = sys.argv[1]
+
+try:
+    with open(hook_file, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+# Copilot's schema is camelCase `preToolUse`, but dcg <= 0.8.0 could leave a
+# PascalCase `PreToolUse` entry behind, so match the key case-insensitively
+# and clean every matching spelling (#253).
+pre_tool_keys = [k for k in hooks if k.lower() == "pretooluse" and isinstance(hooks[k], list)]
+if not pre_tool_keys:
+    sys.exit(0)
+
+def is_dcg_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+def strip_dcg_platform_fields(entry):
+    if not isinstance(entry, dict):
+        return False, [entry]
+
+    cleaned = dict(entry)
+    removed = False
+    for key in ("bash", "powershell"):
+        if is_dcg_command(cleaned.get(key)):
+            removed = True
+            cleaned.pop(key, None)
+
+    if not removed:
+        return False, [entry]
+    if cleaned.get("bash") or cleaned.get("powershell"):
+        return True, [cleaned]
+    return True, []
+
+removed = False
+for key in pre_tool_keys:
+    new_pre = []
+    key_removed = False
+    for entry in hooks[key]:
+        entry_removed, residual_entries = strip_dcg_platform_fields(entry)
+        if entry_removed:
+            key_removed = True
+        new_pre.extend(residual_entries)
+
+    if not key_removed:
+        continue
+    removed = True
+    if new_pre:
+        hooks[key] = new_pre
+    else:
+        hooks.pop(key, None)
+
+if not removed:
+    sys.exit(0)
+
+for key in list(hooks.keys()):
+    if hooks.get(key) == []:
+        hooks.pop(key, None)
+
+if not hooks:
+    settings.pop("hooks", None)
+
+if not settings or settings == {"version": 1}:
+    os.remove(hook_file)
+else:
+    with open(hook_file, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit GitHub Copilot hook file"
+        warn "Please manually remove dcg from $hook_file"
+        return 1
+    fi
+}
+
+# Remove the current user-level Copilot hook and, when uninstall is run inside
+# a repository, the legacy repo-local hook written by dcg <= 0.6.5.
+unconfigure_copilot() {
+    local copilot_home="${COPILOT_HOME:-$HOME/.copilot}"
+    unconfigure_copilot_file "$copilot_home/hooks/dcg.json"
+
+    if command -v git >/dev/null 2>&1; then
+        local repo_root=""
+        repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+        if [ -n "$repo_root" ]; then
+            unconfigure_copilot_file "$repo_root/.github/hooks/dcg.json"
+        fi
+    fi
+}
+
+# Remove dcg settings from Aider config
+unconfigure_aider() {
+    local config="$HOME/.aider.conf.yml"
+
+    if [ ! -f "$config" ]; then
+        return 0
+    fi
+
+    # Check if our settings exist
+    if ! grep -q 'Added by dcg installer' "$config" 2>/dev/null; then
+        return 0
+    fi
+
+    # Create backup
+    cp "$config" "${config}.bak.$(date +%Y%m%d%H%M%S)"
+
+    # Remove lines added by dcg installer
+    local tmp="${config}.tmp"
+    awk '
+        /Added by dcg installer/ { skip=1; next }
+        skip && /git-commit-verify:/ { skip=0; next }
+        { skip=0; print }
+    ' "$config" > "$tmp"
+
+    # Check if file is now empty (just whitespace)
+    if [ ! -s "$tmp" ] || ! grep -q '[^[:space:]]' "$tmp"; then
+        rm -f "$tmp" "$config"
+    else
+        mv "$tmp" "$config"
+    fi
+
+    return 0
+}
+
+# Remove dcg hook from Codex CLI (~/.codex/hooks.json).
+#
+# install.sh writes a Claude-shaped PreToolUse Bash matcher block into
+# ~/.codex/hooks.json. Now that Codex has stable hooks and dcg emits its
+# protocol-specific minimal JSON denial, leaving the
+# hook entry behind after `dcg uninstall` removes the binary would cause
+# every Bash invocation to log "PreToolUse Failed" because codex would
+# spawn a path that no longer exists.
+unconfigure_codex() {
+    local hooks_json="$HOME/.codex/hooks.json"
+
+    if [ ! -f "$hooks_json" ]; then
+        return 0
+    fi
+
+    if ! json_settings_has_dcg_command_hook "$hooks_json" "PreToolUse"; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$hooks_json" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hooks_file = sys.argv[1]
+
+def is_dcg_command(command):
+    if not isinstance(command, str):
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = command.split()
+    if not parts:
+        return False
+    return os.path.basename(parts[0]) in {"dcg", "dcg.exe"}
+
+try:
+    with open(hooks_file, 'r') as f:
+        config = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(config, dict):
+    sys.exit(0)
+
+hooks = config.get('hooks')
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+pre_tool_use = hooks.get('PreToolUse')
+if not isinstance(pre_tool_use, list):
+    sys.exit(0)
+
+new_pre_tool_use = []
+removed = False
+for entry in pre_tool_use:
+    if not isinstance(entry, dict):
+        new_pre_tool_use.append(entry)
+        continue
+    inner = entry.get('hooks', [])
+    if not isinstance(inner, list):
+        new_pre_tool_use.append(entry)
+        continue
+    filtered = [
+        h for h in inner
+        if not (isinstance(h, dict) and is_dcg_command(h.get('command', '')))
+    ]
+    if len(filtered) != len(inner):
+        removed = True
+    if filtered:
+        entry['hooks'] = filtered
+        new_pre_tool_use.append(entry)
+    # else: drop the matcher entry entirely (it had only dcg hooks)
+
+if not removed:
+    sys.exit(0)
+
+if new_pre_tool_use:
+    hooks['PreToolUse'] = new_pre_tool_use
+else:
+    hooks.pop('PreToolUse', None)
+
+if not hooks:
+    config.pop('hooks', None)
+
+# If the file is now effectively empty, remove it so codex doesn't keep
+# parsing a stub. install.sh creates this file dedicated for dcg, so
+# leaving it as an empty {} is just litter.
+try:
+    if not config:
+        os.remove(hooks_file)
+    else:
+        with open(hooks_file, 'w') as f:
+            json.dump(config, f, indent=2)
+except OSError as exc:
+    print(f"warning: failed to update {hooks_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print("removed", file=sys.stderr)
+PYEOF
+        return $?
+    else
+        warn "python3 not available - cannot safely edit Codex hooks.json"
+        warn "Please manually remove dcg from $hooks_json"
+        return 1
+    fi
+}
+
+# Remove dcg hook from Cursor IDE
+unconfigure_cursor() {
+    local hooks_json="$HOME/.cursor/hooks.json"
+    local hook_script="$HOME/.cursor/hooks/dcg-pre-shell.py"
+
+    local removed=0
+
+    # Remove the hook script
+    if [ -f "$hook_script" ] && grep -q 'dcg-cursor-hook' "$hook_script" 2>/dev/null; then
+        rm -f "$hook_script" 2>/dev/null && removed=1
+    fi
+
+    # Remove entry from hooks.json
+    if [ -f "$hooks_json" ] && json_cursor_has_dcg_hook "$hooks_json" "$hook_script"; then
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$hooks_json" "$hook_script" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+hooks_file = sys.argv[1]
+expected_hook = sys.argv[2]
+
+try:
+    with open(hooks_file, "r") as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+entries = hooks.get("beforeShellExecution")
+if not isinstance(entries, list):
+    sys.exit(0)
+
+def is_dcg_cursor_command(command):
+    if not isinstance(command, str) or not command:
+        return False
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    return parts[0] == expected_hook
+
+new_entries = [
+    entry for entry in entries
+    if not (isinstance(entry, dict) and is_dcg_cursor_command(entry.get("command")))
+]
+if len(new_entries) == len(entries):
+    sys.exit(0)
+
+if new_entries:
+    hooks["beforeShellExecution"] = new_entries
+else:
+    hooks.pop("beforeShellExecution", None)
+
+if not hooks:
+    settings.pop("hooks", None)
+
+if not settings or settings == {"version": 1}:
+    os.remove(hooks_file)
+else:
+    with open(hooks_file, "w") as f:
+        json.dump(settings, f, indent=2)
+
+print("removed", file=sys.stderr)
+PYEOF
+            removed=1
+        else
+            warn "python3 not available - cannot safely edit Cursor hooks.json"
+            warn "Please manually remove dcg from $hooks_json"
+            return 1
+        fi
+    fi
+
+    [ "$removed" -eq 1 ] && return 0
+    return 0
+}
+
+# Remove dcg hook from Hermes Agent (${HERMES_HOME:-~/.hermes}/config.yaml)
+unconfigure_hermes() {
+    local cfg_file="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
+
+    if [ ! -f "$cfg_file" ]; then
+        return 0
+    fi
+
+    if ! yaml_hermes_has_dcg_hook "$cfg_file"; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit Hermes config.yaml"
+        warn "Please manually remove dcg from $cfg_file"
+        return 1
+    fi
+    if ! python3 -c 'import yaml' >/dev/null 2>&1; then
+        warn "python3 PyYAML not available - cannot safely edit Hermes config.yaml"
+        warn "Please manually remove dcg from $cfg_file"
+        return 1
+    fi
+
+    python3 - "$cfg_file" <<'PYEOF'
+import os
+import shlex
+import sys
+import yaml
+
+cfg_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    if not isinstance(cmd, str):
+        return False
+    try:
+        parts = shlex.split(cmd)
+    except ValueError:
+        parts = cmd.split()
+    if not parts:
+        return False
+    name = os.path.basename(parts[0])
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name == "dcg"
+
+try:
+    with open(cfg_file, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+except (IOError, yaml.YAMLError):
+    sys.exit(0)
+
+if not isinstance(cfg, dict):
+    sys.exit(0)
+hooks = cfg.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+pre_tool_call = hooks.get("pre_tool_call")
+if not isinstance(pre_tool_call, list):
+    sys.exit(0)
+
+filtered = []
+removed = False
+for entry in pre_tool_call:
+    if isinstance(entry, dict) and is_dcg_command(entry.get("command")):
+        removed = True
+        continue
+    filtered.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+if filtered:
+    hooks["pre_tool_call"] = filtered
+else:
+    hooks.pop("pre_tool_call", None)
+    if not hooks:
+        cfg.pop("hooks", None)
+
+# We do NOT touch `hooks_auto_accept` on uninstall: the user may have other
+# hooks declared in this same file (per Hermes' shared config layout) that
+# rely on auto-accept for non-TTY runs. Removing it would silently break
+# their other integrations.
+
+try:
+    if not cfg:
+        os.remove(cfg_file)
+    else:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, sort_keys=False, default_flow_style=False)
+except OSError as exc:
+    print(f"warning: failed to update {cfg_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print("removed", file=sys.stderr)
+PYEOF
+    return $?
+}
+
+# Remove dcg hook from Posit Assistant (~/.posit/assistant/settings.json).
+#
+# Only dcg-owned entries are removed. A matcher group is dropped only when it
+# had hooks and dcg was the last one left; groups the user wrote for other
+# tools — and groups with no `hooks` key at all — survive untouched. The file
+# itself is NEVER deleted: Posit Assistant keeps unrelated settings in it.
+unconfigure_posit_assistant() {
+    local settings="$HOME/.posit/assistant/settings.json"
+
+    if [ ! -f "$settings" ]; then
+        return 0
+    fi
+
+    if ! json_settings_has_dcg_command_hook "$settings" "PreToolUse"; then
+        return 0
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit Posit Assistant settings"
+        warn "Please manually remove dcg from $settings"
+        return 1
+    fi
+
+    python3 - "$settings" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+settings_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring).
+
+    This code DELETES entries, so a substring false positive (e.g.
+    /opt/dcgrep/bin/scan or ~/.local/bin/dcgworkflow) would be data loss for
+    the user's unrelated tooling.
+    """
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0])
+    if name.endswith('.exe'):
+        name = name[:-4]
+    return name == 'dcg'
+
+try:
+    with open(settings_file, 'r', encoding='utf-8') as f:
+        settings = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+if not isinstance(settings, dict):
+    sys.exit(0)
+hooks = settings.get('hooks')
+if not isinstance(hooks, dict):
+    sys.exit(0)
+pre_tool_use = hooks.get('PreToolUse')
+if not isinstance(pre_tool_use, list):
+    sys.exit(0)
+
+new_entries = []
+removed = False
+for entry in pre_tool_use:
+    if not isinstance(entry, dict) or not isinstance(entry.get('hooks'), list):
+        new_entries.append(entry)
+        continue
+    inner = entry['hooks']
+    filtered = [
+        hook for hook in inner
+        if not (isinstance(hook, dict) and is_dcg_command(hook.get('command')))
+    ]
+    if len(filtered) != len(inner):
+        removed = True
+    if inner and not filtered:
+        # The group existed only to run dcg; drop it rather than leave an
+        # empty group behind.
+        continue
+    entry['hooks'] = filtered
+    new_entries.append(entry)
+
+if not removed:
+    sys.exit(0)
+
+# The settings file stays in place even when the hooks empty out — unlike
+# ~/.codex/hooks.json (dcg-dedicated), this file also holds unrelated Posit
+# Assistant settings, and an empty `hooks` object is valid.
+if new_entries:
+    hooks['PreToolUse'] = new_entries
+else:
+    hooks.pop('PreToolUse', None)
+
+try:
+    with open(settings_file, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+except OSError as exc:
+    print(f"warning: failed to update {settings_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+print("removed", file=sys.stderr)
+PYEOF
+    return $?
+}
+
+current_repo_root() {
+    local start
+    if ! start=$(pwd -P) || [ -z "$start" ]; then
+        return 1
+    fi
+    local root="$start"
+    while true; do
+        if [ -e "$root/.git" ]; then
+            printf '%s\n' "$root"
+            return 0
+        fi
+        [ "$root" = "/" ] && break
+        root="${root%/*}"
+        [ -n "$root" ] || root="/"
+    done
+    printf '%s\n' "$start"
+}
+
+unconfigure_opencode() {
+    # OpenCode plugin (#318): a standalone generated file. Delete it ONLY when
+    # it carries the dcg ownership marker — never remove a user-authored
+    # plugin that happens to share the name. Both the user-level and any
+    # repo-local copy are covered, including when uninstall runs in a nested
+    # working directory.
+    local removed=0
+    local plugin
+    local repo_root=""
+    local -a plugins=(
+        "${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/dcg-guard.js"
+    )
+    # `current_repo_root` falls back to the physical cwd outside Git, so one
+    # resolved project candidate covers both existing cleanup cases without
+    # checking the same file again through a relative alias. If cwd cannot be
+    # resolved, omit the project capability entirely rather than constructing
+    # `/.opencode/...` from an empty root.
+    if repo_root=$(current_repo_root); then
+        plugins+=("$repo_root/.opencode/plugins/dcg-guard.js")
+    fi
+    for plugin in "${plugins[@]}"; do
+        if [ -f "$plugin" ] && grep -q 'dcg-opencode-plugin' "$plugin" 2>/dev/null; then
+            rm -f "$plugin" 2>/dev/null && removed=1
+        fi
+    done
+    if [ "$removed" -eq 1 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
+# Remove dcg's entries from one Crush config file (#388). Crush's hook
+# entries are flat `{name, matcher, command, timeout}` objects under
+# `hooks.PreToolUse` (any case/separator spelling of the event key). Only
+# entries whose command basename is `dcg` are dropped; everything else in the
+# file is preserved byte-for-value.
+unconfigure_crush_file() {
+    local config_file="$1"
+    local agent="${2:-Crush}"
+    [ -f "$config_file" ] || return 0
+    grep -q 'dcg' "$config_file" 2>/dev/null || return 0
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 not available - cannot safely edit $agent config"
+        warn "Please manually remove dcg from $config_file"
+        return 1
+    fi
+
+    python3 - "$config_file" <<'PYEOF'
+import json
+import os
+import shlex
+import sys
+
+config_file = sys.argv[1]
+
+def is_dcg_command(cmd):
+    """True iff `cmd` invokes the dcg binary (basename match, not substring)."""
+    if not isinstance(cmd, str) or not cmd:
+        return False
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    name = os.path.basename(tokens[0].replace('\\', '/'))
+    if name.lower().endswith('.exe'):
+        name = name[:-4]
+    return name.lower() == 'dcg'
+
+def is_pre_tool_use(key):
+    return key.replace('_', '').replace('-', '').lower() == 'pretooluse'
+
+try:
+    with open(config_file, 'r') as f:
+        config = json.load(f)
+except (IOError, ValueError, json.JSONDecodeError):
+    sys.exit(0)
+
+hooks = config.get('hooks') if isinstance(config, dict) else None
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+removed = False
+for key, entries in hooks.items():
+    if not is_pre_tool_use(key) or not isinstance(entries, list):
+        continue
+    kept = [
+        e for e in entries
+        if not (isinstance(e, dict) and is_dcg_command(e.get('command', '')))
+    ]
+    if len(kept) != len(entries):
+        removed = True
+        hooks[key] = kept
+
+if not removed:
+    sys.exit(0)
+
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+
+print("removed", file=sys.stderr)
+PYEOF
+}
+
+unconfigure_crush() {
+    # Crush hook (#388): user-level crush.json (honoring CRUSH_GLOBAL_CONFIG and
+    # XDG_CONFIG_HOME exactly as Crush resolves them) plus any repo-local
+    # crush.json / .crush.json written by `dcg install --crush --project`.
+    # Each file prints its own "removed" marker; report_unconfigure only
+    # needs at least one such line in the combined output.
+    local config_file
+    local repo_root=""
+    local -a configs=(
+        "${CRUSH_GLOBAL_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/crush}/crush.json"
+    )
+    if repo_root=$(current_repo_root); then
+        configs+=("$repo_root/crush.json" "$repo_root/.crush.json")
+    fi
+    for config_file in "${configs[@]}"; do
+        unconfigure_crush_file "$config_file" || true
+    done
+    return 0
+}
+
+droid_may_have_dcg_hooks() {
+    # Conservative inventory only, never a JSON editor or an ownership claim.
+    # If a file is unreadable, retain the binary until native cleanup can check.
+    local factory_dir="$1"
+    local candidate
+    for candidate in "$factory_dir/hooks.json" "$factory_dir/settings.json" \
+        "$factory_dir/settings.local.json" "$factory_dir/hooks/hooks.json"; do
+        if [ -e "$candidate" ] || [ -L "$candidate" ]; then
+            if [ ! -f "$candidate" ] || [ ! -r "$candidate" ]; then
+                return 0
+            fi
+            # JSON may spell the executable with Unicode escapes. Delegate
+            # such files to the native parser instead of silently missing a
+            # live registration; any read error is also an unknown result.
+            local inventory_status=0
+            grep -Eiq 'dcg|\\u[0-9a-f]{4}' "$candidate" || inventory_status=$?
+            if [ "$inventory_status" -ne 1 ]; then
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+unconfigure_droid() {
+    # Factory has standalone and settings-wrapped hook maps, including local
+    # overrides. Let the native editor remove only DCG entries in each scope,
+    # while the binary still exists. Never guess at JSON structure here.
+    local dcg_bin="${1:-}"
+    local repo_root=""
+    repo_root=$(current_repo_root) || true
+    local user_hook=0 project_hook=0
+    droid_may_have_dcg_hooks "$HOME/.factory" && user_hook=1
+    if [ -n "$repo_root" ] && droid_may_have_dcg_hooks "$repo_root/.factory"; then
+        project_hook=1
+    fi
+    if [ "$user_hook" -eq 0 ] && [ "$project_hook" -eq 0 ]; then
+        return 0
+    fi
+    [ -n "$dcg_bin" ] || dcg_bin=$(find_dcg_binary)
+    if [ -z "$dcg_bin" ] || [ ! -x "$dcg_bin" ]; then
+        warn "Factory Droid cleanup requires a DCG binary with Droid support."
+        warn "Run 'dcg uninstall --droid' (and --project in each configured project)."
+        return 1
+    fi
+    case "$dcg_bin" in
+        /*) ;;
+        *) dcg_bin="$PWD/$dcg_bin" ;;
+    esac
+    if [ "$user_hook" -eq 1 ]; then
+        if ! "$dcg_bin" uninstall --droid; then
+            warn "Factory Droid user hook cleanup failed; inspect ~/.factory before removing DCG."
+            return 1
+        fi
+    fi
+    if [ "$project_hook" -eq 1 ]; then
+        if ! (cd "$repo_root" && "$dcg_bin" uninstall --droid --project); then
+            warn "Factory Droid project hook cleanup failed at $repo_root/.factory."
+            return 1
+        fi
+    fi
+    return 0
+}
+
+unconfigure_reasonix() {
+    # Reasonix hook (#358): <Reasonix home>/settings.json (REASONIX_HOME, else
+    # ~/.reasonix) plus any repo-local .reasonix/settings.json written by
+    # `dcg install --reasonix --project`. Its entries are `hooks.PreToolUse[]`
+    # objects with a `command`, the shape the Crush editor above already
+    # handles. A hook left behind after the binary is gone makes Reasonix
+    # warn on every shell call. REASONIX_HOME is trimmed and a leading `~`
+    # expanded as Reasonix does; ~/.reasonix is cleaned as well, since an
+    # earlier install without REASONIX_HOME may have written there, and only
+    # dcg's own entries are ever removed.
+    local config_file
+    local repo_root=""
+    local home_dir="${REASONIX_HOME:-}"
+    home_dir="${home_dir#"${home_dir%%[![:space:]]*}"}"
+    home_dir="${home_dir%"${home_dir##*[![:space:]]}"}"
+    case "$home_dir" in
+        "~") home_dir="$HOME" ;;
+        "~/"*) home_dir="$HOME/${home_dir#"~/"}" ;;
+    esac
+    local -a configs=("$HOME/.reasonix/settings.json")
+    if [ -n "$home_dir" ] && [ "$home_dir" != "$HOME/.reasonix" ]; then
+        configs+=("$home_dir/settings.json")
+    fi
+    if repo_root=$(current_repo_root); then
+        configs+=("$repo_root/.reasonix/settings.json")
+    fi
+    for config_file in "${configs[@]}"; do
+        unconfigure_crush_file "$config_file" Reasonix || true
+    done
+    return 0
+}
+
+# Validate the complete profile value as one ASCII pathname component. A
+# line-oriented grep would accept a valid first line and ignore an injected
+# second line, so keep this check inside Bash's whole-string pattern matcher.
+omp_profile_has_ascii_shape() {
+    local profile="$1"
+    case "$profile" in
+        [abcdefghijklmnopqrstuvwxyz0123456789]*)
+            case "$profile" in
+                *[!abcdefghijklmnopqrstuvwxyz0123456789._-]*) return 1 ;;
+                *) return 0 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# Mirror Node's POSIX `path.join(HOME, PI_CONFIG_DIR || ".omp")` lexically.
+# Backslashes are ordinary POSIX filename bytes; only `/` separates components.
+resolve_omp_uninstall_config_root() {
+    local config_name="${PI_CONFIG_DIR:-.omp}"
+    local remaining="$HOME/$config_name"
+    local absolute=0
+    local segment
+    local component
+    local result=""
+    local count
+    local last
+    local -a components=()
+
+    case "$remaining" in
+        /*) absolute=1 ;;
+    esac
+
+    while [ -n "$remaining" ]; do
+        case "$remaining" in
+            */*)
+                segment="${remaining%%/*}"
+                remaining="${remaining#*/}"
+                ;;
+            *)
+                segment="$remaining"
+                remaining=""
+                ;;
+        esac
+        case "$segment" in
+            "" | .) ;;
+            ..)
+                count=${#components[@]}
+                if [ "$count" -gt 0 ]; then
+                    last=$((count - 1))
+                    if [ "${components[$last]}" != ".." ]; then
+                        unset "components[$last]"
+                    elif [ "$absolute" -eq 0 ]; then
+                        components[${#components[@]}]=".."
+                    fi
+                elif [ "$absolute" -eq 0 ]; then
+                    components[0]=".."
+                fi
+                ;;
+            *) components[${#components[@]}]="$segment" ;;
+        esac
+    done
+
+    [ "$absolute" -eq 1 ] && result="/"
+    for component in ${components[@]+"${components[@]}"}; do
+        if [ "$result" = "/" ]; then
+            result="/$component"
+        elif [ -z "$result" ]; then
+            result="$component"
+        else
+            result="$result/$component"
+        fi
+    done
+    [ -n "$result" ] || result="."
+    printf '%s\n' "$result"
+}
+
+collect_omp_uninstall_extensions() {
+    # Keep pre-confirmation inventory and post-confirmation cleanup on one
+    # candidate authority. Cleanup still re-checks every ownership marker after
+    # confirmation, so a file changed between the two phases is never removed
+    # based on stale inventory.
+    local config_root
+    # Command substitution strips every trailing LF. Keep a non-LF sentinel
+    # after the resolver's framing newline, then remove exactly the sentinel and
+    # framing byte so LF bytes belonging to the path remain intact.
+    config_root=$(resolve_omp_uninstall_config_root; printf '\034')
+    config_root="${config_root%$'\034'}"
+    config_root="${config_root%$'\n'}"
+    local agent_dir="$config_root/agent"
+    local profile=""
+    if [ "${OMP_PROFILE+x}" = "x" ]; then
+        profile="$OMP_PROFILE"
+    elif [ "${PI_PROFILE+x}" = "x" ]; then
+        profile="$PI_PROFILE"
+    fi
+    profile=$(printf '%s' "$profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    local profile_base="${profile%%.*}"
+    local profile_reserved=0
+    case "$profile_base" in
+        con|prn|aux|nul|com[0-9]|lpt[0-9]) profile_reserved=1 ;;
+    esac
+    local agent_dir_override="${PI_CODING_AGENT_DIR:-}"
+    if { [ -z "$profile" ] || [ "$profile" = "default" ]; } &&
+        [ -n "$agent_dir_override" ]; then
+        local legacy_profile="${PI_PROFILE-}"
+        legacy_profile=$(printf '%s' "$legacy_profile" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        local legacy_profile_base="${legacy_profile%%.*}"
+        local legacy_profile_reserved=0
+        case "$legacy_profile_base" in
+            con|prn|aux|nul|com[0-9]|lpt[0-9]) legacy_profile_reserved=1 ;;
+        esac
+        if [ -n "$legacy_profile" ] && [ "$legacy_profile" != "default" ] &&
+            [ "${legacy_profile%.}" = "$legacy_profile" ] &&
+            [ "$legacy_profile_reserved" -eq 0 ] &&
+            [ "${#legacy_profile}" -le 64 ] &&
+            omp_profile_has_ascii_shape "$legacy_profile" &&
+            [ "$agent_dir_override" = "$config_root/profiles/$legacy_profile/agent" ]; then
+            agent_dir_override=""
+        fi
+    fi
+    if [ -n "$profile" ] && [ "$profile" != "default" ] &&
+        [ "${profile%.}" = "$profile" ] && [ "$profile_reserved" -eq 0 ] &&
+        [ "${#profile}" -le 64 ] &&
+        omp_profile_has_ascii_shape "$profile"; then
+        agent_dir="$config_root/profiles/$profile/agent"
+    elif [ -n "$agent_dir_override" ]; then
+        agent_dir="$agent_dir_override"
+    fi
+
+    OMP_UNINSTALL_ENUMERATION_FAILED=0
+    OMP_UNINSTALL_FAILED_PROFILE_ROOTS=()
+    OMP_UNINSTALL_EXTENSIONS=(
+        "$agent_dir/extensions/dcg-guard.ts"
+        "$config_root/agent/extensions/dcg-guard.ts"
+        "$HOME/.omp/agent/extensions/dcg-guard.ts"
+        ".omp/extensions/dcg-guard.ts"
+    )
+    if [ -n "${PI_CODING_AGENT_DIR:-}" ]; then
+        OMP_UNINSTALL_EXTENSIONS+=("$PI_CODING_AGENT_DIR/extensions/dcg-guard.ts")
+    fi
+    local -a profile_roots=(
+        "$HOME/.omp/profiles"
+        "$config_root/profiles"
+    )
+    local -a seen_profile_roots=()
+    local profiles_root
+    local seen_profile_root
+    local profile_agent_dir
+    local duplicate
+    for profiles_root in ${profile_roots[@]+"${profile_roots[@]}"}; do
+        duplicate=0
+        for seen_profile_root in ${seen_profile_roots[@]+"${seen_profile_roots[@]}"}; do
+            if [ "$profiles_root" = "$seen_profile_root" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_profile_roots+=("$profiles_root")
+        [ -d "$profiles_root" ] || continue
+
+        if ! find "$profiles_root" -mindepth 1 -maxdepth 1 -type d -print \
+            >/dev/null 2>&1; then
+            OMP_UNINSTALL_ENUMERATION_FAILED=1
+            OMP_UNINSTALL_FAILED_PROFILE_ROOTS+=("$profiles_root")
+            continue
+        fi
+        for profile_agent_dir in "$profiles_root"/*/agent; do
+            [ -d "$profile_agent_dir" ] || continue
+            OMP_UNINSTALL_EXTENSIONS+=("$profile_agent_dir/extensions/dcg-guard.ts")
+        done
+    done
+}
+
+inspect_omp_uninstall_extensions() {
+    # Populate the owned-candidate array without flattening paths through a
+    # newline-delimited command-substitution channel. Status 1 means no owned
+    # extension; status 2 means the inventory was incomplete and must not be
+    # described as "nothing to remove".
+    collect_omp_uninstall_extensions
+
+    OMP_UNINSTALL_OWNED_EXTENSIONS=()
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    local duplicate
+    local found=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            OMP_UNINSTALL_OWNED_EXTENSIONS+=("$extension")
+            found=1
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
+                failed=1
+            fi
+        fi
+    done
+    [ "$failed" -eq 0 ] || return 2
+    [ "$found" -eq 1 ] || return 1
+    return 0
+}
+
+report_omp_uninstall_inventory() {
+    local status
+    if inspect_omp_uninstall_extensions; then
+        status=0
+    else
+        status=$?
+    fi
+
+    local extension
+    for extension in ${OMP_UNINSTALL_OWNED_EXTENSIONS[@]+"${OMP_UNINSTALL_OWNED_EXTENSIONS[@]}"}; do
+        log "  • Oh My Pi extension ($extension)"
+    done
+    if [ "$status" -eq 2 ]; then
+        warn "Oh My Pi extension inventory is incomplete; ownership will be rechecked before removal"
+    fi
+    return "$status"
+}
+
+unconfigure_omp() {
+    # Oh My Pi extension: remove only marker-owned files. Cover the active
+    # profile, every named profile under the default/current config roots, the
+    # legacy agent-dir override, and the current working directory's project
+    # install. OMP's native extension discovery is cwd-only; it does not walk
+    # to a Git ancestor.
+    collect_omp_uninstall_extensions
+
+    local removed=0
+    local failed="$OMP_UNINSTALL_ENUMERATION_FAILED"
+    local failed_profile_root
+    for failed_profile_root in ${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]+"${OMP_UNINSTALL_FAILED_PROFILE_ROOTS[@]}"}; do
+        warn "Could not inspect Oh My Pi profiles under $failed_profile_root"
+    done
+    local -a seen_extensions=()
+    local extension
+    local seen_extension
+    local grep_status
+    local duplicate
+    for extension in ${OMP_UNINSTALL_EXTENSIONS[@]+"${OMP_UNINSTALL_EXTENSIONS[@]}"}; do
+        duplicate=0
+        for seen_extension in ${seen_extensions[@]+"${seen_extensions[@]}"}; do
+            if [ "$extension" = "$seen_extension" ]; then
+                duplicate=1
+                break
+            fi
+        done
+        [ "$duplicate" -eq 0 ] || continue
+        seen_extensions+=("$extension")
+
+        [ -f "$extension" ] || continue
+        if grep -q -- 'dcg-omp-extension' "$extension" 2>/dev/null; then
+            if rm -f -- "$extension" 2>/dev/null &&
+                [ ! -e "$extension" ] && [ ! -L "$extension" ]; then
+                removed=1
+            else
+                failed=1
+                warn "Could not remove Oh My Pi extension at $extension"
+            fi
+        else
+            grep_status=$?
+            if [ "$grep_status" -gt 1 ]; then
+                failed=1
+                warn "Could not inspect Oh My Pi extension at $extension"
+            fi
+        fi
+    done
+    if [ "$removed" -eq 1 ] && [ "$failed" -eq 0 ]; then
+        echo "removed" >&2
+    fi
+    return 0
+}
+
+# Run an unconfigure function and report the outcome. The old call pattern
+# (`unconfigure_x 2>&1 | grep -q removed`) swallowed every human-visible line
+# the function printed — most importantly the `warn` fallback messages on
+# python3-less hosts — so capture the output, replay everything except the
+# machine-readable "removed" marker line, and report success on the marker.
+report_unconfigure() {
+    local label="$1"
+    shift
+    local output=""
+    output=$("$@" 2>&1) || true
+    if [ -n "$output" ]; then
+        printf '%s\n' "$output" | grep -v '^removed$' || true
+    fi
+    if printf '%s\n' "$output" | grep -q '^removed$'; then
+        ok "Removed $label"
+    fi
+}
+
+remove_state_directories() {
+    local config_dir="$1"
+    local data_dir="$2"
+    local state_dir="$3"
+
+    # Releases before 0.15 wrote history.db beside config.toml, and release
+    # backups still live there. KeepConfig and KeepHistory therefore need
+    # field-level removal rather than treating the whole directory as one
+    # category. Newer installs keep history.db in $state_dir (#381).
+    if [ -d "$config_dir" ]; then
+        if [ "$KEEP_CONFIG" -eq 0 ] && [ "$KEEP_HISTORY" -eq 0 ]; then
+            if rm -rf "$config_dir" 2>/dev/null; then
+                ok "Removed configuration and history database"
+            else
+                warn "Failed to remove configuration directory"
+            fi
+        elif [ "$KEEP_CONFIG" -eq 0 ]; then
+            if find "$config_dir" -mindepth 1 -maxdepth 1 \
+                ! -name 'history.db' \
+                ! -name 'history.db-wal' \
+                ! -name 'history.db-shm' \
+                ! -name 'backups' \
+                -exec rm -rf -- {} + 2>/dev/null; then
+                ok "Removed configuration (preserved history)"
+            else
+                warn "Failed to remove some configuration files"
+            fi
+        elif [ "$KEEP_HISTORY" -eq 0 ]; then
+            if rm -f -- \
+                "$config_dir/history.db" \
+                "$config_dir/history.db-wal" \
+                "$config_dir/history.db-shm" 2>/dev/null &&
+                rm -rf -- "$config_dir/backups" 2>/dev/null; then
+                ok "Removed history database and release backups"
+            else
+                warn "Failed to remove some history files"
+            fi
+        fi
+    fi
+
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$data_dir" ]; then
+        if rm -rf "$data_dir" 2>/dev/null; then
+            ok "Removed history data"
+        else
+            warn "Failed to remove history data"
+        fi
+    fi
+
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$state_dir" ]; then
+        if rm -rf "$state_dir" 2>/dev/null; then
+            ok "Removed history database ($state_dir)"
+        else
+            warn "Failed to remove history database ($state_dir)"
+        fi
+    fi
+}
+
+# Main uninstall function
+main() {
+    log "${BOLD}dcg uninstaller${NC}"
+    log ""
+
+    # Find binary
+    local binary
+    binary=$(find_dcg_binary)
+
+    # Determine paths
+    local config_dir="$HOME/.config/dcg"
+    local data_dir="$HOME/.local/share/dcg"
+    # Default history.db location since 0.15 (#381); older installs keep it
+    # in $config_dir, which remove_state_directories also handles.
+    local state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dcg"
+    local claude_settings
+    claude_settings="$(claude_config_dir; printf .)"
+    claude_settings="${claude_settings%$'\n.'}"
+    claude_settings="${claude_settings%/}/settings.json"
+    local gemini_settings="$HOME/.gemini/settings.json"
+    local aider_config="$HOME/.aider.conf.yml"
+    local copilot_hook_file="${COPILOT_HOME:-$HOME/.copilot}/hooks/dcg.json"
+
+    # Show what will be removed
+    log "The following will be removed:"
+    log ""
+
+    local found_anything=0
+    local aider_configured=0
+
+    # Agent hooks
+    if json_settings_has_dcg_command_hook "$claude_settings" "PreToolUse"; then
+        log "  • Claude Code hook ($claude_settings)"
+        found_anything=1
+    fi
+    if json_settings_has_dcg_command_hook "$gemini_settings" "BeforeTool"; then
+        log "  • Gemini CLI hook ($gemini_settings)"
+        found_anything=1
+    fi
+    if [ -f "$aider_config" ] && grep -q 'Added by dcg installer' "$aider_config" 2>/dev/null; then
+        log "  • Aider configuration ($aider_config)"
+        found_anything=1
+        aider_configured=1
+    fi
+    if json_copilot_has_dcg_hook "$copilot_hook_file"; then
+        log "  • GitHub Copilot CLI hook ($copilot_hook_file)"
+        found_anything=1
+    fi
+    local cursor_hooks_json="$HOME/.cursor/hooks.json"
+    local cursor_hook_script="$HOME/.cursor/hooks/dcg-pre-shell.py"
+    if { [ -f "$cursor_hook_script" ] && grep -q 'dcg-cursor-hook' "$cursor_hook_script" 2>/dev/null; } || \
+       { json_cursor_has_dcg_hook "$cursor_hooks_json"; }; then
+        log "  • Cursor IDE hook ($cursor_hooks_json, $cursor_hook_script)"
+        found_anything=1
+    fi
+    local codex_hooks_json="$HOME/.codex/hooks.json"
+    if json_settings_has_dcg_command_hook "$codex_hooks_json" "PreToolUse" "Bash"; then
+        log "  • Codex CLI hook ($codex_hooks_json)"
+        found_anything=1
+    fi
+    local hermes_config="${HERMES_HOME:-$HOME/.hermes}/config.yaml"
+    if yaml_hermes_has_dcg_hook "$hermes_config"; then
+        log "  • Hermes Agent hook ($hermes_config)"
+        found_anything=1
+    fi
+    local posit_assistant_settings="$HOME/.posit/assistant/settings.json"
+    if json_settings_has_dcg_command_hook "$posit_assistant_settings" "PreToolUse"; then
+        log "  • Posit Assistant hook ($posit_assistant_settings)"
+        found_anything=1
+    fi
+    local omp_inventory_status
+    if report_omp_uninstall_inventory; then
+        found_anything=1
+    else
+        omp_inventory_status=$?
+        # An incomplete inventory is actionable: continue to confirmation so
+        # cleanup can re-enumerate and report precise marker/removal failures.
+        [ "$omp_inventory_status" -ne 2 ] || found_anything=1
+    fi
+    local droid_repo_root=""
+    droid_repo_root=$(current_repo_root) || true
+    if droid_may_have_dcg_hooks "$HOME/.factory" ||
+        { [ -n "$droid_repo_root" ] && droid_may_have_dcg_hooks "$droid_repo_root/.factory"; }; then
+        log "  • Factory Droid DCG hook entries (user and current project)"
+        found_anything=1
+    fi
+
+    # Config
+    if { [ "$KEEP_CONFIG" -eq 0 ] || [ "$KEEP_HISTORY" -eq 0 ]; } &&
+        [ -d "$config_dir" ]; then
+        log "  • Configuration/history state ($config_dir)"
+        found_anything=1
+    fi
+
+    # History
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$data_dir" ]; then
+        log "  • History data ($data_dir)"
+        found_anything=1
+    fi
+    if [ "$KEEP_HISTORY" -eq 0 ] && [ -d "$state_dir" ]; then
+        log "  • History database ($state_dir)"
+        found_anything=1
+    fi
+
+    # Binary
+    if [ -n "$binary" ] && [ -f "$binary" ]; then
+        log "  • Binary ($binary)"
+        found_anything=1
+    fi
+
+    if [ "$found_anything" -eq 0 ]; then
+        log "  ${DIM}Nothing to remove - dcg does not appear to be installed${NC}"
+        return 0
+    fi
+
+    log ""
+
+    # Confirmation
+    if [ "$YES" -eq 0 ]; then
+        # When invoked via `curl … | bash`, stdin is the pipe from curl, not
+        # the user's terminal — `read` returns immediately with empty input
+        # and the default "N" answer silently cancels the uninstall. Read
+        # from /dev/tty instead so the curl-pipe-bash one-liner works.
+        # If /dev/tty isn't available (e.g. CI), refuse with a clear message
+        # rather than silently cancelling.
+        printf "%bProceed with uninstall? [y/N]%b " "$YELLOW" "$NC"
+        response=""
+        if [ -r /dev/tty ]; then
+            # `|| true` so Ctrl-D/EOF doesn't kill the script under `set -e`;
+            # an empty response falls through the case below and cancels cleanly.
+            read -r response < /dev/tty || true
+        elif [ -t 0 ]; then
+            read -r response || true
+        else
+            echo
+            log "${YELLOW}Cannot read confirmation (no TTY available).${NC}"
+            log "${YELLOW}Re-run with --yes to skip the prompt, e.g.:${NC}"
+            log "    bash ./uninstall.sh --yes  # from your reviewed local checkout"
+            return 1
+        fi
+        case "$response" in
+            [yY]|[yY][eE][sS])
+                ;;
+            *)
+                log "${YELLOW}Uninstall cancelled.${NC}"
+                return 0
+                ;;
+        esac
+    fi
+
+    log ""
+
+    # Remove agent hooks. report_unconfigure replays each function's
+    # human-visible output (the old inline `2>&1 | grep -q` ate it) and
+    # prints the success line when the "removed" marker is present.
+    report_unconfigure "Claude Code hook" unconfigure_claude_code
+    report_unconfigure "Gemini CLI hook" unconfigure_gemini
+    # GitHub Copilot CLI hook (user-level plus legacy repo-local).
+    report_unconfigure "GitHub Copilot CLI hook" unconfigure_copilot
+    report_unconfigure "Cursor IDE hook" unconfigure_cursor
+    report_unconfigure "Codex CLI hook" unconfigure_codex
+    report_unconfigure "Hermes Agent hook" unconfigure_hermes
+    report_unconfigure "Posit Assistant hook" unconfigure_posit_assistant
+    report_unconfigure "OpenCode plugin" unconfigure_opencode
+    report_unconfigure "Crush hook" unconfigure_crush
+    report_unconfigure "Reasonix hook" unconfigure_reasonix
+    if ! unconfigure_droid "$binary"; then
+        err "Factory Droid hook cleanup is incomplete; retaining the DCG binary."
+        return 1
+    fi
+    report_unconfigure "Oh My Pi extension" unconfigure_omp
+
+    # Remove Aider config
+    if [ "$aider_configured" -eq 1 ] && unconfigure_aider; then
+        if [ ! -f "$aider_config" ] || ! grep -q 'Added by dcg installer' "$aider_config" 2>/dev/null; then
+            ok "Removed Aider configuration"
+        fi
+    fi
+
+    remove_state_directories "$config_dir" "$data_dir" "$state_dir"
+
+    # Remove binary
+    if [ -n "$binary" ] && [ -f "$binary" ]; then
+        if rm -f "$binary" 2>/dev/null; then
+            ok "Removed binary"
+        else
+            warn "Failed to remove binary - you may need sudo"
+            warn "  Run: sudo rm -f $binary"
+        fi
+    fi
+
+    log ""
+    log "${GREEN}${BOLD}Uninstall complete!${NC}"
+    log "${DIM}Restart any AI coding agents for changes to take effect.${NC}"
+}
+
+main "$@"

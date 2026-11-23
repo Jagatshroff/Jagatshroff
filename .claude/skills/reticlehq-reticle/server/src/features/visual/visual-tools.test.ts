@@ -1,0 +1,363 @@
+import { removeTempDir } from '@/machine/temp-dir.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { WebSocket } from 'ws';
+import { mkdtemp, readdir, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PNG } from 'pngjs';
+import {
+  InputMode,
+  MessageKind,
+  RETICLE_PROTOCOL_VERSION,
+  VisualReason,
+  type HelloMessage,
+} from '@reticlehq/core';
+import { TOOLS, type ToolDeps } from '@/surface/tools/tools.js';
+import { ReticleTool } from '@reticlehq/core';
+import { BaselineStore } from '@/memory/project/baselines.js';
+import { RecordingStore } from '@/language/flows/recording/tape/recordings.js';
+import { FlowStore } from '@/language/flows/flows.js';
+import { ProjectStore } from '@/memory/project/project-store.js';
+import { AnnotationStore } from '@/language/flows/stores/annotation-store.js';
+import { createNodeFileSystem, type FileSystemPort } from '@/memory/project/fs/fs-port.js';
+import type { RealInputProvider } from '@/portal/input/real-input.js';
+import { Session } from '@/portal/session/session.js';
+import { SessionManager } from '@/portal/session/session-manager.js';
+import { AppRuntime, RETICLE_CAPTURE_FILE_PREFIX, ReticleCommand } from '@reticlehq/core';
+
+const now = (): number => 0;
+const SESSION_URL = 'http://localhost:3100/';
+
+function solidPng(rgb: [number, number, number]): Uint8Array {
+  const png = new PNG({ width: 6, height: 6 });
+  for (let i = 0; i < png.data.length; i += 4) {
+    png.data[i] = rgb[0];
+    png.data[i + 1] = rgb[1];
+    png.data[i + 2] = rgb[2];
+    png.data[i + 3] = 255;
+  }
+  return new Uint8Array(PNG.sync.write(png));
+}
+
+/** A provider that screenshots a fixed PNG (the "page"). */
+function fakeProvider(png: Uint8Array): RealInputProvider {
+  return {
+    isAvailableFor: () => Promise.resolve(true),
+    perform: () =>
+      Promise.resolve({ performed: false, center: { cx: 0, cy: 0 }, inputMode: InputMode.REAL }),
+    screenshot: () => Promise.resolve(png),
+  };
+}
+
+function fakeSession(runtime?: string): Session {
+  return { id: 'demo', url: SESSION_URL, runtime } as Session;
+}
+
+/** A session manager that answers every lookup with `session`. */
+function sessionsOf(session: Session): SessionManager {
+  const sessions: Partial<SessionManager> = {
+    resolve: () => session,
+    resolveServing: () => Promise.resolve(session),
+  };
+  return sessions as SessionManager;
+}
+
+function tool(name: string) {
+  const t = TOOLS.find((x) => x.name === name);
+  if (t === undefined) {
+    throw new Error(`no tool ${name}`);
+  }
+  return t;
+}
+
+describe('visual tools — temp dir, never touches the repo', () => {
+  let root: string;
+  let fs: FileSystemPort;
+
+  beforeEach(async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'reticle-vt-'));
+    root = join(dir, '.reticle');
+    fs = createNodeFileSystem();
+  });
+
+  afterEach(async () => {
+    await removeTempDir(join(root, '..'));
+  });
+
+  function deps(provider?: RealInputProvider, sessionRuntime?: string): ToolDeps {
+    const base: ToolDeps = {
+      sessions: sessionsOf(fakeSession(sessionRuntime)),
+      baselines: new BaselineStore(),
+      recordings: new RecordingStore(),
+      flows: new FlowStore(fs, root, { now }),
+      project: new ProjectStore(fs, root, { now }),
+      annotations: new AnnotationStore(),
+      fs,
+      reticleRoot: root,
+      now,
+    };
+    return provider === undefined ? base : { ...base, realInput: provider };
+  }
+
+  it('1: reticle_screenshot with no driven browser returns NO_PROVIDER + recommendation', async () => {
+    const r = (await tool(ReticleTool.SCREENSHOT).handler(deps(), { name: 'home' })) as {
+      ok: boolean;
+      reason: string;
+      recommendation?: string;
+    };
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe(VisualReason.NO_PROVIDER);
+    expect(r.recommendation).toContain('reticle drive');
+  });
+  describe.each([AppRuntime.ELECTRON, AppRuntime.TAURI])('%s desktop capture', (runtime) => {
+    it.each([
+      { label: 'whole window', scope: {}, refused: false },
+      { label: 'clip', scope: { clip: { x: 1, y: 1, width: 2, height: 2 } }, refused: true },
+      { label: 'ref', scope: { ref: 'panel' }, refused: true },
+    ])('handles $label', async ({ scope, refused }) => {
+      const captureDir = await mkdtemp(join(tmpdir(), RETICLE_CAPTURE_FILE_PREFIX));
+      const capturePath = join(captureDir, `${RETICLE_CAPTURE_FILE_PREFIX}test.png`);
+      try {
+        await writeFile(capturePath, solidPng([255, 255, 255]));
+        const command = vi.fn((name: string) => {
+          if (name !== ReticleCommand.CAPTURE) {
+            throw new Error(`Unexpected command: ${name}`);
+          }
+          return Promise.resolve({ ok: true, result: { ok: true, path: capturePath } });
+        });
+        const session = { ...fakeSession(runtime), command } as unknown as Session;
+        const d = deps();
+        d.sessions = sessionsOf(session);
+        const result = await tool(ReticleTool.SCREENSHOT).handler(d, {
+          name: 'desktop-scope',
+          sessionId: 'demo',
+          ...scope,
+        });
+        if (refused) {
+          expect(result).toMatchObject({ ok: false, reason: VisualReason.CROP_UNSUPPORTED });
+          expect(result).not.toMatchObject({ saved: true });
+          expect(await readdir(root).catch(() => [])).toEqual([]);
+          // The shared capture path must refuse scoped visual diffs too.
+          await writeFile(capturePath, solidPng([255, 255, 255]));
+          expect(
+            await tool(ReticleTool.VISUAL_DIFF).handler(d, {
+              baseline: 'desktop-scope',
+              sessionId: 'demo',
+              ...scope,
+            }),
+          ).toMatchObject({ ok: false, reason: VisualReason.CROP_UNSUPPORTED });
+        } else {
+          expect(result).toMatchObject({ ok: true, saved: true });
+        }
+        expect(command).toHaveBeenCalledWith(ReticleCommand.CAPTURE, { fullPage: false });
+        expect(await readdir(captureDir)).toEqual([]);
+      } finally {
+        await removeTempDir(captureDir);
+      }
+    });
+  });
+
+  it.each(['clip', 'ref'])('keeps browser %s cropping for a desktop session', async (scope) => {
+    const clip = { x: 1, y: 1, width: 2, height: 2 };
+    const png = solidPng([255, 255, 255]);
+    const screenshot = vi.fn(() => Promise.resolve(png));
+    const provider = { ...fakeProvider(png), screenshot };
+    const d = deps(provider, AppRuntime.ELECTRON);
+    const command = vi.fn(() => Promise.resolve({ ok: true, result: { box: clip } }));
+    d.sessions = sessionsOf({ ...fakeSession(AppRuntime.ELECTRON), command } as unknown as Session);
+    expect(
+      await tool(ReticleTool.SCREENSHOT).handler(d, {
+        name: 'browser-scope',
+        sessionId: 'demo',
+        ...('clip' === scope ? { clip } : { ref: 'panel' }),
+      }),
+    ).toMatchObject({ ok: true, saved: true });
+    expect(screenshot).toHaveBeenCalledWith(SESSION_URL, { clip });
+    expect(command).not.toHaveBeenCalledWith(ReticleCommand.CAPTURE, expect.anything());
+  });
+
+  it('passes clip to the leased screenshot', async () => {
+    const clip = { x: 100, y: 50, width: 300, height: 200 };
+
+    const screenshotLease = vi.fn().mockResolvedValue(solidPng([255, 255, 255]));
+
+    const d = deps();
+
+    // The fake pool records the options passed to the lease.
+    d.pool = {
+      screenshotLease,
+    } as unknown as NonNullable<ToolDeps['pool']>;
+
+    await tool(ReticleTool.SCREENSHOT).handler(d, {
+      name: 'leased-clip',
+      sessionId: 'demo',
+      clip,
+    });
+
+    expect(screenshotLease).toHaveBeenCalledWith('demo', expect.objectContaining({ clip }));
+  });
+
+  // Re-check: a Tauri release build without `in-release` refused the capture, and the agent
+  // heard the web answer, "start with `reticle drive <url>`", about a desktop app.
+  it('names the Tauri capture off in a release build, and how to turn it on', async () => {
+    const session = {
+      ...fakeSession('tauri'),
+      command: () =>
+        Promise.resolve({
+          ok: true,
+          result: {
+            ok: false,
+            reason:
+              'reticle-tauri is inert in a release build (enable its `in-release` feature to test one)',
+          },
+        }),
+    } as unknown as Session;
+    const d = { ...deps(), sessions: sessionsOf(session) };
+    const r = (await tool(ReticleTool.SCREENSHOT).handler(d, { name: 'home' })) as {
+      reason: string;
+      recommendation?: string;
+    };
+    expect(r.reason).toBe(VisualReason.NO_PROVIDER);
+    expect(r.recommendation).toContain('in-release');
+    expect(r.recommendation).not.toContain('reticle drive');
+  });
+
+  it('2: reticle_screenshot saves a baseline PNG to .reticle/visual/<name>.png', async () => {
+    const png = solidPng([255, 255, 255]);
+    const r = (await tool(ReticleTool.SCREENSHOT).handler(deps(fakeProvider(png)), {
+      name: 'home',
+    })) as { saved: boolean; name: string; path: string; bytes: number };
+    expect(r.saved).toBe(true);
+    expect(r.name).toBe('home');
+    expect(r.bytes).toBe(png.length);
+    expect((await stat(r.path)).isFile()).toBe(true);
+  });
+
+  it('3: reticle_visual_diff against an identical page matches', async () => {
+    const png = solidPng([255, 255, 255]);
+    const d = deps(fakeProvider(png));
+    await tool(ReticleTool.SCREENSHOT).handler(d, { name: 'home' });
+    const r = (await tool(ReticleTool.VISUAL_DIFF).handler(d, { baseline: 'home' })) as {
+      matched: boolean;
+      changedPixels: number;
+      diffPath: string;
+    };
+    expect(r.matched).toBe(true);
+    expect(r.changedPixels).toBe(0);
+    expect((await stat(r.diffPath)).isFile()).toBe(true);
+  });
+
+  it('4: reticle_visual_diff detects a changed page (saved white vs current black)', async () => {
+    const white = solidPng([255, 255, 255]);
+    // Save a white baseline, then diff with a provider that now returns black.
+    await tool(ReticleTool.SCREENSHOT).handler(deps(fakeProvider(white)), { name: 'home' });
+    const r = (await tool(ReticleTool.VISUAL_DIFF).handler(
+      deps(fakeProvider(solidPng([0, 0, 0]))),
+      {
+        baseline: 'home',
+      },
+    )) as { matched: boolean; changedPixels: number; ratio: number };
+    expect(r.matched).toBe(false);
+    expect(r.changedPixels).toBe(36); // every pixel of the 6×6 image changed
+    expect(r.ratio).toBe(1);
+  });
+
+  it('5: reticle_visual_diff with no saved baseline returns BASELINE_MISSING', async () => {
+    const r = (await tool(ReticleTool.VISUAL_DIFF).handler(
+      deps(fakeProvider(solidPng([0, 0, 0]))),
+      {
+        baseline: 'never-saved',
+      },
+    )) as { ok: boolean; reason: string };
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe(VisualReason.BASELINE_MISSING);
+  });
+
+  /**
+   * A baseline belongs to the renderer that produced its pixels, which is decided by the CAPTURE
+   * ROUTE — not by the session named.
+   *
+   * `capture()` tries three: a driven browser, the desktop window's own backing store, then a leased
+   * page. Two of the three are browsers. So naming a Tauri session while a driven browser is attached
+   * yields a BROWSER rendering of that url, and filing it under `tauri/` would overwrite the desktop
+   * baseline with a picture of a different renderer — a later real regression then passes against it.
+   *
+   * Keying on the session's runtime looked equivalent and is exactly this bug.
+   */
+  describe('a visual baseline is keyed by what rendered it', () => {
+    it('files a driven-browser capture as web, even for a desktop session', async () => {
+      const result = (await tool(ReticleTool.SCREENSHOT).handler(
+        deps(fakeProvider(solidPng([10, 20, 30])), 'tauri'),
+        { name: 'home' },
+      )) as { ok: boolean; path?: string };
+      expect(result.ok).toBe(true);
+      // Flat, because a driven browser IS web — never under visual/tauri/.
+      expect(result.path).toBe(join(root, 'visual', 'home.png'));
+      expect(result.path).not.toContain(join('visual', 'tauri'));
+    });
+  });
+
+  /**
+   * One lease of this caller and one focused SDK-only tab. An id-less screenshot chose the tab, and
+   * capture() never tried a lease without an id, so it refused with no-provider (#1959).
+   */
+  describe('a screenshot without a sessionId', () => {
+    const LEASE = 'lease-1';
+    const SDK_ONLY = 'tab-1';
+    const AGENT = 'agent-1';
+    const fakeSocket = { send: (): void => {} } as unknown as WebSocket;
+
+    /** A connected web page on a fixed clock. It has no desktop capture helper, as in a browser. */
+    function sessionOf(id: string, focused: boolean): Session {
+      const hello: HelloMessage = {
+        kind: MessageKind.HELLO,
+        protocolVersion: RETICLE_PROTOCOL_VERSION,
+        sessionId: id,
+        url: SESSION_URL,
+        title: id,
+        adapters: [],
+        hasCapabilities: false,
+      };
+      const session = new Session(hello, fakeSocket, () => 0);
+      session.touch();
+      session.applyHealth(false, focused);
+      // The SDK in a browser page answers CAPTURE at once: it has no shell to ask.
+      return Object.assign(session, {
+        command: () => Promise.resolve({ ok: true, result: { ok: false } }),
+      });
+    }
+
+    it('photographs the one lease this caller holds, not the focused SDK-only tab', async () => {
+      const sessions = new SessionManager();
+      // The SDK-only tab has the focus, so resolve() picks it.
+      sessions.add(sessionOf(SDK_ONLY, true));
+      sessions.add(sessionOf(LEASE, false));
+
+      const shot: string[] = [];
+      const pool = {
+        heldBy: (id: string, owner: string | undefined) => id === LEASE && owner === AGENT,
+        screenshotLease: (id: string) => {
+          shot.push(id);
+          return Promise.resolve(solidPng([1, 2, 3]));
+        },
+      } as unknown as NonNullable<ToolDeps['pool']>;
+      const d = { ...deps(), sessions, pool, attachId: AGENT };
+
+      const result = await tool(ReticleTool.SCREENSHOT).handler(d, { name: 'mobile' });
+
+      expect(result).toMatchObject({ ok: true, saved: true });
+      expect(shot).toEqual([LEASE]);
+    });
+  });
+});
+
+describe('visual_diff tells the agent the default it actually uses', () => {
+  it('states the threshold default from the constant the diff reads', async () => {
+    // The description said 0.01 while the diff used 0.1: an agent tuning a flaky diff from that
+    // number set a threshold ten times stricter than the default it believed it was loosening.
+    const { VISUAL_PIXEL_THRESHOLD } = await import('@reticlehq/core');
+    const tool = TOOLS.find((t) => ReticleTool.VISUAL_DIFF === t.name);
+    const threshold = tool?.inputSchema['threshold'] as { description?: string } | undefined;
+    expect(threshold?.description).toContain(`Default: ${String(VISUAL_PIXEL_THRESHOLD)}.`);
+  });
+});

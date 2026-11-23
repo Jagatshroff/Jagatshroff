@@ -1,0 +1,171 @@
+/**
+ * The pooled launch hands Playwright more than a headless flag.
+ *
+ * A pooled browser serves several lease contexts while only one page is ever the visible one, so
+ * without the anti-throttling switches every other page gets its timers throttled and its rAF
+ * suspended, which is exactly the state a lease reports as `throttled: true`. This pins that what
+ * reaches `chromium.launch` carries the switches. It proves plumbing, not Chromium's behavior; the
+ * behavioral half needs a real browser and lives outside the unit gate.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const launchCalls: unknown[] = [];
+let launchRejection: Error | undefined;
+
+vi.mock('playwright', () => ({
+  chromium: {
+    launch: vi.fn((opts: unknown) => {
+      launchCalls.push(opts);
+      if (launchRejection !== undefined) {
+        return Promise.reject(launchRejection);
+      }
+      return Promise.resolve({
+        isConnected: () => true,
+        newContext: () => Promise.reject(new Error('not reached in this test')),
+        close: () => Promise.resolve(),
+        on: () => {},
+      });
+    }),
+  },
+}));
+
+import { HIDE_RETICLE_CHROME_CSS } from '@reticlehq/core';
+import {
+  captureWithChromeHidden,
+  playwrightLauncher,
+  screenshotOptions,
+} from './playwright-launcher.js';
+
+describe('playwrightLauncher', () => {
+  beforeEach(() => {
+    launchCalls.length = 0;
+    launchRejection = undefined;
+  });
+
+  it('passes the anti-throttling args to chromium.launch', async () => {
+    const launch = playwrightLauncher({ headless: true });
+    const browser = await launch();
+    expect(browser.isConnected()).toBe(true);
+    expect(launchCalls).toHaveLength(1);
+    const opts = launchCalls[0] as { headless?: boolean; args?: readonly string[] };
+    expect(opts.headless).toBe(true);
+    expect(opts.args).toContain('--disable-background-timer-throttling');
+    expect(opts.args).toContain('--disable-backgrounding-occluded-windows');
+    expect(opts.args).toContain('--disable-renderer-backgrounding');
+  });
+
+  describe('launch failure hints', () => {
+    it('tells the user to install Chromium when the executable is missing', async () => {
+      launchRejection = new Error(
+        "browserType.launch: Executable doesn't exist at /home/x/.cache/ms-playwright/chromium-1223/chrome-linux/chrome",
+      );
+      const launch = playwrightLauncher({ headless: true });
+      await expect(launch()).rejects.toThrow(/Chromium is not installed for Playwright/);
+      await expect(launch()).rejects.toThrow(/install chromium/);
+    });
+
+    it('tells the user to install-deps, not reinstall Chromium, when host shared libraries are missing', async () => {
+      // The real shape of Playwright's host-requirement validation failure: the browser binary is
+      // present, but its OS-level shared-library dependencies are not, so `chromium.launch` never
+      // gets far enough to report a missing executable.
+      launchRejection = new Error(
+        [
+          'browserType.launch: Host system is missing dependencies to run browsers.',
+          '',
+          'Please install them with the following command:',
+          '',
+          '    npx playwright install-deps',
+          '',
+          'Alternatively, use apt:',
+          '    apt-get install libnspr4',
+        ].join('\n'),
+      );
+      const launch = playwrightLauncher({ headless: true });
+      let thrown: Error | undefined;
+      try {
+        await launch();
+      } catch (err) {
+        thrown = err instanceof Error ? err : undefined;
+      }
+      expect(thrown).toBeDefined();
+      // The correct remedy for a missing shared library is install-deps...
+      expect(thrown?.message).toMatch(/install-deps chromium/);
+      // ...not the missing-binary hint, which fixes nothing here and sends the user in a loop.
+      expect(thrown?.message).not.toMatch(/Chromium is not installed for Playwright/);
+    });
+
+    it('rethrows an unrelated launch failure unchanged', async () => {
+      launchRejection = new Error('spawn ENOENT');
+      const launch = playwrightLauncher({ headless: true });
+      await expect(launch()).rejects.toThrow('spawn ENOENT');
+    });
+  });
+});
+
+describe('a live picture of a leased tab', () => {
+  it("leaves Reticle's own panel out of the picture, as the visual captures do", () => {
+    expect(screenshotOptions({ jpegQuality: 50 })).toEqual({
+      fullPage: false,
+      type: 'jpeg',
+      quality: 50,
+      style: HIDE_RETICLE_CHROME_CSS,
+      animations: 'disabled',
+    });
+  });
+
+  it('leaves it out of a plain PNG capture too, so a lease baseline shows only the app', () => {
+    expect(screenshotOptions({ fullPage: true })).toEqual({
+      fullPage: true,
+      style: HIDE_RETICLE_CHROME_CSS,
+      animations: 'disabled',
+    });
+  });
+
+  it('takes a step screenshot as the page is: CSS pixels, nothing fast-forwarded or injected', () => {
+    expect(screenshotOptions({ jpegQuality: 70, cssScale: true })).toEqual({
+      fullPage: false,
+      type: 'jpeg',
+      quality: 70,
+      scale: 'css',
+    });
+  });
+});
+
+/*
+ * A step screenshot of a leased tab showed Reticle's own HUD over about a third of the page: the
+ * step path injects nothing (no stylesheet, no animation fast-forward), so nothing hid it. Only our
+ * own hosts are hidden, by their own inline visibility, for the one capture, and put back.
+ */
+describe('a step screenshot of a leased tab', () => {
+  it('hides only Reticle’s own hosts for the capture, and puts them back after', async () => {
+    const calls: string[] = [];
+    const page = {
+      evaluate: (script: string): Promise<unknown> => {
+        const hide = script.includes("'hidden'");
+        calls.push(hide ? 'hide' : 'restore');
+        if (hide) expect(script).toContain('[data-reticle-hud]');
+        return Promise.resolve(undefined);
+      },
+    };
+    const shot = await captureWithChromeHidden(page, () => {
+      calls.push('shot');
+      return Promise.resolve(new Uint8Array([1]));
+    });
+    expect(calls).toEqual(['hide', 'shot', 'restore']);
+    expect(shot).toEqual(new Uint8Array([1]));
+  });
+
+  it('puts them back even when the capture fails', async () => {
+    const calls: string[] = [];
+    const page = {
+      evaluate: (script: string): Promise<unknown> => {
+        calls.push(script.includes("'hidden'") ? 'hide' : 'restore');
+        return Promise.resolve(undefined);
+      },
+    };
+    await expect(
+      captureWithChromeHidden(page, () => Promise.reject(new Error('gone'))),
+    ).rejects.toThrow('gone');
+    expect(calls).toEqual(['hide', 'restore']);
+  });
+});

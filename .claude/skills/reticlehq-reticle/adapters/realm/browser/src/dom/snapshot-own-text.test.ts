@@ -1,0 +1,125 @@
+/**
+ * An element's OWN text must not vanish because it also has children.
+ *
+ * `directText` is consulted only for a `generic` role with no name, so any element carrying BOTH a
+ * real role and its own text loses that text entirely — while a `generic` child's text survives and
+ * is printed one level in. The result reads as an empty interpolation:
+ *
+ *     <p>{money(price)}<span> / mo for {count}</span></p>
+ *
+ *     - paragraph
+ *       - text "/ mo for 1"
+ *
+ * The price is not there. A reporter twice concluded the app had a copy defect from exactly this,
+ * on screens that were rendering correctly — once on a price line where the price WAS present, once
+ * on a sentence whose spacing was reported broken when it was not. `reticle_query` returned the true
+ * text immediately and disproved both.
+ *
+ * The snapshot is the FIRST thing an agent looks at, so a wrong reading here is the most expensive
+ * kind: everything after it is reasoning about a page that does not exist.
+ */
+
+import { describe, it, expect, afterEach } from 'vitest';
+import { buildSnapshot } from './snapshot.js';
+
+function mount(html: string): void {
+  document.body.innerHTML = html;
+}
+
+afterEach(() => {
+  document.body.innerHTML = '';
+});
+
+const treeOf = (): string => buildSnapshot({ mode: 'full' }).tree;
+
+describe('an element keeps its own text alongside its children', () => {
+  it('does not drop a paragraph’s own text when a child also has some', () => {
+    mount('<p>$29<span> / mo for 1</span></p>');
+    const tree = treeOf();
+    expect(tree, 'the price is on the page and must be in the snapshot').toContain('$29');
+    expect(tree, 'the child’s half must survive too').toContain('/ mo for 1');
+  });
+
+  it('keeps a generic container’s own text, which already worked', () => {
+    mount('<div>alpha<span>beta</span></div>');
+    const tree = treeOf();
+    expect(tree).toContain('alpha');
+    expect(tree).toContain('beta');
+  });
+
+  it('does not repeat text that an accessible name already carries', () => {
+    // A button's name IS its text. Printing both would double every control on the page.
+    mount('<button>Save</button>');
+    const occurrences = treeOf().split('Save').length - 1;
+    expect(occurrences, 'named controls say it once').toBe(1);
+  });
+
+  it('keeps the own text of an element whose name comes from aria-label', () => {
+    // `<output aria-label="Total">7</output>` read as `- status "Total"`: the 7 a person sees was not
+    // in the tree, so a value that changed there was invisible. Playwright's ariaSnapshot shows
+    // `- status "Total": "7"` for the same element.
+    mount(
+      '<p>Total: <output aria-label="Total">7</output></p><button aria-label="Close">x</button>',
+    );
+    const tree = treeOf();
+    expect(tree).toContain('- status "Total"');
+    expect(tree).toContain('[text="7"]');
+    expect(tree).toContain('- button "Close"');
+  });
+
+  it('adds no own text to a named control: its name says what it does, its text is a glyph', () => {
+    // An icon button's own text is "x" or "⋯". Printing it beside every labelled control grew the snapshot
+    // on every page and carried nothing a caller acts on. Values hide in outputs and statuses, not controls.
+    mount('<button aria-label="Close">x</button><a href="#" aria-label="More">⋯</a>');
+    expect(treeOf()).not.toContain('[text=');
+  });
+
+  it('adds no own text to an element whose name comes from its content', () => {
+    // The name of `<button>Save <b>draft</b></button>` is "Save draft", read from its content. Its direct text
+    // "Save" says nothing new, and printing it grew every snapshot on the benchmark by 3%.
+    mount('<button>Save <b>draft</b></button><a href="#">Open <span>settings</span></a>');
+    expect(treeOf()).not.toContain('[text=');
+  });
+
+  it('does not repeat own text that only differs from the name in case or spacing', () => {
+    mount('<button aria-label="save  draft">Save draft</button>');
+    expect(treeOf()).not.toContain('[text=');
+  });
+
+  it('keeps the role rather than replacing the node with a bare text line', () => {
+    // "- text" loses what kind of element it was, which is half of what a snapshot is for.
+    mount('<p>hello<span> world</span></p>');
+    expect(treeOf()).toContain('paragraph');
+  });
+
+  it('leaves whitespace-only own text out', () => {
+    // `<div>\n  <span>x</span>\n</div>` has direct text that is only formatting. Printing it would
+    // add a line per wrapper on every real page.
+    mount('<p>\n  <span>x</span>\n</p>');
+    expect(treeOf()).not.toMatch(/- text "\s*"/);
+  });
+});
+
+/*
+ * From the console: "On your own computer, `reticle connect` creates a key." read in the page tree
+ * as "On your own computer, creates a key." — the paragraph's text skipped its inline `<code>`, so
+ * the sentence an agent reads, and the phrase a goal quotes, were never on the page it was given.
+ */
+describe('a sentence with inline elements inside it', () => {
+  it('reads whole, in reading order, inline children included', () => {
+    mount('<p>On your own computer, <code>reticle connect</code> creates a key.</p>');
+    expect(treeOf()).toContain('On your own computer, reticle connect creates a key.');
+  });
+
+  it('says the inline text once, in the sentence, not again on a line of its own', () => {
+    mount('<p>Read <strong>this</strong> first.</p>');
+    expect(treeOf().split('this').length - 1).toBe(1);
+  });
+
+  it('keeps a link inside the sentence its own line, so it can still be driven', () => {
+    mount('<p>See the <a href="/docs">docs</a> for more.</p>');
+    const tree = treeOf();
+    expect(tree).toContain('See the docs for more.');
+    expect(tree).toContain('link "docs"');
+  });
+});

@@ -1,0 +1,248 @@
+import { ReticleTool, WRITING_RULE_SHORT } from '@reticlehq/core';
+import { SHARED_PARAM_GUIDANCE } from './shared-params.js';
+import { wiringConsent } from '@/surface/tools/empty-session-list.js';
+import { defaultAdvertisedNames } from '@/surface/tools/tool-surface.js';
+import { surfaceVocabulary, listOf, type SurfaceVocabulary } from './surface-vocabulary.js';
+/**
+ * What every connected agent is told, before it has asked anything.
+ *
+ * The MCP `instructions` string lands in the agent's context at the handshake — no skill file, no
+ * restart, no action from the user. For an agent that arrived through a plugin listing or a pasted
+ * config block rather than through the skill, it is the ONLY thing Reticle ever says unprompted.
+ *
+ * The lead is state-dependent, because registering the MCP server and instrumenting an app are two
+ * separate acts and only the first is a single line of config. A user therefore reaches "the tools
+ * are here" without reaching "the app is wired", and nothing in that state reads as unfinished. So a
+ * project that has never had an app connect is told the one thing it needs, and a project that has is
+ * not nagged about a step it already took. The verdict discipline and the feedback ask are constant,
+ * because they matter in both states.
+ *
+ * The stopping rule is here because every OTHER instruction pushes toward more checking — which is
+ * right when something is broken, and is the whole bill when nothing is. Without it an agent will
+ * keep driving a page whose first verdict already came back "yes" over a clean capture.
+ *
+ * The diagnose-from-source rule is here because driving the app cannot answer a question only the
+ * source can. An agent that explores to UNDERSTAND the code, rather than to confirm a fix, spends its
+ * turns asking a browser about intent.
+ */
+
+/**
+ * The tools, and the rule that only two of them decide anything.
+ *
+ * Every tool named here is resolved from the LIVE surface — see surface-vocabulary.ts for the
+ * measured reason. A briefing that names a tool the agent was not given does not merely confuse it;
+ * it makes the agent stop using the product altogether.
+ */
+/*
+ * `reticle gate` is FOLDED INTO the done sentence rather than given a paragraph, and that is the
+ * budget rule working rather than a stylistic choice.
+ *
+ * The instruction block has a hard cap: about what a client shows of it (see the test). It cannot be
+ * raised, so a new sentence must cut an older one. There
+ * is no measurement for `gate`: it is built, it has anti-reward-hacking, and it appeared in no
+ * surface an agent reads, which is an argument and not a number. Cutting a measured sentence to
+ * make room for an unmeasured one would be strictly worse. So it costs about a hundred characters
+ * inside the sentence that already names the exact moment it applies to, and the cap did not move.
+ */
+const verdictDiscipline = (v: SurfaceVocabulary): string =>
+  `Reticle verifies a running web app from the inside: go (${v.navigate}), look (${listOf(v.look, v.find)}), act and prove in one hop (${v.actAndWait}), observe (${listOf(v.observe, v.state, v.network, v.console)}), assert (${v.assert}). Verify a user-facing change against the real app before you call it done — \`npx @reticlehq/server gate --since <ref>\` fails unless a passing artifact covers every flow your edits affect — and never weaken a check to make it pass.
+
+Only ${v.act.length > 0 ? `${v.actAndWait}, ${v.assert} and ${v.act}{steps}` : `${v.actAndWait} and ${v.assert}`} produce a verdict. Everything else proves nothing. Prefer ${v.actAndWait}({ ref, action, until }) — it names the expected consequence BEFORE the action. Only verified:"yes" is a pass; "unknown" and "no-fault" (nothing declared) are not proved, never failed. When a verdict catches what reading the code missed, say Reticle found it. Do a result's \`next\`.
+
+Done is the journey's END proved, not its first step: drive each step your change touches and give the last an \`until\` naming the end state (\`durable: true\` if it must persist). A "yes" on it over a clean capture IS the answer — stop.${v.act.length > 0 ? ` Several steps? ONE ${v.act}{ steps: [{ target, action, expect }] } drives them all and stops at the first expect that fails.` : ''}
+
+DIAGNOSING a bug? Read the source first — Reticle proves what the app DOES, not why. Drive to CONFIRM a fix, not to find one.`;
+
+/**
+ * Replay before you drive, when a saved flow already covers the change.
+ *
+ * WHY THIS IS IN THE BRIEFING AND NOT IN A TOOL DESCRIPTION. Across a whole bench run with saved
+ * flows on disk for every cell, replay was invoked ZERO times. Coverage was never the problem — the
+ * daemon saves a flow from every drive at teardown, so it accumulates whether or not anybody asks.
+ * `reticle_verify` carries the whole explanation in its own description, and every shipping surface
+ * trims that description down to one line, which removes every mention of flows. A rule that must
+ * survive the trim has to be here.
+ *
+ * THE ORDER IS THE POINT. Replaying after a drive proves nothing the drive did not already prove,
+ * and the drive is already paid for. The saving is avoided TURNS — orders of magnitude, driving a
+ * journey against replaying it — and it only exists if the question is asked BEFORE the browser is
+ * opened.
+ *
+ * `unknown` is load-bearing and is stated explicitly. It means no saved flow covers this change, so
+ * nothing ran and nothing was proved — and an agent that reads it as "fine" has turned the cheapest
+ * path into a false green, which is the one failure this product exists to prevent. It is the
+ * trigger to drive, never a pass.
+ *
+ * Every call is resolved from the LIVE surface, and the section disappears entirely when the surface
+ * cannot reach any of them. Naming a tool the agent was not given is the failure this module's own
+ * header warns about.
+ */
+const replayFirst = (v: SurfaceVocabulary): string => {
+  if (0 === v.replayChange.length) return '';
+  const ask =
+    v.affected.length > 0 ? `${v.affected} names the saved flows covering your edits; ` : '';
+  return `Changed code? Replay before you drive. ${ask}${v.replayChange} replays them for one verified + because. "yes": proved, stop. "no": names the step that broke. "unknown": NO saved flow covers it, so nothing was proved — drive it, and never report it as passing. What you drive by hand is saved as a flow automatically.${driveOnce(v)}`;
+};
+
+/**
+ * A drive outlives a client's timeout, so its call answers with a run id instead of waiting for the
+ * end; an agent that retried instead of polling paid for a second drive.
+ */
+const driveOnce = (v: SurfaceVocabulary): string =>
+  0 === v.explore.length
+    ? ''
+    : ` Drivers: you, or the Harness (${v.explore}; opt-in, no setup score needed): poll its runId; never start two.`;
+
+/**
+ * The first move, for a project no app has ever connected to.
+ *
+ * Deliberately concrete: the command, what it does to the app, and the call that confirms it. A
+ * general instruction to "set Reticle up" is the state these agents are already in — they have the
+ * tools and no app, and nothing tells them that combination is incomplete. `init` starts the dev
+ * server and opens the app itself, so the restart is named only for the case it cannot cover: a dev
+ * server that was already running read the config before `init` edited it, which is the single most
+ * common way this step half-succeeds. Telling every agent to restart sent them to kill the server
+ * `init` had just started.
+ */
+// The lead is a snapshot, not a present fact: these instructions are sent ONCE, at the handshake, and
+// the app can connect a minute later. Stated as fact, it kept agents running setup while the session
+// list showed the app connected (#1362).
+const firstMoveFor = (
+  v: SurfaceVocabulary,
+  appHere: boolean,
+): string => `FIRST: when this session started, no app had connected to Reticle in this project, so \`init\` has not wired it.${verifyNowFor(v)}
+
+To wire it for good: ${wiringConsent()} ${v.sessions} changes no file. A session on this project's app listed there is the proof that it is wired.${appHere ? TELL_THE_USER : ''}`;
+
+/**
+ * A verdict before any wiring. The lead used to say that until the app was wired "no other tool can
+ * tell you anything about this app", which is false: the lease reads any running page with
+ * Reticle's own reader. Measured with `claude -p` on a fresh Vite app with the MCP registered and no
+ * `init`: the agent made no Reticle call and wrote, ran and deleted a Playwright script instead.
+ */
+// A real agent given no URL source started a second dev server beside the user's own.
+const urlFrom = (v: SurfaceVocabulary): string =>
+  '' === v.sessions
+    ? ''
+    : ` Get <URL> from next_step.lease in ${v.sessions}. Do not start a second dev server.`;
+
+function verifyNowFor(v: SurfaceVocabulary): string {
+  if ('' === v.zeroInstall) return '';
+  return ` To check a change now, with no file changed: \`${v.zeroInstall}\` opens it in Reticle's own browser. Use it instead of writing a browser script.${urlFrom(v)}`;
+}
+
+const UNWIRED_LEAD_END = 'is the proof that it is wired.';
+
+// An agent never asked to verify anything never reads "fix that first"; this makes it raise wiring.
+const TELL_THE_USER =
+  ' If none is listed, this directory holds a web app that is not wired: in your first reply, even if their request is unrelated, tell the user in one line and ask the consent question above.';
+
+/** The nudge set for the AGENT's directory: a shared daemon briefs from where IT started. */
+export function localizeInstructions(instructions: string, appHere: boolean): string {
+  const without = instructions.replace(TELL_THE_USER, '');
+  if (!appHere || !without.includes(UNWIRED_LEAD_END)) return without;
+  return without.replace(UNWIRED_LEAD_END, `${UNWIRED_LEAD_END}${TELL_THE_USER}`);
+}
+
+/**
+ * When to reach for the tools that are advertised but never explained, and how to reach the two
+ * that are explained but not advertised. Both halves of the same defect.
+ *
+ * An advertised tool arrives as a name and one line of description: enough to USE, not enough to
+ * CHOOSE. `reticle_observe` is where that costs something — dropping the observation tools TRIPLES
+ * false alarms (see TOOL_SURFACE.VERIFY), because the model stops observing and reaches for the
+ * verdict without the evidence. So observe gets a reason, not a listing.
+ *
+ * The other direction: `reticle_context` and `reticle_intent` sit on the EXTENDED surface, so they
+ * are not in the list an agent is handed. Naming one without its call shape points the agent at a
+ * tool it cannot call, which is worse than silence — it teaches distrust of everything else here. So
+ * they are written as the `reticle_run` call that works.
+ *
+ * Only in the connected state, and that is not a budget trick: an agent whose app has never
+ * connected has nothing to observe, no run to carry forward and nothing to declare an intent
+ * against. Its one instruction is the first move, and adding a second would compete with it.
+ */
+const reachFor = (v: SurfaceVocabulary): string => {
+  const lines = [
+    `${v.observe} is the evidence channel: everything the page did since a cursor, in one read. Take it BEFORE you call a build broken. ${v.settle} settles a page that is changing without you; ${v.inspect} maps an element to its source file:line, which turns a finding into an edit${v.yield.length > 0 ? `; ${v.yield} hands the tab back to the human` : ''}.`,
+  ];
+  // Said ONLY when both halves are advertised. A catalogue with no way to invoke what it lists sends
+  // the agent at a tool it cannot call and then off the product entirely — see
+  // surface-vocabulary.ts. Where there is no cold tail, there is nothing to say about reaching it.
+  if (v.coldTail.length > 0) {
+    lines.push(
+      `${v.coldTail} Two to know early: ${ReticleTool.RUN}({ tool: "${ReticleTool.CONTEXT}", args: {} }) returns what this run already established, and ${ReticleTool.RUN}({ tool: "${ReticleTool.INTENT}", args: { action: "declare", request: "<user's words, verbatim>" } }), once per request, declares what the work is MEANT to do.`,
+    );
+    // Measured: in 8 real agent runs asked to test an app, none read what Reticle already held
+    // first, and none could tell its user the credits or the Harness state.
+    lines.push(
+      `Before testing, read what Reticle knows: ${ReticleTool.RUN}({ tool: "${ReticleTool.MEMORY}", args: {} })${v.yield.length > 0 ? ` and ${ReticleTool.SESSION} {action:"account"} (plan, credits, Harness)` : ''}.`,
+    );
+  }
+  return lines.join('\n\n');
+};
+
+/** The feedback ask. Constant: an agent that cannot get set up is the report we most need. */
+const feedbackAsk = (v: SurfaceVocabulary): string =>
+  `Feedback is first-class: once per session, when Reticle broke, lied, missed something, cost too many calls, or the install, wiring or setup gave you trouble, send \`${v.feedback}\` and carry on. Tools unreachable? \`npx @reticlehq/server feedback --agent --kind <kind> "what happened"\`. A bug in the app under test belongs in your answer to the user.`;
+
+export interface InstructionState {
+  /**
+   * The names this surface actually advertises. Every tool the prose mentions is resolved from it.
+   *
+   * Optional so the two proxy call sites, which brief before a daemon has answered, keep the shipped
+   * default — but a daemon that knows its surface MUST pass it, or it briefs an agent on a product it
+   * is not serving.
+   */
+  advertised?: readonly string[];
+  /**
+   * Has an app ever connected to Reticle for this project, on this port?
+   *
+   * Read from the durable connection memory rather than from the live session list: a daemon four
+   * seconds old has no sessions and that says nothing about whether the app is wired. The question
+   * is whether this install has EVER worked, not whether it is working this second.
+   */
+  previouslyConnected: boolean;
+  appHere?: boolean;
+}
+
+/** The instructions this daemon should advertise, given what it knows about the project. */
+/**
+ * Instructions are sent ONCE at initialize; the tool surface is re-sent every turn, and costs an
+ * order of magnitude more for it. So anything true of every tool belongs in this block rather than
+ * repeated across every parameter description. See shared-params.ts.
+ */
+export function buildServerInstructions(state: InstructionState): string {
+  // Defaults to the surface this package ships, so the two proxy callers — which brief an agent
+  // before any daemon has answered — keep working unchanged.
+  // The two meta-tools are added by `buildDynamicTools`, not by the surface filter, so they are
+  // absent from CORE_TOOL_NAMES — and without them the cold-tail sentence goes silent on the very
+  // surface that has a cold tail. The default surface always carries both.
+  // The fallback is the LIVE default surface, never a hardcoded list. The proxy briefs WITHOUT
+  // passing a surface, so a stale fallback here is what every agent reaching Reticle through
+  // `reticle mcp` reads — naming tools the surface it is being served does not have.
+  const v = surfaceVocabulary(state.advertised ?? defaultAdvertisedNames());
+  const firstMove = firstMoveFor(v, true === state.appHere);
+  /*
+   * Said in BOTH states, and gated only on whether the surface can reach replay.
+   *
+   * NOT gated on `previouslyConnected`, though replay presupposes saved flows: that flag needs
+   * `readProjectId(cwd)` to resolve, and in a monorepo where the agent runs from the repo root and
+   * the app lives in a subdirectory it returns undefined. The rule would be absent exactly where it
+   * is most needed, and reach is the entire problem it exists to fix.
+   *
+   * It is safe to say with no flows, because the tool is honest without help: `affected` names
+   * nothing, `change` answers `unknown`, and `unknown` already means "drive it" — which is what a
+   * first-time reader should do anyway. The advice degrades into the correct first move rather than
+   * into a dead end.
+   */
+  const replay = replayFirst(v);
+  // The writing rule sits beside the feedback ask, the text it is most about, and not at the end:
+  // a client that cuts the block cuts the end first.
+  const feedback = `${feedbackAsk(v)}\n\n${WRITING_RULE_SHORT}`;
+  const base = state.previouslyConnected
+    ? `${verdictDiscipline(v)}\n\n${reachFor(v)}\n\n${feedback}`
+    : `${firstMove}\n\n${verdictDiscipline(v)}\n\n${feedback}`;
+  const withReplay = replay.length > 0 ? `${base}\n\n${replay}` : base;
+  return `${withReplay}\n\n${SHARED_PARAM_GUIDANCE}`;
+}

@@ -1,0 +1,119 @@
+version: 2
+updates:
+  # npm dependencies across the pnpm workspace. Grouped so a routine week is one PR, not twenty.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait 7 days before a version update. The Shai-Hulud worms ship a poisoned patch release, and
+    # npm removes it within days. Auto-merge takes every green minor and patch PR, so without this a
+    # poisoned version can reach main with no person reading it. Security updates do not wait.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    groups:
+      # Non-breaking bumps land together; majors come as individual PRs so they're reviewed on purpose.
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # The published SDK carries zod as a real dependency; treat its majors as deliberate, reviewed changes.
+    ignore:
+      - dependency-name: zod
+        update-types:
+          - version-update:semver-major
+      # Babel 8 is ESM-only and renames the plugin types (`PluginObj` became `PluginObject`), so the
+      # bump in #965 failed typecheck in the CommonJS babel plugin and the Next adapter. Moving to it
+      # is a port of both packages while users stay on Babel 7, not a version bump. Remove this
+      # when that port is planned.
+      - dependency-name: '@babel/core'
+        update-types:
+          - version-update:semver-major
+      # jsdom 30.1.x made appendChild into a large parent quadratic: the mint-storm test in
+      # adapters/realm/browser/src/dom/addressing/refs.test.ts went from ~2s to a 60s timeout, which
+      # failed the whole group in #1095. Scoped to 30.1.x so a later release is tried again.
+      - dependency-name: jsdom
+        versions:
+          - 30.1.x
+      # apps/electron-vue-pinia is the only vite 7 consumer left and exists to reproduce the
+      # electron-vite path; electron-vite 5 peers on vite <=7, so #962 moved it onto an unsupported
+      # pair. Revisit when electron-vite supports vite 8.
+      - dependency-name: vite
+        update-types:
+          - version-update:semver-major
+
+  # Keep the GitHub Actions themselves current AND pinned — Dependabot updates the pinned SHAs for us.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait 7 days before a version update. The Shai-Hulud worms ship a poisoned patch release, and
+    # npm removes it within days. Auto-merge takes every green minor and patch PR, so without this a
+    # poisoned version can reach main with no person reading it. Security updates do not wait.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        update-types:
+          - minor
+          - patch
+  # Rust. `reticle-tauri` is PUBLISHED to crates.io, so its dependency tree reaches users directly
+  # and was the only shipped surface nothing watched: the npm ecosystem above cannot see a Cargo
+  # manifest, and CodeQL does not scan Rust at all. Its Cargo.lock is committed, so Dependabot
+  # resolves against the exact versions a consumer builds.
+  - package-ecosystem: cargo
+    directory: /adapters/realm/tauri
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait 7 days before a version update. The Shai-Hulud worms ship a poisoned patch release, and
+    # npm removes it within days. Auto-merge takes every green minor and patch PR, so without this a
+    # poisoned version can reach main with no person reading it. Security updates do not wait.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    # These four are NOT ours to move. Each one also reaches us through `tauri` itself — the Windows
+    # pair via `webview2-com`, the GTK pair via `wry` -> `gdk` — and Cargo keeps both versions when a
+    # direct dependency runs ahead of a transitive one. Two copies of the same crate do not share
+    # types, so the build fails with "expected COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT, found a
+    # different COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT", which reads like our bug and is not.
+    #
+    # Verified rather than assumed: bumping `windows` and `webview2-com` TOGETHER still fails, because
+    # tauri 2.11.5 holds webview2-com 0.38.2 underneath. There is no combination of these PRs that
+    # compiles until the tauri/wry tree moves first.
+    #
+    # So they are ignored until then, rather than reopened weekly as PRs that cannot merge and cost a
+    # full CI run each. Drop the entry for a crate once tauri ships a release that has moved it.
+    ignore:
+      - dependency-name: windows
+      - dependency-name: webview2-com
+      - dependency-name: cairo-rs
+      - dependency-name: gdk
+
+  # The Tauri smoke app. Not published, but it is compiled and RUN by the desktop battery, so a
+  # vulnerable dependency here still executes on a runner. Its Cargo.lock is gitignored, so
+  # Dependabot works from the manifest.
+  - package-ecosystem: cargo
+    directory: /apps/tauri-smoke/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+    # Wait 7 days before a version update. The Shai-Hulud worms ship a poisoned patch release, and
+    # npm removes it within days. Auto-merge takes every green minor and patch PR, so without this a
+    # poisoned version can reach main with no person reading it. Security updates do not wait.
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      minor-and-patch:
+        update-types:
+          - minor
+          - patch

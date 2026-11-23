@@ -1,0 +1,133 @@
+---
+title: reticle_act_sequence
+description: Run several actions in order in one round trip. Fill, fill, submit. Instead of paying a full turn for each step.
+icon: layer-group
+---
+
+<Warning>
+  **reticle_act_sequence is not advertised.** The default surface is the merged ten, so an agent does not see
+  this name. Call **`reticle_act { steps: [...] }`** instead: the same call, routed on the steps array. Everything below describes what that call does;
+  only the spelling changed. A call to the old name is answered with the new one, but an
+  `allowedTools` allowlist or an MCP permission rule naming it refuses before Reticle is asked.
+</Warning>
+
+`reticle_act_sequence` runs several actions in order in a single round trip. Reach for it whenever a journey needs more than one step, such as fill, fill, submit. A step that carries an `expect` (the same predicate shape as `until`) proves its consequence: the result then carries `verified`, and `stopped_at` plus the un-run `tail` if a step's `expect` did not hold. With `onDeviation: "continue"` it drives every step and reports every miss instead of stopping. A sequence with no `expect` anywhere proves nothing.
+
+A login is three actions. Driving it one call at a time costs three round trips and three turns of context. `reticle_act_sequence` does it in one.
+
+This tool exists because of a measured problem: agents were driving forms one call at a time, over and over. Those repeats were not retries. The calls succeeded and got repeated, because the batching tool was not advertised and so nobody knew it was there.
+
+## Example
+
+```json
+{
+  "steps": [
+    { "ref": "e603", "action": "fill", "args": { "value": "admin@reticle.dev" } },
+    { "ref": "e604", "action": "fill", "args": { "value": "correct-horse-battery-staple" } },
+    { "ref": "e605", "action": "click" }
+  ]
+}
+```
+
+Steps may also name a `target` instead of a `ref`, the same locator [`reticle_act`](/tools/act) takes. The sequence resolves each one when that step runs (waiting up to `timeout_ms` for it to appear), so a login does not need a query round trip per field, and a control an earlier step opens is still addressable:
+
+```json
+{
+  "steps": [
+    { "target": { "label": "Email" }, "action": "fill", "args": { "value": "admin@reticle.dev" } },
+    {
+      "target": { "label": "Password" },
+      "action": "fill",
+      "args": { "value": "correct-horse-battery-staple" }
+    },
+    { "target": { "testid": "login-submit" }, "action": "click" }
+  ]
+}
+```
+
+Real response shape, trimmed. Each `steps[]` entry also carries `settled`, `settleReason`, `component`, `role` and `name`, and `window`, `digest` and `contradictions` for that step:
+
+```json
+{
+  "since": 3915,
+  "dispatched": true,
+  "completed": 3,
+  "recorded": 3,
+  "verified": "unknown",
+  "because": "all 3 step(s) declared nothing, so the app was driven but not verified: give each step an `expect` naming the consequence it causes",
+  "coverage": { "declared": 0, "total": 3 },
+  "steps": [
+    {
+      "ref": "e603",
+      "action": "fill",
+      "dispatched": true,
+      "testid": "login-email",
+      "source": { "file": "src/components/Login.tsx", "line": 48 }
+    },
+    {
+      "ref": "e604",
+      "action": "fill",
+      "dispatched": true,
+      "testid": "login-password",
+      "source": { "file": "src/components/Login.tsx", "line": 59 }
+    },
+    {
+      "ref": "e605",
+      "action": "click",
+      "dispatched": true,
+      "testid": "login-submit",
+      "source": { "file": "src/components/Login.tsx", "line": 81 }
+    }
+  ]
+}
+```
+
+## Read that response again
+
+Every step dispatched. In this run the password was wrong, and the login **failed**. No step declared an `expect`, so the sequence cannot know that. It does not claim a pass: it answers `verified: "unknown"`, and `because` says that the app was driven but not verified.
+
+<Warning>
+  `dispatched: true` is a statement about the input, not about the outcome. A step with no `expect`
+  proves nothing. Put an `expect` on the step that ends the journey, or finish with
+  [`reticle_act_and_wait`](/tools/act-and-wait) or [`reticle_assert`](/tools/assert).
+</Warning>
+
+The honest pattern is: batch the setup, prove the outcome.
+
+```json
+{
+  "steps": [
+    { "ref": "e603", "action": "fill", "args": { "value": "admin@reticle.dev" } },
+    { "ref": "e604", "action": "fill", "args": { "value": "correct-password" } }
+  ]
+}
+```
+
+then
+
+```json
+{ "ref": "e605", "action": "click", "until": { "kind": "signal", "name": "auth:granted" } }
+```
+
+which returns the verdict. Putting `"expect": { "kind": "signal", "name": "auth:granted" }` on the click step inside the sequence gets the same verdict in one call:
+
+```json
+{
+  "verified": "yes",
+  "because": "every declared consequence held, but only 1 of 3 steps declared one; the rest were driven, not verified",
+  "coverage": { "declared": 1, "total": 3 }
+}
+```
+
+Two calls instead of four, and the last one returns a verdict. A proved plan also carries `keep`, which is the call that saves it as a regression flow.
+
+## What each step reports
+
+Each step comes back with its `testid`, `component` and `source`, its `digest` (what the app did, as counts) and any `contradictions`. A step with an `expect` also carries `held`, and `observed` when it missed. When a sequence goes wrong, this tells you which step, and which line of which file.
+
+<Note>
+  A step that cannot be performed stops the sequence: `stalled_at` names it, and the step's `error`
+  says why. A step whose `expect` does not hold stops it too (`stopped_at`), unless you pass
+  `onDeviation: "continue"`. The steps that did not run come back unchanged in `tail`. Read
+  `verified` and `because`, not `dispatched`.
+</Note>

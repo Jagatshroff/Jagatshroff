@@ -1,0 +1,980 @@
+/**
+ * How one anchored step is turned into a live action.
+ *
+ * Split out of flow-replay.ts when adding the role+name runner pushed that file past the size cap.
+ * These three share one shape — resolve an anchor to a ref, then dispatch — and the sharing is the
+ * point: the action window must open and close identically no matter which anchor found the element,
+ * or a step's events land in the wrong window depending on how it was addressed.
+ */
+import { expectedElementTestid } from '@reticlehq/core';
+import {
+  AnchorKind,
+  DEGRADED_ANCHOR_ROLE,
+  DOCUMENT_ANCHOR_ROLE,
+  DriftReason,
+  PredicateKind,
+  QueryBy,
+  ReplayStatus,
+  ReticleCommand,
+  type Drift,
+  type FlowAnchor,
+  type FlowReplayResult,
+  type QueryEmptyHint,
+  type FlowStep,
+  type FlowStepResult,
+  type Predicate,
+} from '@reticlehq/core';
+import { ReticleTool, isGlobalPressCall } from '@reticlehq/core';
+import { namelessRefs, replayActionArgs } from './replay.js';
+import {
+  burstGap,
+  holdGap,
+  isStaleRefError,
+  pacedArgs,
+} from '@/surface/tools/act/act-sequence-retry.js';
+import { waitForReaction } from '@/surface/tools/act/react-grace.js';
+import {
+  unreachableSubStepDrift,
+  unreachableTargetNote,
+} from '@/surface/tools/act/act-observation.js';
+import { anchorFieldName } from './flows.js';
+import { unreachableTargetResult } from './flow-undecided.js';
+export { unreachableTargetResult } from './flow-undecided.js';
+import type { FlowReplaySession, Sleep } from './flow-replay-types.js';
+import {
+  ambiguityDrift,
+  refFor,
+  anchorLabel,
+  componentLabel,
+  componentQueryArgs,
+  expectElementDrift,
+  queryOnce,
+  reresolved,
+  resolveRoleAnchor,
+  roleQueryArgs,
+  resolveQuery,
+  roleAnchorLabel,
+  testidDrift,
+  type Reresolved,
+} from './flow-anchor.js';
+import { nearestRoleName, type RoleCandidate } from './role-anchor-nearest.js';
+import { roleDriftReason } from '@/judgement/outcome/role-drift-reason.js';
+import { captureBaselines, type Baselines } from '@reticlehq/engine/evidence/baseline.js';
+
+/** The live act_sequence tool gives each step this transport budget when none was supplied. */
+export const DEFAULT_SEQUENCE_STEP_TIMEOUT_MS = 8_000;
+
+/**
+ * The controls actually on the page, as role + name, for the nearest-match scan.
+ *
+ * Reads the interactive snapshot rather than a second query per candidate: one round trip, and it is
+ * the same view the coverage tool uses, so "what is on this page" has one definition.
+ */
+async function nearestRoleNameOnPage(
+  session: FlowReplaySession,
+  anchor: { role: string; name?: unknown },
+): Promise<string | null> {
+  const wanted = 'string' === typeof anchor.name ? anchor.name : undefined;
+  if (wanted === undefined) {
+    return null;
+  }
+  try {
+    // Straight off the QUERY result: resolveQuery reduces to refs, and the NAMES are what this needs.
+    const result = await session.command(ReticleCommand.QUERY, {
+      by: QueryBy.ROLE,
+      value: anchor.role,
+    });
+    const payload = result.result;
+    const elements =
+      'object' === typeof payload && payload !== null
+        ? (payload as { elements?: unknown }).elements
+        : undefined;
+    if (!Array.isArray(elements)) {
+      return null;
+    }
+    const candidates: RoleCandidate[] = elements
+      .map((element) =>
+        'object' === typeof element && element !== null
+          ? (element as { name?: unknown }).name
+          : undefined,
+      )
+      .filter((name): name is string => 'string' === typeof name && name.length > 0)
+      .map((name) => ({ role: anchor.role, name }));
+    return nearestRoleName(anchor.role, wanted, candidates);
+  } catch {
+    // A drift report must never fail because the suggestion lookup did.
+    return null;
+  }
+}
+
+export async function runRoleStep(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  anchor: Extract<FlowAnchor, { kind: typeof AnchorKind.ROLE }>,
+  confirmDangerous: boolean,
+  sleep: Sleep,
+): Promise<FlowStepResult> {
+  const label = roleAnchorLabel(anchor);
+  const { refs } = await resolveRoleAnchor(session, anchor, sleep);
+  /*
+   * More than one match is DRIFT, not a guess: taking `refs[0]` replayed a recorded row action on
+   * row 1 and passed whenever every row shared the consequence. `ambiguityDrift` holds the rule,
+   * shared with the testid and component runners.
+   */
+  const ambiguous = ambiguityDrift(anchor, refs);
+  if (ambiguous !== null) {
+    return { step: index, tool: step.tool, anchor: label, ok: false, drift: ambiguous };
+  }
+  const ref = refFor(anchor, refs);
+  if (ref === undefined && anchor.name === undefined) {
+    // There is no name to suggest a nearest match from; say what was looked for and what was found.
+    return {
+      step: index,
+      tool: step.tool,
+      anchor: label,
+      ok: false,
+      drift: {
+        reasonKind: DriftReason.COMPONENT_NOT_FOUND,
+        reason: `no ${anchor.role} with no accessible name was found at the recorded position (${label}); the page has ${String(refs.length)} such control(s). Give the control an accessible name or a test id, or re-record the step`,
+        anchor: label,
+        nearest: null,
+      },
+    };
+  }
+  if (ref === undefined) {
+    // `nearest` used to be the literal null, so heal answered "no nearest match cleared the
+    // confidence floor" for EVERY role-anchored drift — a structural limit reported as a judgement
+    // about candidates, when nothing had looked. It looks now, and it is deliberately stricter than
+    // the testid path: a role name is user-visible text, so a near-match is far more likely to be a
+    // different control than a renamed one. A candidate here is INFORMATION for the agent; heal
+    // still refuses to rebind a role anchor on its own.
+    const nearest = await nearestRoleNameOnPage(session, anchor);
+    return {
+      step: index,
+      tool: step.tool,
+      anchor: label,
+      ok: false,
+      drift: {
+        reasonKind: DriftReason.COMPONENT_NOT_FOUND,
+        reason: roleDriftReason(anchor.role, String(anchor.name), nearest),
+        anchor: label,
+        nearest,
+      },
+    };
+  }
+  return await actOnResolvedRef(
+    session,
+    step,
+    index,
+    label,
+    ref,
+    confirmDangerous,
+    anchorFieldName(anchor),
+    /*
+     * The retry's whole point: run the SAME locator against the DOM as it is now.
+     *
+     * It reports WHAT it found, not just a ref. A re-render can turn an unambiguous anchor into an
+     * ambiguous one between the two dispatches, and dispatching at the first of the new matches would
+     * re-make the guess the check above exists to refuse — one layer deeper, where the caller cannot
+     * see it. `reresolved` is the same rule as that check, so the two cannot disagree.
+     */
+    async () => reresolved(anchor, (await resolveRoleAnchor(session, anchor, sleep)).refs),
+  );
+}
+
+/**
+ * `assertActionAllowed`'s refusal — "potentially destructive action blocked; retry with
+ * args.confirmDangerous=true" — is written for a LIVE call, where retrying with that arg works. It
+ * does not during replay: `replayActionArgs` deliberately strips any `confirmDangerous` a step's own
+ * args carry and restores it only from the ONE call-level boolean this run was given, because a
+ * destructive confirmation has to be a decision made for THIS run, never a value saved into the
+ * recording (#94). A caller who hand-edits the flow file's step args to add it gets it silently
+ * deleted, replays again, and reads the identical refusal — which reads as though nothing they tried
+ * worked, when what happened is they tried the one thing that cannot work here.
+ *
+ * Appends the path that does, rather than replacing the message: an agent that has already learned
+ * to recognise the raw refusal still finds it, plus the fix for this specific caller.
+ */
+const DESTRUCTIVE_ACTION_PATTERN = /potentially destructive (?:\w+ )*(?:action|tool) blocked/i;
+
+function replayDestructiveActionHint(rawError: string): string {
+  if (!DESTRUCTIVE_ACTION_PATTERN.test(rawError)) {
+    return rawError;
+  }
+  return (
+    `${rawError} — this is a flow REPLAY: a step's own args.confirmDangerous is stripped before ` +
+    'dispatch and never persists, so editing the flow file does nothing. Pass it at the call level ' +
+    `instead: ${ReticleTool.FLOW_REPLAY} { confirmDangerous: true } acknowledges every flagged step ` +
+    'for this run, as do reticle_verify{action:"flows", confirmDangerous: true} for a suite and ' +
+    '`reticle verify <url> --confirm-dangerous` from the command line.'
+  );
+}
+
+/**
+ * Dispatch one already-resolved step. Shared so every anchor kind runs the action the same way —
+ * including the action window, whose open/close must not depend on which anchor found the element.
+ */
+export async function actOnResolvedRef(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  label: string,
+  ref: string,
+  confirmDangerous: boolean,
+  /**
+   * The field name a redacted fill is supplied under, from `anchorFieldName` — the SAME function
+   * redaction uses to decide what to hide. Without it a role-anchored secret is redacted at save
+   * and looked up at replay under no name at all, so the flow types the placeholder into the form.
+   */
+  field?: string,
+  /**
+   * Resolve the anchor again. Supplied by the caller because only it knows how this step's anchor is
+   * found, and the retry below is worthless without it: re-dispatching the SAME dead ref fails
+   * identically. What changed between the two attempts is the DOM, so the locator has to be run
+   * against it again.
+   *
+   * It reports WHAT it found, not just a ref: see `Reresolved`. A re-render that turns one match into
+   * three is a drift, and the caller is the only layer that can say so with the right anchor in hand.
+   */
+  reresolve?: () => Promise<Reresolved | undefined>,
+): Promise<FlowStepResult> {
+  const dispatch = async (
+    at: string,
+  ): Promise<{ ok: boolean; error?: string | undefined; result?: unknown }> => {
+    session.beginAction?.(ReticleTool.FLOW_REPLAY, { ref: at, action: step.action ?? '' });
+    try {
+      const r = await session.command(ReticleCommand.ACT, {
+        ref: at,
+        action: step.action ?? '',
+        args: replayActionArgs(step.args, confirmDangerous, field),
+      });
+      return { ok: r.ok, error: r.error, result: r.result };
+    } finally {
+      session.finishAction?.();
+    }
+  };
+
+  let act = await dispatch(ref);
+  /*
+   * One retry, and only for staleness.
+   *
+   * A saved flow of `fill` then `click` failed with "ref 'eNNNN' no longer resolves to an element",
+   * a different ref each attempt: the fill re-rendered the page between the click step resolving its
+   * element and dispatching at it. `flow_heal` answered `unhealable` and was right — the locator was
+   * correct, only the timing was wrong — and the flow format has no way to express a wait, so there
+   * was nothing the user could do.
+   *
+   * `act_sequence` already solved this race for the same reason; the predicate and the grace period
+   * come from there rather than being written twice. A step that failed for any OTHER reason is
+   * never retried: a replay that quietly repeats actions turns one click into two, which is worse
+   * than the failure it papers over.
+   */
+  if (!act.ok && isStaleRefError(act.error) && reresolve !== undefined) {
+    await waitForReaction(session, 0, STALE_REF_GRACE_MS, {
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    });
+    const fresh = await reresolve();
+    /*
+     * The re-render turned one match into SEVERAL, so there is nothing to dispatch at and the answer
+     * is a drift — the same `anchor_ambiguous` the first resolution would have given, reported for the
+     * same reason.
+     *
+     * The staleness this retry exists to absorb is a different diagnosis with a different fix, and
+     * this used to be the only one reported: the step came back as `{ok: false, error: "ref 'e-orig'
+     * no longer resolves to an element"}` — a sentence about an element that is GONE, sent for an
+     * element that is now three. An agent reading it goes hunting for a rename, or re-records the
+     * flow, when the actual fix is a narrower anchor. Telling the two apart is what `Reresolved` is
+     * for, and the reason `ANCHOR_AMBIGUOUS` exists as its own kind rather than folding into "not
+     * found".
+     */
+    if (fresh !== undefined && 'drift' in fresh) {
+      return { step: index, tool: step.tool, anchor: label, ok: false, drift: fresh.drift };
+    }
+    if (fresh !== undefined) {
+      act = await dispatch(fresh.ref);
+    }
+  }
+
+  const result: FlowStepResult = { step: index, tool: step.tool, anchor: label, ok: act.ok };
+  if (!act.ok) {
+    result.error = replayDestructiveActionHint(act.error ?? 'command failed');
+  }
+  // A click no person could have made decides nothing, on replay as on a live act.
+  const unreachable = act.ok ? unreachableTargetNote(act.result) : undefined;
+  if (unreachable !== undefined) {
+    return {
+      ...result,
+      ok: false,
+      drift: {
+        reasonKind: DriftReason.TARGET_UNREACHABLE,
+        reason: unreachable,
+        anchor: label,
+        nearest: null,
+      },
+    };
+  }
+  return result;
+}
+
+/** How long to let the app finish re-rendering before the one retry. Matches the sequence path. */
+const STALE_REF_GRACE_MS = 400;
+
+/** Run one component-anchored step: re-resolve via QUERY by:'component', ACT on the live ref, else drift. */
+export async function runComponentStep(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  anchor: Extract<FlowAnchor, { kind: typeof AnchorKind.COMPONENT }>,
+  confirmDangerous: boolean,
+  sleep: Sleep,
+): Promise<FlowStepResult> {
+  const label = componentLabel(anchor);
+  const { refs } = await resolveQuery(session, componentQueryArgs(anchor), sleep);
+  if (0 === refs.length) {
+    return {
+      step: index,
+      tool: step.tool,
+      anchor: label,
+      ok: false,
+      drift: {
+        reasonKind: DriftReason.COMPONENT_NOT_FOUND,
+        reason: `component anchor "${label}" not found`,
+        anchor: label,
+        nearest: null,
+      },
+    };
+  }
+  /*
+   * Several matches is DRIFT here too, and this runner is where the rule was MISSING.
+   *
+   * The other two runners check it (through `ambiguityDrift`); this one took `refs[0]`, dispatched and
+   * returned `ok: true`. `by: QueryBy.COMPONENT` matches by component NAME, and a component rendered
+   * once per row — a table's action button, a card's menu — matches as many times as there are rows.
+   * So the guessed-green shape is not an edge case for this anchor kind, it is its ordinary one, and
+   * it is the exact defect #1227 describes: a click on the wrong element reported as a pass because
+   * the verdict reads `drift` and `ok` and never reads which element was hit.
+   */
+  const ambiguous = ambiguityDrift(anchor, refs);
+  if (ambiguous !== null) {
+    return { step: index, tool: step.tool, anchor: label, ok: false, drift: ambiguous };
+  }
+  // The only match, or the recorded position (`ambiguityDrift` has cleared every other case). It took
+  // `refs[0]`, so a recorded position that passed the check still acted on the first match.
+  const ref = refFor(anchor, refs) ?? '';
+  // Shared with the role path so both get the same action window AND the same stale-ref retry —
+  // this used to dispatch inline, which is how one anchor kind could gain a fix the other lacked.
+  return await actOnResolvedRef(
+    session,
+    step,
+    index,
+    label,
+    ref,
+    confirmDangerous,
+    anchorFieldName(anchor),
+    // Same rule one layer deeper, same helper: a re-render that turns one match into three must not
+    // be dispatched at either, and it must say so as a drift rather than as a dead ref. This callback
+    // used to return `refs[0]` unconditionally.
+    async () =>
+      reresolved(anchor, (await resolveQuery(session, componentQueryArgs(anchor), sleep)).refs),
+  );
+}
+
+/**
+ * DEGRADED_ANCHOR_ROLE is a MARKER ("no anchor could be determined"), never a locator.
+ *
+ * Recognising it is most of the fix: a nameless-ROLE anchor used to fall through to the testid
+ * runner, which asked the DOM eight times for a testid literally named "unresolved", found none (it
+ * never exists), and reported a MISSING ELEMENT. It then ran edit-distance against the word
+ * "unresolved" and offered the nearest testid as a rebind target — which flow_verify printed while
+ * flow_heal refused it on confidence. Two tools contradicting each other over a candidate that never
+ * meant anything.
+ *
+ * Both recorders emit this sentinel, so the check belongs here on the replay side, where all of them
+ * land.
+ */
+export function isDegradedAnchor(anchor: FlowAnchor): boolean {
+  return (
+    anchor.kind === AnchorKind.ROLE &&
+    anchor.role === DEGRADED_ANCHOR_ROLE &&
+    anchor.name === undefined
+  );
+}
+
+/**
+ * A saved document-key press (#1559): the nameless `document` ROLE anchor on a press of a document
+ * key. It is dispatched with no ref, the way `act` ran it live, and never QUERIED: there is no
+ * element with that role to find, and the page's root would be the wrong target if there were.
+ *
+ * The press is checked as well as the anchor, so the same anchor on any other action stays an
+ * anchor that addresses nothing.
+ */
+export function isDocumentPressStep(step: Pick<FlowStep, 'anchor' | 'action' | 'args'>): boolean {
+  return (
+    step.anchor.kind === AnchorKind.ROLE &&
+    step.anchor.role === DOCUMENT_ANCHOR_ROLE &&
+    step.anchor.name === undefined &&
+    isGlobalPressCall({ action: step.action, args: step.args })
+  );
+}
+
+/** A `document` ROLE anchor names no element, whatever the step's action. */
+function isDocumentAnchor(anchor: FlowAnchor): boolean {
+  return (
+    anchor.kind === AnchorKind.ROLE &&
+    anchor.role === DOCUMENT_ANCHOR_ROLE &&
+    anchor.name === undefined
+  );
+}
+
+/** What a step with no resolvable anchor reports, instead of a missing-element story. */
+const DEGRADED_STEP_REASON =
+  'recorded without a resolvable anchor (no data-testid, no accessible role+name), so it can never ' +
+  'resolve on replay — add a data-testid to the element and record this flow again';
+
+export function degradedStepResult(step: FlowStep, index: number, label: string): FlowStepResult {
+  return {
+    step: index,
+    tool: step.tool,
+    anchor: label,
+    ok: false,
+    drift: {
+      reasonKind: DriftReason.ANCHOR_DEGRADED,
+      reason: DEGRADED_STEP_REASON,
+      anchor: label,
+      // Deliberately null: the old path produced a nearest match to the WORD "unresolved", which is
+      // not a candidate for anything.
+      nearest: null,
+    },
+  };
+}
+
+/**
+ * QUERY args for an element anchor — null when the anchor addresses no element.
+ *
+ * Exported for `arriveAtStartPath`, which has to ask "can step 1 resolve where we already are?"
+ * before deciding to navigate. Sharing this mapping rather than repeating it keeps that question and
+ * the step runner's own resolution asking the same thing of the same anchor.
+ */
+export function anchorQueryArgs(anchor: FlowAnchor): Record<string, unknown> | null {
+  if (anchor.kind === AnchorKind.TESTID) {
+    return { by: QueryBy.TESTID, value: anchor.value };
+  }
+  if (anchor.kind === AnchorKind.COMPONENT) {
+    return componentQueryArgs(anchor);
+  }
+  if (anchor.kind === AnchorKind.ROLE && !isDegradedAnchor(anchor) && !isDocumentAnchor(anchor)) {
+    return roleQueryArgs(anchor);
+  }
+  return null;
+}
+
+/**
+ * The anchor as a PRECONDITION a flow file can store: "this element is on the page".
+ *
+ * What `requires` means for a flow that starts from state a page load discards, in the shape the
+ * flow's own `requires` holds. No tool writes `requires`, so the reset's hint hands over this line.
+ */
+export function anchorPrecondition(anchor: FlowAnchor): Predicate | undefined {
+  if (anchor.kind === AnchorKind.TESTID) {
+    return { kind: PredicateKind.ELEMENT, query: { testid: anchor.value } };
+  }
+  if (anchor.kind === AnchorKind.ROLE && !isDegradedAnchor(anchor) && !isDocumentAnchor(anchor)) {
+    return { kind: PredicateKind.ELEMENT, query: { role: anchor.role, name: anchor.name } };
+  }
+  return undefined;
+}
+
+/** What is added to a stale-ref error when it cannot be traced to one sub-step of the sequence. */
+const STALE_SUB_STEP_UNKNOWN =
+  ' (which sub-step that was could not be told, so the ones before it may have run)';
+
+/** Where a ref that stayed stale sat in the sequence, and that every sub-step before it ran. */
+const staleSubStepPosition = (at: number, total: number): string =>
+  ` (sub-step ${String(at)} of ${String(total)}; ${String(at)} before it ran)`;
+
+/**
+ * Why a step whose target kept going stale is unverifiable, as the replay result tells a reader.
+ * `step` is the index of the step that could not be acted on.
+ */
+const staleTargetReason = (step: number): string =>
+  `step ${String(step)} could not be acted on: its target kept going stale, because the ` +
+  `page re-rendered between finding the element and using it, and the replay looked it up ` +
+  `again for as long as that got it further. The steps before it are reported and nothing ` +
+  `after it ran. Nothing here says the app failed. If an earlier step makes the page ` +
+  `re-render, record that step's consequence with \`expect\` so the replay waits for the new ` +
+  `render before it moves on.`;
+
+/**
+ * The sub-step, among live[from, to), whose ref the page said it could not find.
+ *
+ * The page echoes the ref in "ref 'x' no longer resolves to an element". A ref it shortened, or one
+ * that is not among these, gives no answer. Neither does a ref that two sub-steps share: the first of
+ * them may already have run, and may be what re-rendered the page, which makes the later one the stale
+ * one, and nothing in the message says so. The caller must not guess which actions already ran.
+ */
+function staleSubStep(
+  error: string,
+  live: readonly { ref: string }[],
+  from: number,
+  to: number,
+): number | undefined {
+  const named = /ref '([^']*)'/.exec(error)?.[1];
+  if (named === undefined) {
+    return undefined;
+  }
+  const sharing = live.flatMap((one, at) =>
+    at >= from && at < to && one.ref === named ? [at] : [],
+  );
+  const [only] = sharing;
+  return 1 === sharing.length ? only : undefined;
+}
+
+/**
+ * The honest answer when a step's target kept going stale.
+ *
+ * Replay looks the element up again and goes on while that gets it further, so a step still stale
+ * after that is one the page re-rendered around faster than it could be targeted. Reporting it as
+ * `error` with the browser's own sentence says "your app broke", which is a claim nothing observed
+ * and sends a reader into product code that is fine. It is the same bucket as a document that went
+ * away: the steps before it are real and are attached, the step that could not be acted on is among
+ * them with its index, and nothing after it ran.
+ *
+ * Left alone, so the ordinary verdict stands, when anything else is in the run: a drifted anchor is
+ * drift whatever else happened, and a failure that is not staleness is a failure.
+ */
+export function staleTargetResult(
+  name: string,
+  steps: readonly FlowStepResult[],
+  /**
+   * `startControlRequired`: replay loaded the start page itself, with no redirect, and the caller
+   * asked that a missing step 1 control fail. Then the miss means the app does not offer the control
+   * the journey starts with (#2061), so it stays drift. Without it, the miss is not proved.
+   */
+  options: { startControlRequired?: boolean } = {},
+): FlowReplayResult | undefined {
+  // A target no person could reach is the same kind of answer: nothing about the app was decided.
+  const unreached =
+    true === options.startControlRequired ? undefined : unreachedStepResult(name, steps);
+  const unreachable = unreachableTargetResult(name, steps) ?? unreached;
+  if (unreachable !== undefined) {
+    return unreachable;
+  }
+  if (steps.some((step) => step.drift !== undefined)) {
+    return undefined;
+  }
+  const failed = steps.filter((step) => !step.ok);
+  const [only] = failed;
+  if (failed.length !== 1 || only === undefined || !isStaleRefError(only.error)) {
+    return undefined;
+  }
+  return {
+    name,
+    status: ReplayStatus.UNVERIFIABLE,
+    steps: [...steps],
+    unverifiable: { reason: staleTargetReason(only.step) },
+  };
+}
+
+/** Drifts where the step's own control was never resolved, so the step never acted. */
+const ANCHOR_MISSES: ReadonlySet<string> = new Set([
+  DriftReason.TESTID_NOT_FOUND,
+  DriftReason.COMPONENT_NOT_FOUND,
+  DriftReason.ANCHOR_AMBIGUOUS,
+  DriftReason.ANCHOR_DEGRADED,
+]);
+
+/**
+ * The honest answer when a replay stopped before it acted on anything: its first failing step's
+ * control was not on the page, often because the page lacks a state the recording had (a task added
+ * before recording started). Nothing ran, so nothing was proved. Read as drift, the run synced as
+ * FAIL, and the dashboard showed a failure for a journey that was never tested.
+ *
+ * Only when no earlier step ran. A control that is missing after earlier steps acted is on a page
+ * those steps made, so it stays drift, and heal reads it. An ambiguous control is the exception: it
+ * is on the page, and the replay cannot choose, so it is not proved after any number of steps. A step that acted and whose expectation
+ * did not hold is a consequence drift and stays a failure. The failing step keeps its index and
+ * its `drift.reasonKind`, which the synced run carries in `stepResults`.
+ */
+function unreachedStepResult(
+  name: string,
+  steps: readonly FlowStepResult[],
+): FlowReplayResult | undefined {
+  const at = steps.findIndex((s) => !s.ok);
+  const step = steps[at];
+  const drift = step?.drift;
+  if (step === undefined || drift === undefined || !ANCHOR_MISSES.has(drift.reasonKind)) {
+    return undefined;
+  }
+  const acted = steps.slice(0, at).some((s) => s.ok);
+  // An anchor that several live elements match is on the page, so the earlier steps did not lose it.
+  // The replay cannot choose one, so nothing about the app was decided, whatever ran before.
+  if (DriftReason.ANCHOR_AMBIGUOUS === drift.reasonKind && acted) {
+    return {
+      name,
+      status: ReplayStatus.UNVERIFIABLE,
+      steps: [...steps],
+      unverifiable: {
+        reason:
+          `step ${String(step.step + 1)}: ${drift.reason}. The replay stopped there, so this run ` +
+          `proved nothing about the app. Narrow the anchor on this step.`,
+      },
+    };
+  }
+  if (acted) {
+    return undefined;
+  }
+  // ponytail: one close, unambiguous survivor reads as a rename (heal's case), so it stays drift. A
+  // page with exactly one sibling of the missing control (`toggle-1` for `toggle-3`) reads the same.
+  if (drift.nearest !== null && true !== drift.ambiguous) {
+    return undefined;
+  }
+  return {
+    name,
+    status: ReplayStatus.UNVERIFIABLE,
+    steps: [...steps],
+    unverifiable: {
+      reason:
+        `did not reach step ${String(step.step + 1)} (${drift.reason}), so nothing was acted ` +
+        `on and nothing was proved. Start the replay from the state this step needs, or record the ` +
+        `steps that make it.`,
+    },
+  };
+}
+
+/**
+ * Run an act_sequence step: resolve every sub-step's OWN anchor, then dispatch the whole thing as one
+ * ACT_SEQUENCE, the shape `replayProgram` uses, so a recorded sequence and a saved one run the same.
+ */
+export async function runSequenceStep(
+  session: FlowReplaySession,
+  step: FlowStep,
+  index: number,
+  subs: readonly FlowStep[],
+  confirmDangerous: boolean,
+  sleep: Sleep,
+  /** Testids whose presence is deliberately NOT asserted — the LLM-output case. */
+  dynamic: ReadonlySet<string> = new Set(),
+  /** Judge a sub-step's `expect` from `since`, just before its dispatch, against the `before`
+   *  reading; omitted for a setup step, whose consequences are not checked. */
+  judge?: (expectation: Predicate, since: number, before?: Baselines) => Promise<Drift | undefined>,
+): Promise<FlowStepResult> {
+  type LiveSubStep = { ref: string; action: string; args: Record<string, unknown> };
+  const gap = burstGap(step.burstMs);
+  let lastSent: number | undefined;
+
+  /**
+   * Find one sub-step's element as the page is NOW. Either the live step to dispatch, or the step
+   * result that ends the run: a degraded anchor, or one that is no longer on the page.
+   *
+   * An anchor that matches several elements is drift, on the first look and on the look after a
+   * re-render alike, as it is for a single step: the first match may be an element the recording did
+   * not mean, and acting on it reports a result for a click nobody can attribute.
+   *
+   * `ahead` is a look at a sub-step before its turn. It is one query with no settle. An anchor that is
+   * not on the page yet is `pending`, not drift, because an earlier sub-step can render it.
+   */
+  const lookUpSub = async (
+    anchor: FlowAnchor,
+    queryArgs: Record<string, unknown>,
+    ahead: boolean,
+  ): Promise<{ refs: string[]; hint?: QueryEmptyHint }> => {
+    const nameless = AnchorKind.ROLE === anchor.kind && anchor.name === undefined;
+    if (ahead) {
+      return nameless
+        ? { refs: namelessRefs(await session.command(ReticleCommand.QUERY, queryArgs)) }
+        : await queryOnce(session, queryArgs);
+    }
+    if (AnchorKind.ROLE === anchor.kind) {
+      return await resolveRoleAnchor(session, anchor, sleep);
+    }
+    return await resolveQuery(session, queryArgs, sleep);
+  };
+
+  const resolveSub = async (
+    sub: FlowStep,
+    subIndex: number,
+    ahead = false,
+  ): Promise<{ live: LiveSubStep } | { stop: FlowStepResult } | { pending: true }> => {
+    const label = `${anchorLabel(sub.anchor)} (sub-step ${String(subIndex)})`;
+    if (isDocumentPressStep(sub)) {
+      // Dispatched as it ran live, at the document with no ref (#1559).
+      return {
+        live: {
+          ref: '',
+          action: sub.action ?? '',
+          args: pacedArgs(replayActionArgs(sub.args, confirmDangerous, undefined), gap),
+        },
+      };
+    }
+    const queryArgs = anchorQueryArgs(sub.anchor);
+    if (null === queryArgs) {
+      return { stop: degradedStepResult(step, index, label) };
+    }
+    // A role anchor is found as a single step finds it, a nameless one among the nameless controls
+    // of its role (#2084: querying every control sent a file upload to the first named button).
+    const { refs, hint } = await lookUpSub(sub.anchor, queryArgs, ahead);
+    // Several matches with no usable recorded position is drift on every look, as in the single-step
+    // runners. The first look used to take `refs[0]`: a click recorded on one item of a list (every
+    // item from one JSX line) replayed on another item and failed a correct app. A look ahead is not
+    // a verdict, and an earlier sub-step can still change what is on the page.
+    const ambiguous = ahead ? null : ambiguityDrift(sub.anchor, refs);
+    if (ambiguous !== null) {
+      return { stop: { step: index, tool: step.tool, anchor: label, ok: false, drift: ambiguous } };
+    }
+    // The only match, or the recorded position while the page has exactly as many namesakes.
+    const ref = refFor(sub.anchor, refs);
+    if (ref === undefined) {
+      if (ahead) {
+        return { pending: true };
+      }
+      return {
+        stop: {
+          step: index,
+          tool: step.tool,
+          anchor: label,
+          ok: false,
+          drift:
+            sub.anchor.kind === AnchorKind.TESTID
+              ? testidDrift(sub.anchor.value, hint)
+              : {
+                  reasonKind: DriftReason.COMPONENT_NOT_FOUND,
+                  reason: `anchor ${label} not found`,
+                  anchor: label,
+                  nearest: null,
+                },
+        },
+      };
+    }
+    return {
+      live: {
+        ref,
+        action: sub.action ?? '',
+        // Each sub-step carries its OWN anchor, so each gets its own field name (a login's fill).
+        args: pacedArgs(
+          replayActionArgs(sub.args, confirmDangerous, anchorFieldName(sub.anchor)),
+          gap,
+        ),
+      },
+    };
+  };
+
+  const live: LiveSubStep[] = [];
+
+  /**
+   * Resolve sub-steps from `from`, as far as the page allows now. Return the index where the run must
+   * dispatch before it can look further.
+   *
+   * Sub-step `from` is the one whose turn it is. It gets the full settle, and it drifts if it is
+   * missing. At 0, that is before anything acted. Each later sub-step gets one look before its turn.
+   * The first one that is not on the page yet ends the stretch. Live, a later sub-step can target
+   * what an earlier one renders, for example the "Cancel" of a form that "Edit" opens (#1523). A
+   * sequence whose anchors are all on the page at the start is one stretch, so it is one batch.
+   */
+  const resolveFrom = async (from: number): Promise<{ end: number } | { stop: FlowStepResult }> => {
+    for (let at = from; at < subs.length; at += 1) {
+      const sub = subs[at];
+      if (sub === undefined) {
+        continue;
+      }
+      const resolved = await resolveSub(sub, at, at > from);
+      if ('pending' in resolved) {
+        return { end: at };
+      }
+      if ('stop' in resolved) {
+        return resolved;
+      }
+      live[at] = resolved.live;
+    }
+    return { end: subs.length };
+  };
+
+  const result: FlowStepResult = {
+    step: index,
+    tool: step.tool,
+    anchor: anchorLabel(step.anchor),
+    ok: true,
+  };
+
+  /** One dispatch through the SAME command either way, so batched and walked replay identically. */
+  const send = async (
+    steps: readonly LiveSubStep[],
+  ): Promise<Awaited<ReturnType<typeof session.command>>> => {
+    session.beginAction?.(ReticleTool.FLOW_REPLAY, { steps: steps.length });
+    try {
+      // A recorded zero means "do not wait for the element", not "abort the whole batch now".
+      // Keep the transport alive long enough for the sequence's default per-step budget, and give
+      // an omitted timeout the same aggregate budget as the live tool's independent step waits.
+      const perStepTimeout =
+        undefined === step.timeoutMs || 0 === step.timeoutMs
+          ? DEFAULT_SEQUENCE_STEP_TIMEOUT_MS
+          : step.timeoutMs;
+      const timeoutMs = perStepTimeout * steps.length;
+      return await session.command(ReticleCommand.ACT_SEQUENCE, { steps }, timeoutMs);
+    } finally {
+      session.finishAction?.();
+    }
+  };
+
+  /**
+   * Run sub-steps [from, to), and survive the page re-rendering under them.
+   *
+   * The refs were resolved before their stretch ran, and the first action of a sequence is allowed to
+   * re-render the page, so by the time a later sub-step is reached its ref may be dead. The same
+   * anchor is almost always still there under a new ref; what was missing is a second look.
+   *
+   * The page names the ref it could not find, which says WHICH sub-step failed and so which ones
+   * already ran, as long as no other sub-step holds the same ref. Only the rest is resolved again and
+   * sent, so nothing acts twice. Only a stale ref is retried, and only while the retry gets further:
+   * stale again at the same point is a target that does not hold still, and the run says so.
+   */
+  const dispatchFrom = async (from: number, to: number): Promise<boolean> => {
+    let start = from;
+    let staleBefore = -1;
+    for (;;) {
+      const act = await send(live.slice(start, to));
+      if (act.ok) {
+        // A sub-step no person could have clicked decides nothing (#2113).
+        const drift = unreachableSubStepDrift(
+          act.result,
+          (at) =>
+            `${anchorLabel(subs[start + at]?.anchor ?? step.anchor)} (sub-step ${String(start + at)})`,
+        );
+        Object.assign(
+          result,
+          drift === undefined ? {} : { ok: false, anchor: drift.anchor, drift },
+        );
+        return drift === undefined;
+      }
+      const error = act.error ?? 'command failed';
+      if (!isStaleRefError(error)) {
+        result.ok = false;
+        result.error = replayDestructiveActionHint(error);
+        return false;
+      }
+      const staleAt = staleSubStep(error, live, start, to);
+      if (staleAt === undefined) {
+        result.ok = false;
+        result.error = error + STALE_SUB_STEP_UNKNOWN;
+        return false;
+      }
+      if (staleAt <= staleBefore) {
+        result.ok = false;
+        result.error = error + staleSubStepPosition(staleAt, subs.length);
+        return false;
+      }
+      staleBefore = staleAt;
+      await waitForReaction(session, 0, STALE_REF_GRACE_MS, { sleep });
+      for (let at = staleAt; at < to; at += 1) {
+        const sub = subs[at];
+        if (sub === undefined) {
+          continue;
+        }
+        const resolved = await resolveSub(sub, at);
+        if ('stop' in resolved) {
+          result.ok = false;
+          result.anchor = resolved.stop.anchor;
+          if (resolved.stop.drift !== undefined) {
+            result.drift = resolved.stop.drift;
+          }
+          return false;
+        }
+        // A second look settles, so it is never `pending`.
+        if ('live' in resolved) {
+          live[at] = resolved.live;
+        }
+      }
+      start = staleAt;
+    }
+  };
+
+  /** The sub-step's own expectation, unless its testid is deliberately unasserted. */
+  const declaredBy = (sub: FlowStep): string | undefined => {
+    const testid = expectedElementTestid(sub.expect);
+    return testid === undefined || dynamic.has(testid) ? undefined : testid;
+  };
+
+  /**
+   * Assert one sub-step's expectation. Absence stops the sequence.
+   *
+   * The STEP's anchor is named, not the assertion's target: replay stops at the first drift, and
+   * naming the expectation here would read as "this step's locator drifted" on a step whose locator
+   * resolved and whose action fired.
+   */
+  const assertDeclared = async (testid: string): Promise<boolean> => {
+    const found = await resolveQuery(session, { by: QueryBy.TESTID, value: testid }, sleep);
+    if (0 < found.refs.length) {
+      return true;
+    }
+    result.ok = false;
+    result.drift = expectElementDrift(testid, found.hint);
+    return false;
+  };
+
+  /*
+   * A sequence that declares nothing goes as ONE batch — the cheap path, and the common one.
+   *
+   * When a sub-step DOES declare, the sub-steps are walked and each expectation is checked right
+   * after its own action, as live: checked at the end, "click Pay, and the receipt appears" passed
+   * because a LATER sub-step produced the receipt. A sequence driven with `burst` is walked too, one
+   * gap between actions, as live: at the default settle a timing-sensitive page answered differently
+   * (#2130). The walk costs a round trip per sub-step, so only these sequences pay for it.
+   */
+  const judged = (sub: FlowStep): boolean => judge !== undefined && sub.expect !== undefined;
+  const declaring =
+    gap !== undefined || subs.some((sub) => declaredBy(sub) !== undefined || judged(sub));
+  // Sub-steps completed with their checks held, for the score; a failed batch leaves its own unknown.
+  let completed = 0;
+  const finish = (r: FlowStepResult): FlowStepResult => ({
+    ...r,
+    subSteps: {
+      passed: r.ok && r.drift === undefined ? subs.length : completed,
+      total: subs.length,
+    },
+  });
+  for (let next = 0; next < subs.length;) {
+    const stretch = await resolveFrom(next);
+    if ('stop' in stretch) {
+      return finish(stretch.stop);
+    }
+    const { end } = stretch;
+    if (!declaring) {
+      if (!(await dispatchFrom(next, end))) {
+        return finish(result);
+      }
+      completed = end;
+    } else {
+      for (let at = next; at < end; at += 1) {
+        const sub = subs[at];
+        if (sub === undefined) {
+          continue;
+        }
+        await holdGap(() => session.elapsed(), lastSent, gap, sleep);
+        const before = judged(sub) ? await captureBaselines(session, sub.expect) : undefined;
+        const since = session.elapsed();
+        lastSent = since;
+        if (!(await dispatchFrom(at, at + 1))) {
+          return finish(result);
+        }
+        const testid = declaredBy(sub);
+        if (testid !== undefined && !(await assertDeclared(testid))) {
+          return finish(result);
+        }
+        // The claim is about THIS sub-step: a later one has not run, and an earlier one is before
+        // `since`. Judged at the end, a middle route expect failed and a late claim passed early.
+        const drift =
+          judge !== undefined && sub.expect !== undefined
+            ? await judge(sub.expect, since, before)
+            : undefined;
+        if (drift !== undefined) {
+          result.ok = false;
+          result.drift = drift;
+          return finish(result);
+        }
+        completed = at + 1;
+      }
+    }
+    next = end;
+  }
+  return finish(result);
+}

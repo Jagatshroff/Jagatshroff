@@ -1,0 +1,241 @@
+---
+title: 'Manual install: by hand, on purpose'
+sidebarTitle: Manual install
+description: Wire Reticle by hand. Register the MCP server for your agent, add the SDK, and connect it. Every step init automates, written out.
+icon: screwdriver-wrench
+---
+
+**Installing Reticle by hand is two independent halves: register the MCP server so your agent gets the `reticle_*` tools, then add the SDK to your app so there is something for those tools to talk to.** You need both, in that order.
+
+Do only the first half and the tools appear but every call reports no session. Do only the second and your app connects to a daemon nobody is asking questions. Stop after the first half and your agent can still check the running app with the zero-install lease, which installs nothing. It asks you before it runs `init`.
+
+<Warning>
+  **You probably do not need this page.** Two commands do all of it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.sh | sh   # or: irm https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.ps1 | iex
+npx @reticlehq/server init                      # in your project
+```
+
+The first registers the MCP server with every agent it can reach. The second wires the app. See the [quickstart](/quickstart).
+
+This page is for the cases those cannot cover: a machine where piping a script is not allowed, an agent Reticle does not know, or a step the installer reported as needing a hand (Codex CLI is the usual one when the `codex` command is not installed, because only `codex mcp add` registers a server in its TOML config).
+
+</Warning>
+
+If you want the CLI without the script:
+
+```bash
+npm install -g @reticlehq/server
+npx @reticlehq/server setup mcp
+```
+
+`reticle setup mcp` is exactly the registration half of the installer, and it prints any client it could not write for you.
+
+### Sandbox and container images
+
+Install the CLI once, in the image:
+
+```bash
+npm install -g @reticlehq/server
+npx @reticlehq/server setup mcp
+```
+
+npx runs the installed copy. When the CLI is installed, `reticle init` and `reticle setup mcp` register its absolute path (`node <path>/bin/reticle.js mcp`). Each boot then starts the MCP server from the local copy, and your agent does not wait for a download.
+
+Without an install, the registration is `npx @reticlehq/server@<version> mcp`, with one exact version. npx uses its cache again only when that cache is in the image. A fresh sandbox with an empty npm cache downloads the package at each boot, and your agent waits for it before its first turn.
+
+If you remove the installed copy later, the agent shows the server as failed. `reticle doctor` then prints a `launcher` row with the missing path and the command to run.
+
+## Part 1. Register the MCP server
+
+There is no config file that all agents share. Each harness has its own path and its own schema, so write only the one you actually use.
+
+| Tool | File | Root key | `type` needed? |
+| --- | --- | --- | --- |
+| Claude Code | `~/.claude.json` (prefer the CLI below) | `mcpServers` | no |
+| Cursor | `~/.cursor/mcp.json` | `mcpServers` | no |
+| VS Code | `.vscode/mcp.json` | `servers` | no |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `mcpServers` | no |
+| OpenCode | `~/.config/opencode/opencode.jsonc` | `mcp` | `"local"` required |
+| Codex CLI | `~/.codex/config.toml` | `[mcp_servers.reticle]` | no |
+| Zed | `~/.config/zed/settings.json` | `context_servers` | no |
+
+### Claude Code
+
+Register once, globally, and every project has it:
+
+```bash
+claude mcp add reticle -s user -- npx @reticlehq/server mcp
+```
+
+Confirm with `claude mcp list`. `reticle` should be there.
+
+If the `claude` CLI isn't available, merge one key into `mcpServers` in `~/.claude.json`. It is a large stateful file, so **merge, never rewrite**:
+
+```json
+{
+  "mcpServers": {
+    "reticle": {
+      "command": "npx",
+      "args": ["@reticlehq/server", "mcp"]
+    }
+  }
+}
+```
+
+### Cursor, VS Code, Windsurf
+
+Same shape, different file and root key. Cursor and Windsurf use `mcpServers`; VS Code uses `servers`:
+
+```json
+{
+  "mcpServers": {
+    "reticle": {
+      "command": "npx",
+      "args": ["@reticlehq/server", "mcp"]
+    }
+  }
+}
+```
+
+### Codex CLI
+
+TOML, in `~/.codex/config.toml`. With the `codex` command installed, `init` runs `codex mcp add reticle -- npx @reticlehq/server mcp` for you, and only when the file has no `reticle` entry yet, because that command replaces one without asking. Without the command, `init` cannot write it for you:
+
+```toml
+[mcp_servers.reticle]
+command = "npx"
+args = ["@reticlehq/server", "mcp"]
+```
+
+When the `[mcp_servers.reticle]` table is there, Reticle adds one line under it: `default_tools_approval_mode = "approve"`. This line approves Reticle's own tools, so Codex does not ask before each call. Reticle changes no other line, and it keeps a mode that you set. To undo it, change that line to `default_tools_approval_mode = "prompt"`. Reticle does not change a mode that is already there.
+
+### OpenCode
+
+Note the flat command array and the required `type`:
+
+```json
+{
+  "mcp": {
+    "reticle": {
+      "type": "local",
+      "command": ["npx", "@reticlehq/server", "mcp"]
+    }
+  }
+}
+```
+
+<Warning>
+  **Restart your agent afterwards.** It read its server list at startup and nothing re-reads it.
+  `/mcp` manages servers that are already loaded, so it cannot discover a new one. Restart Claude
+  Code, reload the Cursor window, or press Start in `.vscode/mcp.json`.
+</Warning>
+
+## Part 2. Wire the SDK into your app
+
+### Vite
+
+```bash
+npm i -D @reticlehq/react @reticlehq/vite-plugin
+```
+
+```ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { reticle } from '@reticlehq/vite-plugin';
+
+export default defineConfig({
+  plugins: [reticle(), react()],
+});
+```
+
+That's the whole web install. The plugin stamps source locations onto elements. That is what turns a DOM node into `src/components/Login.tsx:81`. It also injects `connect()` with the pairing token, so you can't forget either.
+
+### Anything without the plugin
+
+Run `npx @reticlehq/server init` even here: it wires plain HTML, Angular, Remix, Astro, SvelteKit and the rest, and it is the part that gets the **pairing token** to the page without writing it into anything you ship.
+
+If you really are wiring `connect()` by hand, pass the token. The daemon writes it to `~/.reticle/pairing-token` on first start and refuses a page that does not present it, on localhost too. Without it the page console says `bridge refused the connection: authentication failed: no pairing token on the page…`.
+
+`init` gives you a module for this: it writes the token to `reticle.local.js` at the project root, adds that file to `.gitignore`, and prints a snippet that imports it. To do it without `init`, pass the token yourself:
+
+```ts
+import { reticle, SESSION_AUTO } from '@reticlehq/browser';
+
+if (import.meta.env.DEV) {
+  // The contents of ~/.reticle/pairing-token, supplied at dev time (here as a Vite env var).
+  // Never commit it, and never let it reach a production build.
+  reticle.connect({ session: SESSION_AUTO, token: import.meta.env.VITE_RETICLE_TOKEN });
+}
+```
+
+Start the dev server with `VITE_RETICLE_TOKEN="$(cat ~/.reticle/pairing-token)"`, or pin your own secret with `RETICLE_TOKEN=<secret>` in the MCP server's environment and give the page the same value. Set it on the dev command only, never in a `.env` file: a production build reads `.env` and would embed the token in the JavaScript it ships. Not on Vite? Do the same with your bundler's dev-only flag and its way of passing a value to the browser.
+
+<Note>
+  `connect()` is dev-only by design. Guard it with whatever your bundler gives you:
+  `import.meta.env.DEV`, `process.env.NODE_ENV !== 'production'`, or a build flag. Reticle also
+  self-guards, but two locks on a door that leads to your users is a reasonable number.
+</Note>
+
+### Tauri, and the step whose failure is silent
+
+The frontend is identical to any web app. The CSP is not optional:
+
+```json
+{
+  "app": {
+    "security": {
+      "csp": "default-src 'self' ipc: http://ipc.localhost; connect-src 'self' ipc: http://ipc.localhost ws://localhost:4400 ws://127.0.0.1:4400"
+    }
+  }
+}
+```
+
+<Warning>
+  Tauri's default CSP blocks the bridge WebSocket **before it opens**. Your app runs perfectly and
+  simply never connects, with no error to go on. Keep `ipc: http://ipc.localhost` in `connect-src`,
+  Tauri v2 needs it for `invoke` itself. And drop the `ws://` entries from your release config.
+</Warning>
+
+Screenshots and headless mode need the Rust crate, which is versioned independently of the npm packages:
+
+```toml
+[dependencies]
+reticle-tauri = "3.10"
+```
+
+```rust
+tauri::Builder::default()
+    .invoke_handler(tauri::generate_handler![reticle_tauri::reticle_capture])
+    .on_page_load(reticle_tauri::on_page_load)
+```
+
+**Dev builds only.** In a release build the crate is inert: `reticle_capture` refuses and `on_page_load` does nothing, so the binary you sign and ship carries no Reticle capability. A release build you test with Reticle (a CI fixture) turns it on with `reticle-tauri = { version = "3.8", features = ["in-release"] }`.
+
+IPC observation needs nothing on the Rust side. An `invoke('load_todos')` already reaches Reticle as `ipc://load_todos`.
+
+<Card title="Electron, and the rest of desktop" icon="display" href="/desktop">
+  Main-process and renderer wiring, IPC observation, and what differs from the web install.
+</Card>
+
+## Part 3. Prove it
+
+```bash
+npx @reticlehq/server status
+```
+
+A session listed means the SDK reached the page. Setup is finished when the first run returns a verdict.
+
+If it says nothing connected, the usual causes are a port disagreement between your app and the daemon, or a hand-wired `connect()` without the pairing token. The browser console will carry `[Reticle] this page could not open a websocket to …` naming the exact address it tried; set it explicitly with `RETICLE_PORT=4400 pnpm dev` (Vite plugin), `reticle({ port: 4400 })` in `vite.config`, or `reticle.connect({ url: 'ws://localhost:4400/reticle' })` by hand.
+
+Still stuck? `npx @reticlehq/server doctor` checks Chromium, the daemon and the port in one command.
+
+<CardGroup cols={2}>
+  <Card title="Instrument your app" icon="wrench" href="/instrumentation">
+    Register stores, signals and testids so your verdicts get stronger than "the DOM changed".
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Drive your first flow and read a real verdict.
+  </Card>
+</CardGroup>

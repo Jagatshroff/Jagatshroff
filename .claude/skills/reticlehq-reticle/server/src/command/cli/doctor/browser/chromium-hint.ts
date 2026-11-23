@@ -1,0 +1,369 @@
+/**
+ * A Chromium hint you can satisfy by following it.
+ *
+ * `npx playwright install chromium` looks obviously right and is quietly wrong. `npx` resolves the
+ * LATEST playwright, which pins a different browser revision than the playwright the daemon actually
+ * bundles — so the command downloads ~90 MiB of a build the daemon will not use, and the check still
+ * says missing afterwards. Reported from the field by an agent whose machine already had five
+ * chromium builds, none of them the wanted one, with no way to learn which one was wanted.
+ *
+ * The same reporter came back, because pinning the command fixes only half of it. Their five builds
+ * sat in the standard Windows browsers root and the line still read a flat `missing`, which leaves
+ * two readings — "the check is broken" and "none of these count" — and no way to choose. Present at
+ * the wrong revision and absent entirely are different problems: one is a single pinned download,
+ * the other means the lookup is aimed at a root nothing was ever installed into. Collapsing them is
+ * what made the loop unbreakable.
+ *
+ * Three things fix it, and they are what any unsatisfiable check needs: pin the command to the
+ * version doing the asking, say what was probed, and separate the verdicts that have different
+ * fixes. The wanted revision and the browsers root are both read back off the path Playwright itself
+ * resolves, so `PLAYWRIGHT_BROWSERS_PATH` and every platform default are honoured by construction
+ * rather than by a table of roots this file would have to keep in step with Playwright's.
+ */
+
+import { accessSync, constants as fsConstants, existsSync, readdirSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { ReticleEnv } from '@reticlehq/core';
+
+/** What the check found, gathered by the caller so this stays pure and testable. */
+export interface ChromiumProbe {
+  /** Executable path the daemon's own playwright resolves to; undefined when playwright is absent. */
+  executablePath?: string | undefined;
+  /** Whether that path exists on disk. */
+  exists: boolean;
+  /** Version of the playwright the DAEMON bundles — not whatever `npx` would fetch. */
+  playwrightVersion?: string | undefined;
+  /** The revision that path names, e.g. `chromium-1223`. Undefined if the path has no revision in it. */
+  wantedRevision?: string | undefined;
+  /** The browsers root the lookup used, wherever `PLAYWRIGHT_BROWSERS_PATH` and the platform put it. */
+  browsersRoot?: string | undefined;
+  /** Chromium revisions actually sitting in that root, wanted or not. */
+  installedRevisions?: readonly string[] | undefined;
+  /**
+   * The `node_modules` roots this process would resolve `playwright` from, nearest first.
+   *
+   * Only meaningful when playwright is ABSENT, and it is the evidence that branch was missing. The
+   * daemon usually runs from npx or a global install, so it resolves from its OWN location and not
+   * from the user's project — a reporter installed the right playwright in two project directories
+   * and kept reading "not installed", with no way to see that neither was ever searched.
+   */
+  searchedPaths?: readonly string[] | undefined;
+  /**
+   * The installed browser Reticle drives instead when its own build is absent (`Google Chrome`,
+   * `Microsoft Edge`) — see launch-chromium. Present only when `exists` is false and one was found.
+   */
+  fallback?: string | undefined;
+  /**
+   * Where Reticle looked for an installed Chrome or Edge when neither Playwright's build nor a
+   * fallback browser was found.
+   */
+  fallbackPaths?: readonly string[] | undefined;
+  /** `executablePath` came from RETICLE_CHROMIUM_PATH, so the bundled build is not in play at all. */
+  configured?: boolean | undefined;
+  /** Why that configured executable cannot be launched. Present only when `exists` is false. */
+  problem?: ChromiumPathProblem | undefined;
+}
+
+/** What stops the executable RETICLE_CHROMIUM_PATH names from being launched. */
+export const ChromiumPathProblem = {
+  MISSING: 'missing',
+  NOT_A_FILE: 'not-a-file',
+  NOT_EXECUTABLE: 'not-executable',
+} as const;
+export type ChromiumPathProblem = (typeof ChromiumPathProblem)[keyof typeof ChromiumPathProblem];
+
+/**
+ * What stops the file at `path` from being launched, or undefined when nothing does.
+ *
+ * Existing is not enough: Playwright cannot start a directory or a file without the executable bit,
+ * and its error for that reads like a missing install. Windows has no executable bit, so only the
+ * file check applies there.
+ */
+export function chromiumPathProblem(
+  path: string,
+  platform: NodeJS.Platform,
+): ChromiumPathProblem | undefined {
+  let isFile: boolean;
+  try {
+    isFile = statSync(path).isFile();
+  } catch {
+    return ChromiumPathProblem.MISSING;
+  }
+  if (!isFile) return ChromiumPathProblem.NOT_A_FILE;
+  if ('win32' === platform) return undefined;
+  try {
+    accessSync(path, fsConstants.X_OK);
+    return undefined;
+  } catch {
+    return ChromiumPathProblem.NOT_EXECUTABLE;
+  }
+}
+
+/** The Chromium RETICLE_CHROMIUM_PATH names, or undefined when it is unset or blank. */
+export function configuredChromiumPath(env: NodeJS.ProcessEnv): string | undefined {
+  const path = env[ReticleEnv.CHROMIUM_PATH]?.trim();
+  return path === undefined || 0 === path.length ? undefined : path;
+}
+
+/**
+ * What the probes report when RETICLE_CHROMIUM_PATH is set, or undefined when it is not. The user
+ * named the browser, so the bundled revision, the installed channels and the browsers root say
+ * nothing about whether a launch will work. Only the named file does.
+ */
+export function configuredChromiumProbe(
+  env: NodeJS.ProcessEnv,
+  pathProblem: (path: string) => ChromiumPathProblem | undefined,
+): ChromiumProbe | undefined {
+  const path = configuredChromiumPath(env);
+  if (path === undefined) return undefined;
+  const problem = pathProblem(path);
+  return {
+    executablePath: path,
+    exists: problem === undefined,
+    configured: true,
+    ...(problem === undefined ? {} : { problem }),
+  };
+}
+
+/**
+ * How every RETICLE_CHROMIUM_PATH refusal begins. Error recovery keys on it, so the variable's name
+ * is read as configuration rather than as a `reticle_*` tool the call got wrong.
+ */
+export const CHROMIUM_PATH_REFUSAL_PREFIX = `${ReticleEnv.CHROMIUM_PATH} points at `;
+
+/** What each problem reads as, after the path. */
+const CHROMIUM_PATH_PROBLEM_TEXT: Record<ChromiumPathProblem, string> = {
+  [ChromiumPathProblem.MISSING]: 'which does not exist',
+  [ChromiumPathProblem.NOT_A_FILE]: 'which is not a file',
+  [ChromiumPathProblem.NOT_EXECUTABLE]: 'which is not executable',
+};
+
+const CHROMIUM_PATH_FIX = "fix the path, or unset it to use Playwright's own Chromium";
+
+/** The doctor verdict for a RETICLE_CHROMIUM_PATH that can be launched. */
+const CHROMIUM_PATH_IN_USE = (path: string): string =>
+  `✓ using ${path} (${ReticleEnv.CHROMIUM_PATH})`;
+
+/**
+ * A RETICLE_CHROMIUM_PATH that cannot be launched. Worded apart from the missing-browser hint on
+ * purpose: that one sends the reader to install Playwright's build, which does nothing for a path
+ * typed wrong.
+ */
+export function configuredChromiumRefusal(path: string, problem: ChromiumPathProblem): string {
+  return `${CHROMIUM_PATH_REFUSAL_PREFIX}${path}, ${CHROMIUM_PATH_PROBLEM_TEXT[problem]}; ${CHROMIUM_PATH_FIX}`;
+}
+
+/**
+ * A browsers-root entry that is a chromium build.
+ *
+ * Deliberately not matching `chromium_headless_shell-*`: it lives beside the full build and is a
+ * different artifact, so counting it would let a root holding only headless shells report the full
+ * browser as present-but-mismatched.
+ */
+const CHROMIUM_DIR = /^chromium-\d+$/;
+
+/** The same directory name as a path segment, on either separator, so Windows paths split too. */
+const CHROMIUM_SEGMENT = /[\\/](chromium-\d+)[\\/]/;
+
+/**
+ * Pin an `npx playwright <subcommand>` invocation to the playwright the daemon actually bundles.
+ *
+ * Unpinned is still the right fallback: a wrong-revision download is a bad outcome, but no command
+ * at all is a worse one. Shared by `chromiumInstallCommand` and `chromiumInstallDepsCommand`, which
+ * differ only in the subcommand they need pinned.
+ */
+function pinnedPlaywrightCommand(subcommand: string, playwrightVersion?: string): string {
+  const pin = playwrightVersion === undefined ? 'playwright' : `playwright@${playwrightVersion}`;
+  return `npx ${pin} ${subcommand}`;
+}
+
+/** The install command, pinned when we know what to pin to. */
+export function chromiumInstallCommand(playwrightVersion?: string): string {
+  return pinnedPlaywrightCommand('install chromium', playwrightVersion);
+}
+
+/**
+ * The install-deps command, pinned the same way `chromiumInstallCommand` is.
+ *
+ * A missing OS shared library (e.g. `libnspr4.so`) is a different failure from a missing browser
+ * binary: the binary is already there, but Playwright's own host-requirement check refuses to launch
+ * it. `npx playwright install chromium` does nothing for that case — the fix is `install-deps`, and
+ * it needs the same pin for the same reason: unpinned, `npx` can resolve a different playwright than
+ * the one the daemon bundles.
+ */
+export function chromiumInstallDepsCommand(playwrightVersion?: string): string {
+  return pinnedPlaywrightCommand('install-deps chromium', playwrightVersion);
+}
+
+/**
+ * Split a resolved executable path into the browsers root and the revision under it, or null.
+ *
+ * Reading them back off Playwright's own answer is the point. The alternative is reconstructing the
+ * root from `PLAYWRIGHT_BROWSERS_PATH` plus a per-platform default, which is a copy of Playwright's
+ * resolution rules that drifts the first time they change one — and getting it wrong here means
+ * telling a user their browsers are missing while looking in the wrong directory, which is the exact
+ * failure this file exists to stop.
+ */
+export function parseChromiumRevision(
+  executablePath: string,
+): { revision: string; root: string } | null {
+  const match = CHROMIUM_SEGMENT.exec(executablePath);
+  if (null === match) return null;
+  const revision = match[1];
+  if (revision === undefined) return null;
+  return { revision, root: executablePath.slice(0, match.index) };
+}
+
+/** Chromium revisions present in a browsers root. Empty on an unreadable or absent root. */
+function installedRevisions(root: string): string[] {
+  try {
+    return readdirSync(root)
+      .filter((entry) => CHROMIUM_DIR.test(entry))
+      .sort();
+  } catch {
+    // No root at all is the commonest case here and is not an error: it means nothing was installed.
+    return [];
+  }
+}
+
+/**
+ * Ask the playwright THIS process would use, not the one `npx` would fetch.
+ *
+ * `executablePath()` resolves the revision the daemon will actually launch AND the root it will look
+ * in, which is why the probe never reads `PLAYWRIGHT_BROWSERS_PATH` itself.
+ */
+export async function probeChromium(
+  exists: (path: string) => boolean = existsSync,
+): Promise<ChromiumProbe> {
+  const searched = playwrightResolutionRoots();
+  try {
+    const { chromium } = await import('playwright');
+    const executablePath = chromium.executablePath();
+    const parsed = parseChromiumRevision(executablePath);
+    return {
+      executablePath,
+      exists: exists(executablePath),
+      playwrightVersion: bundledPlaywrightVersion(),
+      ...(null === parsed
+        ? {}
+        : {
+            wantedRevision: parsed.revision,
+            browsersRoot: parsed.root,
+            installedRevisions: exists === existsSync ? installedRevisions(parsed.root) : [],
+          }),
+    };
+  } catch {
+    // Playwright itself is absent — a different problem from a missing browser, and the hint says so.
+    // The roots are gathered HERE rather than in the hint so the hint stays pure: this is the only
+    // place that knows which module did the resolving.
+    return { exists: false, ...(0 === searched.length ? {} : { searchedPaths: searched }) };
+  }
+}
+
+/**
+ * Where `import('playwright')` would look from HERE — the roots that EXIST, nearest first.
+ *
+ * The existence filter is the part that makes this evidence rather than noise. Node's ancestor chain
+ * runs to the filesystem root and its nearest entries are usually directories nobody ever created:
+ * measured from the built daemon, the two nearest are `dist/cli/node_modules` and `dist/node_modules`,
+ * and the informative one — the daemon's own `node_modules` — is third. Printing the first two
+ * unfiltered would name two paths the reader cannot check and hide the one they can.
+ *
+ * Capped after filtering, because the point is to show whether this process searched where the
+ * reader installed, not to dump the chain.
+ */
+const MAX_SEARCHED_ROOTS = 2;
+
+function playwrightResolutionRoots(): string[] {
+  try {
+    const roots = createRequire(import.meta.url).resolve.paths('playwright') ?? [];
+    return roots.filter((root) => existsSync(root)).slice(0, MAX_SEARCHED_ROOTS);
+  } catch {
+    // An environment that cannot enumerate its own resolution paths still gets the bare verdict.
+    return [];
+  }
+}
+
+/** The bundled playwright's version, or undefined if it cannot be read (the hint then goes unpinned). */
+export function bundledPlaywrightVersion(): string | undefined {
+  try {
+    const require = createRequire(import.meta.url);
+    const pkg: unknown = require('playwright/package.json');
+    if ('object' === typeof pkg && null !== pkg && 'version' in pkg) {
+      const { version } = pkg;
+      if ('string' === typeof version) return version;
+    }
+  } catch {
+    /* an unreadable package.json is not worth failing a diagnostic over */
+  }
+  return undefined;
+}
+
+/**
+ * Why the lease preflight refuses, or undefined when a launch can go ahead.
+ *
+ * "Chromium is not installed" is kept in the usual message because error-recovery routes it to the
+ * install fix. A RETICLE_CHROMIUM_PATH that cannot be launched is a wrong path, not a missing
+ * install, so it says only that and the install fix is never attached.
+ */
+export function chromiumPreflightRefusal(probe: ChromiumProbe): string | undefined {
+  if (probe.exists) return undefined;
+  if (undefined !== probe.fallback) {
+    return undefined;
+  }
+  if (true === probe.configured && probe.executablePath !== undefined) {
+    return configuredChromiumRefusal(
+      probe.executablePath,
+      probe.problem ?? ChromiumPathProblem.MISSING,
+    );
+  }
+  return `Chromium is not installed for Playwright — ${chromiumHint(probe)}`;
+}
+
+/** The doctor line for the Chromium check — verdict, what was probed, and how to satisfy it. */
+export function chromiumHint(probe: ChromiumProbe): string {
+  if (true === probe.configured && probe.executablePath !== undefined) {
+    return probe.exists
+      ? CHROMIUM_PATH_IN_USE(probe.executablePath)
+      : `✗ ${configuredChromiumRefusal(probe.executablePath, probe.problem ?? ChromiumPathProblem.MISSING)}`;
+  }
+  if (probe.exists) {
+    // Naming the revision on the happy line too: it is the number the mismatch line talks about, and
+    // a reader comparing two machines has nothing to compare without it.
+    return probe.wantedRevision === undefined
+      ? '✓ installed'
+      : `✓ installed (${probe.wantedRevision})`;
+  }
+  const command = chromiumInstallCommand(probe.playwrightVersion);
+  // Not a failure: every Reticle browser launches on this one. The install command stays on the
+  // line for a reader who wants the exact build the tests run against.
+  if (probe.fallback !== undefined && probe.executablePath !== undefined) {
+    return `✓ using the installed ${probe.fallback} (Playwright's own Chromium is not installed; ${command} adds it)`;
+  }
+  if (probe.executablePath === undefined) {
+    // Same rule as the missing-browser line below: a verdict with nowhere to check it against reads
+    // as a broken check. The roots say whether this process even searched the directory the reader
+    // installed into — which for a daemon run from npx or a global install it usually did not.
+    const searched = probe.searchedPaths ?? [];
+    const where = 0 === searched.length ? '' : ` — looked in ${searched.join(', ')}`;
+    return `✗ the playwright package is not installed${where}; run: ${command}`;
+  }
+  const fallbackPaths = probe.fallbackPaths ?? [];
+  const present = probe.installedRevisions ?? [];
+  if (present.length > 0 && probe.wantedRevision !== undefined) {
+    // The reported machine. Every fact here is one the reader could not otherwise get: what is
+    // wanted, what is there, and where "there" is. `npx playwright install chromium` unpinned adds
+    // a build to this list and changes nothing, which is what happened.
+    const fallbackWhere =
+      0 === fallbackPaths.length ? '' : `; also looked for ${fallbackPaths.join(', ')}`;
+    return (
+      `✗ wrong revision — the bundled playwright wants ${probe.wantedRevision}; ` +
+      `${probe.browsersRoot ?? ''} holds ${present.join(', ')}${fallbackWhere}. run: ${command}`
+    );
+  }
+  // Naming the path is what turns "missing" from a verdict into evidence: a reader with browsers on
+  // disk can see immediately whether this is a missing install or a lookup pointed somewhere else
+  // (PLAYWRIGHT_BROWSERS_PATH, a different browsers root, a revision bump).
+  const lookedFor = [probe.executablePath, ...fallbackPaths].join(', ');
+  return `✗ missing — looked for ${lookedFor}; run: ${command}`;
+}

@@ -1,0 +1,719 @@
+/**
+ * A verdict from the CLI, against the daemon that is already running.
+ *
+ * The dead end is not a defect in any tool — it is that the tools are not loaded in the client, and
+ * there was no other supported way to reach a verdict from that state. The app is instrumented, the daemon is healthy, `doctor` shows a live connected page, and
+ * the client (Codex, Cursor Cloud, Antigravity, Gemini CLI, or a Claude Code session whose MCP link
+ * dropped) exposes no `reticle_*` tools, because they load only at client startup.
+ *
+ * `verify` then refused because the daemon owned the port — the normal state after a working
+ * install. The other CLI verdict paths need saved flows, and a first-install project has none. And
+ * our own guidance says never to stop the daemon, because that kills the agent's MCP link. So an
+ * agent held a live, correctly-wired app and no path to a verdict short of a human restarting their
+ * editor.
+ */
+import { describe, expect, it, vi } from 'vitest';
+import {
+  ASSERT_MAX_WAIT_MS,
+  acquireLease,
+  assertTimedOutLines,
+  exploreToEnd,
+  runAdhocVerdict,
+  type ToolCaller,
+} from './adhoc-verdict.js';
+import { MAX_BLOCKING_WAIT_MS } from '@/surface/tools/args/numeric-bounds.js';
+import { ReticleTool } from '@reticlehq/core';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import {
+  LEASE_KEPT_SENTENCE,
+  LEASE_RELEASED_SENTENCE,
+  leaseNotConnectedHint,
+} from '@/surface/tools/lease-hint.js';
+
+/** A fake daemon: records what was asked, answers with the verdict it was given. */
+function caller(verdict: unknown): { tool: ToolCaller; calls: { name: string; args: unknown }[] } {
+  const calls: { name: string; args: unknown }[] = [];
+  return {
+    calls,
+    tool: {
+      call: (name, args) => {
+        calls.push({ name, args });
+        return Promise.resolve({ structuredContent: verdict });
+      },
+      close: () => Promise.resolve(),
+    },
+  };
+}
+
+const run = (verdict: unknown, over = {}) => {
+  const c = caller(verdict);
+  return runAdhocVerdict({
+    port: 4400,
+    url: 'http://localhost:3000/',
+    predicate: { kind: 'text', contains: 'Dashboard' },
+    connect: () => Promise.resolve(c.tool),
+    ...over,
+  }).then((result) => ({ result, calls: c.calls }));
+};
+
+describe('a one-shot verdict against the running daemon', () => {
+  it('navigates first, then asserts', async () => {
+    const { calls } = await run({ verified: 'yes' });
+    expect(calls.map((c) => c.name)).toEqual([ReticleTool.NAVIGATE, ReticleTool.ASSERT]);
+  });
+
+  it('skips the navigation when no url is given, asserting where the session already is', async () => {
+    const { calls } = await run({ verified: 'yes' }, { url: undefined });
+    expect(calls.map((c) => c.name)).toEqual([ReticleTool.ASSERT]);
+  });
+
+  it('passes the predicate through untouched', async () => {
+    const { calls } = await run({ verified: 'yes' });
+    expect(calls[1]?.args).toEqual({
+      predicate: { kind: 'text', contains: 'Dashboard' },
+      timeout_ms: 4000,
+    });
+  });
+});
+
+describe('what the exit code means', () => {
+  it('exits 0 only when the predicate was PROVED', async () => {
+    expect((await run({ verified: 'yes' })).result.code).toBe(0);
+  });
+
+  it.each([
+    ['no — the assertion failed', 'no'],
+    ['unknown — Reticle could not tell what happened', 'unknown'],
+    ['no-fault — nothing was declared to prove', 'no-fault'],
+  ])('exits non-zero on %s', async (_label, verified) => {
+    const { result } = await run({ verified });
+    expect(
+      result.code,
+      'a CI step that treats "could not tell" as success is the false green this exists to prevent',
+    ).not.toBe(0);
+  });
+
+  it('reports the verdict and its reason to the reader', async () => {
+    const { result } = await run({ verified: 'no', verifiedReason: 'assertion_failed' });
+    expect(result.lines.join('\n')).toContain('verified: no');
+    expect(result.lines.join('\n')).toContain('assertion_failed');
+  });
+});
+
+describe('when the daemon cannot be reached', () => {
+  it('says so and exits non-zero, rather than reporting a pass', async () => {
+    const { result } = await run({}, { connect: () => Promise.reject(new Error('ECONNREFUSED')) });
+    expect(result.code).toBe(1);
+    expect(result.lines.join('\n')).toContain('could not reach the daemon');
+  });
+
+  it('exits non-zero when the tool call itself throws', async () => {
+    const tool: ToolCaller = {
+      call: () => Promise.reject(new Error('tool exploded')),
+      close: () => Promise.resolve(),
+    };
+    const { result } = await run({}, { connect: () => Promise.resolve(tool) });
+    expect(result.code).toBe(1);
+    expect(result.lines.join('\n')).toContain('tool exploded');
+  });
+
+  it('closes the connection even when the call failed', async () => {
+    const close = vi.fn(() => Promise.resolve());
+    const tool: ToolCaller = { call: () => Promise.reject(new Error('x')), close };
+    await run({}, { connect: () => Promise.resolve(tool) });
+    expect(close, 'a leaked SSE connection holds an agent slot on the daemon').toHaveBeenCalled();
+  });
+});
+
+/**
+ * `--session-id` was parsed, printed in the help, and dropped on the floor.
+ *
+ * `parseVerifySuffix` reads it and `cli-verify.ts` never passed it on, so with more than one tab
+ * connected the command failed with "multiple sessions connected — pass sessionId to target one":
+ * advice whose own remedy could not be followed through this path. Measured on a machine with three
+ * live sessions, where it also silently graded against the wrong one.
+ */
+describe('the session a one-shot verdict targets', () => {
+  it('pins both the navigate and the assert to the session it was given', async () => {
+    const { calls } = await run({ verified: 'yes' }, { sessionId: 's-42' });
+    expect(calls).toHaveLength(2);
+    for (const call of calls) {
+      expect((call.args as { sessionId?: string }).sessionId).toBe('s-42');
+    }
+  });
+
+  // Omitted means "whatever is connected", which is the single-session case and must stay untouched.
+  it('sends no sessionId when none was asked for', async () => {
+    const { calls } = await run({ verified: 'yes' });
+    for (const call of calls) {
+      expect((call.args as { sessionId?: string }).sessionId).toBeUndefined();
+    }
+  });
+});
+
+/**
+ * The headline line disagreed with the body underneath it.
+ *
+ * `verdictOf` read `structuredContent` only. A daemon answering with the verdict as TEXT content
+ * left it undefined, so the first line printed `verified: unknown` while the JSON below it said
+ * `"verified":"no"` — two different answers to the one question, in one response. Observed against a
+ * live daemon. The exit code was right either way, so this is legibility, not a false green.
+ */
+describe('a verdict carried as text, not structured content', () => {
+  const textCaller = (payload: unknown): ToolCaller => ({
+    call: () => Promise.resolve({ content: [{ type: 'text', text: JSON.stringify(payload) }] }),
+    close: () => Promise.resolve(),
+  });
+
+  it('reads the verdict out of the text and agrees with itself', async () => {
+    const result = await runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(textCaller({ verified: 'no', failureReason: 'it did not' })),
+    });
+    expect(result.lines[0]).toBe('verified: no');
+    expect(result.code).toBe(1);
+  });
+
+  it('still exits 0 on a proved verdict that arrived as text', async () => {
+    const result = await runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(textCaller({ verified: 'yes' })),
+    });
+    expect(result.lines[0]).toBe('verified: yes');
+    expect(result.code).toBe(0);
+  });
+
+  // Text that is not a verdict at all must stay `unknown` rather than being read as one.
+  it('leaves unparseable text as unknown', async () => {
+    const result = await runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () =>
+        Promise.resolve({
+          call: () => Promise.resolve({ content: [{ type: 'text', text: 'not json' }] }),
+          close: () => Promise.resolve(),
+        }),
+    });
+    expect(result.lines[0]).toBe('verified: unknown');
+    expect(result.code).toBe(1);
+  });
+});
+
+/**
+ * `reticle verify <url> --expect …` straight after init, with the app running and no browser open.
+ * It answered `verified: unknown` and a paragraph telling the reader to open a url — and the url it
+ * named was another project's dev server on 5173, not the one they had just typed. The url was
+ * already in the command; opening it is the whole request.
+ */
+describe('a url with no connected tab', () => {
+  const actionOf = (args: Record<string, unknown>): string | undefined =>
+    (args['args'] as { action?: string } | undefined)?.action;
+
+  const leasing = (over: { acquire?: unknown } = {}) => {
+    const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const tool: ToolCaller = {
+      call: (name, args) => {
+        calls.push({ name, args });
+        if (ReticleTool.RUN === name && 'acquire' === actionOf(args)) {
+          return Promise.resolve({ structuredContent: over.acquire ?? { sessionId: 'lease-1' } });
+        }
+        return Promise.resolve({ structuredContent: { verified: 'yes' } });
+      },
+      close: () => Promise.resolve(),
+    };
+    return { calls, tool };
+  };
+
+  it('leases a browser at that url, asserts on it, and releases it', async () => {
+    const c = leasing();
+    const result = await runAdhocVerdict({
+      port: 4400,
+      url: 'http://localhost:5190/',
+      predicate: { kind: 'text', contains: 'count is 0' },
+      connect: () => Promise.resolve(c.tool),
+      sessions: () => Promise.resolve([]),
+    });
+    expect(result.code).toBe(0);
+    expect(c.calls.map((x) => [x.name, actionOf(x.args)])).toEqual([
+      [ReticleTool.RUN, 'acquire'],
+      [ReticleTool.ASSERT, undefined],
+      [ReticleTool.RUN, 'release'],
+    ]);
+    expect(c.calls[1]?.args['sessionId']).toBe('lease-1');
+  });
+
+  it('uses the tab already open on that origin instead of leasing, navigating it there', async () => {
+    const c = leasing();
+    await runAdhocVerdict({
+      port: 4400,
+      url: 'http://localhost:5190/cart',
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(c.tool),
+      sessions: () => Promise.resolve([{ url: 'http://localhost:5190/' }]),
+    });
+    expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.NAVIGATE, ReticleTool.ASSERT]);
+  });
+
+  // Navigating a tab to the url it already shows reloads it, and a reloaded Electron window is a
+  // session that disconnects under the assert: `unknown — session disconnected`.
+  it('does not reload a tab that is already on that url', async () => {
+    const c = leasing();
+    await runAdhocVerdict({
+      port: 4400,
+      url: 'http://localhost:5190',
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(c.tool),
+      sessions: () => Promise.resolve([{ url: 'http://localhost:5190/' }]),
+    });
+    expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.ASSERT]);
+  });
+
+  // `--session-id` skipped the same-document check entirely, so a pinned tab already on the url was
+  // reloaded: page 2 of a list went back to page 1 before the assert read it (#1409).
+  describe('with --session-id', () => {
+    const pinned = (sessions: { url: string; sessionId?: string }[]) => {
+      const c = leasing();
+      return {
+        c,
+        run: (url: string) =>
+          runAdhocVerdict({
+            port: 4400,
+            url,
+            sessionId: 'tab-2',
+            predicate: { kind: 'text', contains: 'page 2' },
+            connect: () => Promise.resolve(c.tool),
+            sessions: () => Promise.resolve(sessions),
+          }),
+      };
+    };
+
+    it('asserts a pinned tab already on the url without navigating it', async () => {
+      const { c, run } = pinned([
+        { sessionId: 'tab-1', url: 'http://localhost:5190/other' },
+        { sessionId: 'tab-2', url: 'http://localhost:5190/list?page=2#top' },
+      ]);
+      await run('http://localhost:5190/list/?page=2');
+      expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.ASSERT]);
+      expect(c.calls[0]?.args['sessionId']).toBe('tab-2');
+    });
+
+    it('still navigates a pinned tab on a different url', async () => {
+      const { c, run } = pinned([{ sessionId: 'tab-2', url: 'http://localhost:5190/list?page=1' }]);
+      await run('http://localhost:5190/list?page=2');
+      expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.NAVIGATE, ReticleTool.ASSERT]);
+      expect(c.calls[0]?.args['sessionId']).toBe('tab-2');
+    });
+
+    it('does not borrow another tab that is on the url', async () => {
+      const { c, run } = pinned([
+        { sessionId: 'tab-1', url: 'http://localhost:5190/list?page=2' },
+        { sessionId: 'tab-2', url: 'http://localhost:5190/' },
+      ]);
+      await run('http://localhost:5190/list?page=2');
+      expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.NAVIGATE, ReticleTool.ASSERT]);
+    });
+
+    it('navigates, as before, when the status read fails', async () => {
+      const c = leasing();
+      await runAdhocVerdict({
+        port: 4400,
+        url: 'http://localhost:5190/list',
+        sessionId: 'tab-2',
+        predicate: { kind: 'text', contains: 'x' },
+        connect: () => Promise.resolve(c.tool),
+        sessions: () => Promise.reject(new Error('status unreachable')),
+      });
+      expect(c.calls.map((x) => x.name)).toEqual([ReticleTool.NAVIGATE, ReticleTool.ASSERT]);
+    });
+  });
+
+  it('reports why the lease failed instead of asserting against nothing', async () => {
+    const c = leasing({ acquire: { error: 'Chromium is not installed for Playwright — run: x' } });
+    const result = await runAdhocVerdict({
+      port: 4400,
+      url: 'http://localhost:5190/',
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(c.tool),
+      sessions: () => Promise.resolve([]),
+    });
+    expect(result.code).toBe(1);
+    expect(result.lines.join('\n')).toMatch(/Chromium is not installed/);
+    expect(c.calls.map((x) => x.name)).not.toContain(ReticleTool.ASSERT);
+  });
+});
+
+// `init` must not count a lease that only connected through Reticle's injected reader as the
+// install connecting, and it can only tell from the flag carried here.
+describe('a lease that had to supply its own reader', () => {
+  const answering = (report: Record<string, unknown>): ToolCaller => ({
+    call: () => Promise.resolve({ structuredContent: report }),
+    close: () => Promise.resolve(),
+  });
+
+  it('says so', async () => {
+    const got = await acquireLease(answering({ sessionId: 's', zeroInstall: true }), 'http://x/');
+    expect(got).toEqual({ leased: 's', zeroInstall: true });
+  });
+
+  it('is not one when the app dialled in itself', async () => {
+    const got = await acquireLease(answering({ sessionId: 's' }), 'http://x/');
+    expect(got).toEqual({ leased: 's', zeroInstall: false });
+  });
+});
+
+// A daemon from an older release refuses the `root` argument a newer CLI sends with the lease. The
+// CLI used to print that refusal and stop, before it had opened the page (#1659).
+describe('a daemon that does not know the lease `root`', () => {
+  type Call = { name: string; args: { args: Record<string, unknown> } };
+  const olderDaemon = (): { tool: ToolCaller; calls: Call[] } => {
+    const calls: Call[] = [];
+    return {
+      calls,
+      tool: {
+        call: (name, args) => {
+          calls.push({ name, args } as Call);
+          const sent = (args as Call['args']).args;
+          return Promise.resolve({
+            structuredContent:
+              'root' in sent
+                ? { error: 'unknown parameter for reticle_lease: root' }
+                : { sessionId: 's' },
+          });
+        },
+        close: () => Promise.resolve(),
+      },
+    };
+  };
+
+  it('opens the lease again without `root`', async () => {
+    const daemon = olderDaemon();
+    const got = await acquireLease(daemon.tool, 'http://x/', undefined, '/project');
+
+    expect(got).toEqual({ leased: 's', zeroInstall: false });
+    expect(daemon.calls).toHaveLength(2);
+    expect(daemon.calls[0]?.args.args).toHaveProperty('root', '/project');
+    expect(daemon.calls[1]?.args.args).not.toHaveProperty('root');
+  });
+
+  it('does not retry a refusal that is about something else', async () => {
+    const calls: unknown[] = [];
+    const tool: ToolCaller = {
+      call: (name, args) => {
+        calls.push({ name, args });
+        return Promise.resolve({ structuredContent: { error: 'no browser available' } });
+      },
+      close: () => Promise.resolve(),
+    };
+
+    const got = await acquireLease(tool, 'http://x/', undefined, '/project');
+
+    expect(got).toHaveProperty('failed');
+    expect(calls).toHaveLength(1);
+  });
+});
+
+/*
+ * `reticle verify <url>` on an app whose tab never connected (a page CSP blocked the reader's
+ * socket) answered `sessionId 'lease-…' names no session`. The lease said `ready: false` with the
+ * cause, and the CLI ignored it and drove the dead id. A tab that is not ready is a failed open.
+ */
+describe('a lease whose tab is not ready', () => {
+  const acquiring = (report: Record<string, unknown>) => {
+    const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const tool: ToolCaller = {
+      call: (name, args) => {
+        calls.push({ name, args });
+        return Promise.resolve({ structuredContent: report });
+      },
+      close: () => Promise.resolve(),
+    };
+    return { calls, tool };
+  };
+  const notReady = {
+    sessionId: 'lease-1',
+    ready: false,
+    notReadyReason: 'sdk-never-dialled',
+    hint: 'The page did not connect to the bridge.',
+  };
+
+  it('is a failed open that gives the reason and the hint, not a lease id', async () => {
+    const c = acquiring(notReady);
+    const got = await acquireLease(c.tool, 'http://localhost:5190/');
+    expect(got).toEqual({
+      failed: [
+        'could not open http://localhost:5190/ in a Reticle browser, so nothing was checked:',
+        'the tab did not connect (sdk-never-dialled). The page did not connect to the bridge.',
+      ],
+    });
+  });
+
+  it('releases the lease it opened', async () => {
+    const c = acquiring(notReady);
+    await acquireLease(c.tool, 'http://localhost:5190/');
+    const last = c.calls.at(-1)?.args;
+    expect((last?.['args'] as Record<string, unknown> | undefined)?.['action']).toBe('release');
+    expect((last?.['args'] as Record<string, unknown> | undefined)?.['sessionId']).toBe('lease-1');
+  });
+
+  it('stops a one-shot verdict before it asserts on a session that is not there', async () => {
+    const c = acquiring(notReady);
+    const result = await runAdhocVerdict({
+      port: 4400,
+      url: 'http://localhost:5190/',
+      predicate: { kind: 'text', contains: 'x' },
+      connect: () => Promise.resolve(c.tool),
+      sessions: () => Promise.resolve([]),
+    });
+    expect(result.code).toBe(1);
+    expect(c.calls.map((x) => x.name)).not.toContain(ReticleTool.ASSERT);
+  });
+
+  // The daemon's hint tells an MCP caller that the tab stays leased. The CLI released it, so it
+  // says that instead.
+  it('says the lease is released, not that the tab stays leased', async () => {
+    const c = acquiring({
+      ...notReady,
+      hint: leaseNotConnectedHint('http://localhost:5190/', 4400),
+    });
+    const got = await acquireLease(c.tool, 'http://localhost:5190/');
+    const said = 'failed' in got ? got.failed.join(' ') : '';
+    expect(said).not.toContain(LEASE_KEPT_SENTENCE);
+    expect(said).not.toMatch(/stays leased/);
+    expect(said.endsWith(LEASE_RELEASED_SENTENCE)).toBe(true);
+  });
+});
+
+/*
+ * `reticle try` and the ad-hoc suite want the finished report, and an explore now answers
+ * `running` when its drive outlasts the call. Asking again by run id is the only way to get it
+ * without paying for a second drive.
+ */
+describe('a Harness drive polled to its end', () => {
+  const text = (body: unknown) => ({ content: [{ type: 'text', text: JSON.stringify(body) }] });
+
+  it('polls by run id until the drive stops running, and never starts another', async () => {
+    const asked: Record<string, unknown>[] = [];
+    const answers = [
+      text({ status: 'running', runId: 'harness-1' }),
+      text({ status: 'running', runId: 'harness-1' }),
+      text({ status: 'done', runId: 'harness-1', stopReason: 'finished' }),
+    ];
+    const caller: ToolCaller = {
+      call: (_name, args) => {
+        asked.push(args);
+        return Promise.resolve(answers.shift());
+      },
+      close: () => Promise.resolve(),
+    };
+    const result = await exploreToEnd(caller, { persona: 'a shopper' }, 600_000, () => 0);
+    expect(result).toEqual(text({ status: 'done', runId: 'harness-1', stopReason: 'finished' }));
+    expect(asked.map((a) => a['runId'] ?? a['persona'])).toEqual([
+      'a shopper',
+      'harness-1',
+      'harness-1',
+    ]);
+  });
+
+  it('hands back the running answer once its budget is spent', async () => {
+    let t = 0;
+    const caller: ToolCaller = {
+      call: () => {
+        t += 100_000;
+        return Promise.resolve(text({ status: 'running', runId: 'harness-2' }));
+      },
+      close: () => Promise.resolve(),
+    };
+    const result = await exploreToEnd(caller, {}, 150_000, () => t);
+    expect(result).toEqual(text({ status: 'running', runId: 'harness-2' }));
+  });
+});
+
+/**
+ * `--expect` waits for its expectation, and the grade is still `reticle_assert`'s (#1533).
+ *
+ * It judged once, about a second after navigating, while the request the predicate named was
+ * usually still in flight. The wait must not cost the verdict its journal, its captured assertion
+ * or its `verifiedReason`, which only `reticle_assert` produces.
+ */
+describe('a one-shot verdict waits for its expectation', () => {
+  /** A daemon that answers each call with the next scripted payload, recording what it was asked. */
+  function scripted(answers: unknown[]) {
+    const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const connect = (): Promise<ToolCaller> =>
+      Promise.resolve({
+        call: (name, args) => {
+          calls.push({ name, args });
+          return Promise.resolve(answers.shift() ?? { structuredContent: { verified: 'yes' } });
+        },
+        close: () => Promise.resolve(),
+      });
+    return { calls, connect };
+  }
+  const expectIt = (timeoutMs: number | undefined, connect: () => Promise<ToolCaller>) =>
+    runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'net', urlContains: '/api/data' },
+      connect,
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    });
+
+  it('grades with one reticle_assert that waits the --timeout budget', async () => {
+    const d = scripted([]);
+    const result = await expectIt(30_000, d.connect);
+    expect(d.calls.map((c) => [c.name, c.args['timeout_ms']])).toEqual([
+      [ReticleTool.ASSERT, 30_000],
+    ]);
+    expect(result.code).toBe(0);
+  });
+
+  it('settles the part of a long budget one assert cannot hold, then asserts', async () => {
+    const d = scripted([
+      { structuredContent: { pass: false, resume_ms: 5_000 } },
+      { structuredContent: { pass: false } },
+    ]);
+    await expectIt(80_000, d.connect);
+    expect(d.calls.map((c) => [c.name, c.args['action'], c.args['timeout_ms']])).toEqual([
+      [ReticleTool.ASSERT, 'wait', 25_000],
+      [ReticleTool.ASSERT, 'wait', 5_000],
+      [ReticleTool.ASSERT, undefined, ASSERT_MAX_WAIT_MS],
+    ]);
+  });
+
+  /*
+   * #2144. The wait went through `reticle_run { tool: "reticle_wait_for" }`, a name that was merged
+   * into `reticle_assert`. A 3.9.0 daemon answered it with "reticle_wait_for was merged into
+   * reticle_assert", so every long `--expect` printed `verified: unknown`.
+   */
+  it('waits through reticle_assert itself, never through a merged name', async () => {
+    const d = scripted([{ structuredContent: { pass: false, resume_ms: 5_000 } }]);
+    await expectIt(80_000, d.connect);
+    const named = d.calls.flatMap((c) => [c.name, c.args['tool']]);
+    expect(named).not.toContain(ReticleTool.WAIT_FOR);
+    expect(named).not.toContain(ReticleTool.RUN);
+  });
+
+  // `reticle_assert` answers in its own shape: a final answer carries `verified`, and only a wait
+  // that the per-call cap stopped carries `resume_ms` without one.
+  it('stops waiting once the wait answers with a verdict', async () => {
+    const d = scripted([{ structuredContent: { verified: 'no', pass: false, resume_ms: 5_000 } }]);
+    await expectIt(80_000, d.connect);
+    expect(d.calls.map((c) => c.args['action'])).toEqual(['wait', undefined]);
+  });
+
+  it('reads a "not yet" that arrived as text', async () => {
+    const d = scripted([
+      { content: [{ type: 'text', text: JSON.stringify({ pass: false, resume_ms: 5_000 }) }] },
+    ]);
+    await expectIt(80_000, d.connect);
+    expect(d.calls.map((c) => [c.args['action'], c.args['timeout_ms']])).toEqual([
+      ['wait', 25_000],
+      ['wait', 5_000],
+      [undefined, ASSERT_MAX_WAIT_MS],
+    ]);
+  });
+
+  // Every surface but the merged one keeps `reticle_wait_for` as a tool of its own, and there
+  // `reticle_assert` has no `action` to take.
+  it('waits through reticle_wait_for on a daemon whose reticle_assert takes no action', async () => {
+    const d = scripted([
+      {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: 'MCP error -32602: Unknown parameter for reticle_assert: action. They were NOT applied.',
+          },
+        ],
+      },
+      { structuredContent: { pass: true, verified: 'yes' } },
+    ]);
+    const result = await expectIt(80_000, d.connect);
+    expect(d.calls.map((c) => c.name)).toEqual([
+      ReticleTool.ASSERT,
+      ReticleTool.RUN,
+      ReticleTool.ASSERT,
+    ]);
+    expect(d.calls[1]?.args).toEqual({
+      tool: ReticleTool.WAIT_FOR,
+      args: { predicate: { kind: 'net', urlContains: '/api/data' }, timeout_ms: 25_000 },
+    });
+    expect(result.code).toBe(0);
+  });
+
+  it('says the refusal when the wait answers one', async () => {
+    const d = scripted([
+      {
+        isError: true,
+        content: [{ type: 'text', text: 'timeout_ms must be at most 600000' }],
+      },
+    ]);
+    const result = await expectIt(700_000, d.connect);
+    expect(result.code).toBe(1);
+    expect(result.lines).toEqual(['verified: unknown', 'timeout_ms must be at most 600000']);
+    expect(d.calls).toHaveLength(1);
+  });
+
+  it('says the refusal when reticle_run answers one as data', async () => {
+    const d = scripted([
+      {
+        isError: true,
+        content: [{ type: 'text', text: 'Unknown parameter for reticle_assert: action.' }],
+      },
+      { structuredContent: { error: 'timeout_ms must be at most 600000' } },
+    ]);
+    const result = await expectIt(700_000, d.connect);
+    expect(result.code).toBe(1);
+    expect(result.lines).toEqual(['verified: unknown', 'timeout_ms must be at most 600000']);
+    expect(d.calls.map((c) => c.name)).toEqual([ReticleTool.ASSERT, ReticleTool.RUN]);
+  });
+
+  it('waits the wait form default when no --timeout is given', async () => {
+    const d = scripted([]);
+    await expectIt(undefined, d.connect);
+    expect(d.calls[0]?.args['timeout_ms']).toBe(4000);
+  });
+
+  it('names the assert cap the tool layer enforces', () => {
+    expect(ASSERT_MAX_WAIT_MS).toBe(MAX_BLOCKING_WAIT_MS);
+  });
+});
+
+/*
+ * #2443. The daemon reached `verified: yes` after the final assert call stopped waiting, and the CLI
+ * printed the raw "Request timed out" error. The agent could not tell why.
+ */
+describe('a final assert that outlives its deadline', () => {
+  const timingOut = (): Promise<ToolCaller> =>
+    Promise.resolve({
+      call: () => Promise.reject(new McpError(ErrorCode.RequestTimeout, 'Request timed out')),
+      close: () => Promise.resolve(),
+    });
+
+  it('prints verified: unknown, names the wait, and gives the next step', async () => {
+    const result = await runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'text', contains: 'Dashboard' },
+      connect: timingOut,
+      timeoutMs: 10_000,
+    });
+    expect(result.code).toBe(1);
+    expect(result.lines).toEqual(assertTimedOutLines(15_000));
+    expect(result.lines.join('\n')).not.toMatch(/Request timed out/);
+    expect(result.lines.join('\n')).toMatch(/--timeout/);
+  });
+
+  it('still reports another failure of the call as it came', async () => {
+    const result = await runAdhocVerdict({
+      port: 4400,
+      predicate: { kind: 'text', contains: 'Dashboard' },
+      connect: () =>
+        Promise.resolve({
+          call: () => Promise.reject(new Error('socket hang up')),
+          close: () => Promise.resolve(),
+        }),
+    });
+    expect(result.lines.join('\n')).toMatch(/socket hang up/);
+  });
+});

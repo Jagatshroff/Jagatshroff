@@ -1,0 +1,95 @@
+use destructive_command_guard::config::Config;
+use destructive_command_guard::evaluator::{EvaluationDecision, MatchSource, evaluate_command};
+use destructive_command_guard::load_default_allowlists;
+use destructive_command_guard::packs::REGISTRY;
+use std::collections::HashSet;
+
+#[test]
+fn test_python_exe_bypass() {
+    let mut config = Config::default();
+    // Ensure heredoc scanning is enabled
+    config.heredoc.enabled = Some(true);
+    // This regression isolates Windows interpreter-name parsing, not the
+    // production latency budget. A cold, highly parallel nextest run can spend
+    // the default 50 ms initializing AST/regex state before this test reaches
+    // the parser, so give the parser proof a deterministic local budget.
+    config.heredoc.timeout_ms = Some(5_000);
+
+    let enabled_packs: HashSet<String> = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let compiled_overrides = config.overrides.compile();
+    let allowlists = load_default_allowlists();
+
+    // Command using python.exe (Windows style)
+    let command = r#"python.exe -c "import shutil; shutil.rmtree('/')""#;
+
+    let evaluate = || {
+        evaluate_command(
+            command,
+            &config,
+            &enabled_keywords,
+            &compiled_overrides,
+            &allowlists,
+        )
+    };
+    let mut result = evaluate();
+
+    // This should be DENIED because it contains shutil.rmtree
+    assert!(
+        result.decision != EvaluationDecision::Allow,
+        "python.exe bypass detected! Command was allowed: {command}"
+    );
+    assert!(result.is_denied());
+
+    // Which layer answers is budget-dependent in an integration test: the AST
+    // matcher keeps its production budget here, and on a loaded host it can
+    // time out and let the legacy fallback deny instead (#476). If `python.exe`
+    // were not recognised as Python, the AST layer would never answer, so a
+    // bounded re-run separates a scheduling miss from that regression.
+    for _ in 0..3 {
+        if result
+            .pattern_info
+            .as_ref()
+            .is_some_and(|info| info.source == MatchSource::HeredocAst)
+        {
+            break;
+        }
+        result = evaluate();
+    }
+    let info = result.pattern_info.as_ref().unwrap();
+
+    // Verify it was blocked by heredoc scanning, not something else
+    assert_eq!(info.source, MatchSource::HeredocAst);
+    assert_eq!(info.pack_id.as_deref(), Some("heredoc.python"));
+    assert_eq!(info.pattern_name.as_deref(), Some("shutil_rmtree"));
+}
+
+#[test]
+fn test_python_versioned_exe_bypass() {
+    let mut config = Config::default();
+    config.heredoc.enabled = Some(true);
+    config.heredoc.timeout_ms = Some(5_000);
+
+    let enabled_packs: HashSet<String> = config.enabled_pack_ids();
+    let enabled_keywords = REGISTRY.collect_enabled_keywords(&enabled_packs);
+    let compiled_overrides = config.overrides.compile();
+    let allowlists = load_default_allowlists();
+
+    // Command using python3.11.exe
+    let command = r#"python3.11.exe -c "import shutil; shutil.rmtree('/')""#;
+
+    let result = evaluate_command(
+        command,
+        &config,
+        &enabled_keywords,
+        &compiled_overrides,
+        &allowlists,
+    );
+
+    assert!(
+        result.decision != EvaluationDecision::Allow,
+        "python3.11.exe bypass detected! Command was allowed: {command}"
+    );
+
+    assert!(result.is_denied());
+}

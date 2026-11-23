@@ -1,0 +1,213 @@
+/**
+ * What the pool drives, stated as interfaces and nothing else.
+ *
+ * A leaf: `storage-seed.ts` needs four of these shapes and had to import them back out of
+ * `browser-pool.ts`, which imports IT. Real Playwright `Page`/`BrowserContext`/`Browser` satisfy
+ * these structurally, which is how the pool stays testable without a real Chromium.
+ */
+
+import type { RealInputArgs, RealInputResult } from '@/portal/input/real-input.js';
+import type { LeaseEmulation, LeaseMedia } from './lease-emulation.js';
+import type { ScriptCoverage } from '@/portal/input/js-coverage.js';
+
+/** JS coverage on one page: start it, and take what ran since the previous take. */
+export interface PooledCoverage {
+  /** False when the page cannot measure coverage. */
+  start(): Promise<boolean>;
+  /** Undefined when coverage was not running; the first take does not start it. */
+  take(): Promise<ScriptCoverage[] | undefined>;
+}
+
+/** The minimal page surface the pool drives. Real Playwright `Page` satisfies this. */
+export interface PooledPage {
+  goto(url: string, opts?: { timeoutMs?: number }): Promise<unknown>;
+  close(): Promise<void>;
+  /** Fires when THIS page's renderer crashes — lets the pool reclaim just this lease, not the fleet. */
+  onCrash(handler: () => void): void;
+  /**
+   * Fires for each console message the page logs. OPTIONAL: a fake that does not implement it makes
+   * the pool record nothing, which is the correct degradation — an absent dial address must read as
+   * "the page said nothing", never as "the page dialled correctly".
+   */
+  onConsole?(handler: (text: string) => void): void;
+  /**
+   * Fires for each error the page threw with no handler for it — an import-time module throw
+   * included. OPTIONAL like `onConsole`: a fake without it makes the pool hear nothing, which
+   * degrades to the old behaviour instead of inventing an error nobody reported. The handler must
+   * be installed BEFORE the first navigation — an import-time throw lands during `goto`, and a
+   * listener attached after it reads a broken page as healthy (#1966).
+   */
+  onPageError?(handler: (error: PooledPageError) => void): void;
+  /**
+   * Capture the page as a PNG, or a JPEG at `jpegQuality` (a live picture, where size matters more). OPTIONAL, like `onConsole`: a fake that does not implement it makes
+   * the pool report "no provider", which is the correct degradation — an absent screenshotter must
+   * read as "this context cannot be captured", never as a blank image that a visual diff would then
+   * compare against and pass.
+   */
+  screenshot?(opts?: ScreenshotOptions): Promise<Uint8Array>;
+  /**
+   * Move the real pointer to (x, y) so CSS `:hover` applies. OPTIONAL, like `screenshot`: a fake
+   * that does not implement it makes hover refuse rather than dispatch a synthetic mouseover that
+   * reports dispatched/settled while the styles never ran.
+   */
+  hover?(x: number, y: number): Promise<void>;
+  /**
+   * Press a key with the real keyboard; it goes to whatever holds focus. OPTIONAL, like `hover`: a
+   * page without it keeps the in-page dispatcher, whose synthetic Tab moves no focus.
+   */
+  press?(args: RealInputArgs): Promise<RealInputResult>;
+  /**
+   * Reload the page with the browser cache ignored for the document and every subresource, as
+   * Cmd+Shift+R does. OPTIONAL: without it a hard reload can only re-fetch the document (#1785).
+   */
+  reloadIgnoringCache?(): Promise<void>;
+  /** Set prefers-color-scheme and prefers-reduced-motion. OPTIONAL: without it the media stay. */
+  emulateMedia?(media: LeaseMedia): Promise<void>;
+  /** Evaluate a script in the page's current document. OPTIONAL: without it no reader is injected. */
+  evaluate?(script: string): Promise<unknown>;
+  /** Add an init script to run after document creation but before any page scripts run. */
+  addInitScript?<Arg>(
+    script: ((arg: Arg) => void) | string,
+    arg?: Arg,
+  ): Promise<InitScriptHandle | void>;
+  /**
+   * Install (or clear) network mocks on this page. OPTIONAL: a fake that does not implement it
+   * makes `reticle_network_mock` refuse rather than claiming it stubbed a request it cannot intercept.
+   */
+  installMocks?(rules: readonly PooledMockRule[]): Promise<void>;
+  /**
+   * Answer every request this page sends through `decide`: a string refuses it (403, the string as
+   * the error), undefined lets it go. OPTIONAL, like `installMocks`. A production drive uses it so a
+   * refused request never reaches the live service.
+   */
+  guardRequests?(decide: (method: string, url: string) => string | undefined): Promise<void>;
+  /**
+   * Resize this page's viewport. OPTIONAL, like `installMocks`: a fake that does not implement it
+   * makes `reticle_viewport` refuse rather than claim a resize the page never took.
+   *
+   * A lease IS a real browser page, so the resize was always possible — the tool simply had no route
+   * to it and consulted only the driven-provider path. On an SDK-only install there is no such
+   * provider, so mobile-only UI (a `lg:hidden` hamburger, a drawer that only mounts under a
+   * breakpoint) could not be driven at all without installing Playwright separately.
+   */
+  setViewport?(size: { width: number; height: number }): Promise<void>;
+  /**
+   * Fires when the page opens a native `window.confirm`/`alert`/`prompt`. OPTIONAL, like `onConsole`:
+   * a fake that does not implement it means the pool cannot see or arbitrate the dialog, and the
+   * page is left to whatever the underlying engine does with no listener attached.
+   *
+   * The pool always dismisses on this handler (see `acquire`) — a page blocked on a native dialog
+   * previously wedged the whole session (every subsequent tool call timed out and no recovery
+   * existed short of restarting the daemon), because nothing in the stack ever answered it.
+   */
+  onDialog?(handler: (dialog: PooledDialog) => void): void;
+  /**
+   * Make this the visible tab. OPTIONAL, like `onDialog`: a page opened beside others can start
+   * hidden, and a hidden tab throttles timers and rAF so nothing on it verifies (#1351).
+   */
+  bringToFront?(): Promise<void>;
+  /**
+   * JS coverage of this page. OPTIONAL, like `installMocks`: a page without it makes the
+   * coverage tool refuse rather than report that no code ran.
+   */
+  jsCoverage?: PooledCoverage;
+}
+
+/** A native dialog the page opened, handed to the pool so it can be dismissed instead of left blocking. */
+export interface PooledDialog {
+  /** The dialog's message text — kept for diagnostics (`BrowserPool#lastDialogMessage`). */
+  readonly message: string;
+  /** `alert`, `confirm`, `prompt` or `beforeunload`, as the engine names it. Absent: not known. */
+  readonly kind?: string;
+  dismiss(): Promise<void>;
+}
+
+/**
+ * One uncaught error the page threw, as the engine reported it. The message is the exception text
+ * without the console's `Uncaught ` prefix; the stack is present when the engine had one.
+ */
+export interface PooledPageError {
+  readonly message: string;
+  readonly stack?: string;
+}
+
+export interface InitScriptHandle {
+  dispose(): Promise<void>;
+}
+
+export interface PooledCookie {
+  name: string;
+  value: string;
+  url?: string;
+  domain?: string;
+  path?: string;
+  expires?: number;
+  httpOnly?: boolean;
+  secure?: boolean;
+  sameSite?: 'Strict' | 'Lax' | 'None';
+}
+
+/**
+ * One interception rule the pool can install. Same fields as the drive-path mock rule, kept here so
+ * the pool does not import Playwright.
+ */
+export interface PooledMockRule {
+  urlContains: string;
+  method?: string;
+  status?: number;
+  body?: string;
+  contentType?: string;
+  delayMs?: number;
+  abort?: boolean;
+  /** Send the request on to this origin; the path and query stay (see network-mock.ts). */
+  forwardTo?: string;
+}
+
+/** An isolated browsing context (cookies/storage). Real Playwright `BrowserContext` satisfies this. */
+export interface PooledContext {
+  newPage(): Promise<PooledPage>;
+  close(): Promise<void>;
+  addCookies?(cookies: PooledCookie[]): Promise<void>;
+  /**
+   * Grant browser permissions on this context. OPTIONAL, like `addCookies`: a context that cannot
+   * grant makes a lease that asked for permissions refuse, rather than open with none granted while
+   * the caller believes otherwise.
+   */
+  grantPermissions?(permissions: string[], opts?: { origin?: string }): Promise<void>;
+  /** Drop every permission granted on this context. OPTIONAL, for the same reason. */
+  clearPermissions?(): Promise<void>;
+  /**
+   * Add `origin` to the `connect-src` of each top document's CSP, and call `onWidened` when that
+   * changed a response (see `csp-widen.ts`). OPTIONAL: without it a deployed page with a strict CSP
+   * blocks the reader, and the lease says `sdk_never_dialled`, which is true.
+   */
+  widenCsp?(origin: string, onWidened: () => void): Promise<void>;
+}
+
+/** The launched browser. Real Playwright `Browser` satisfies this. */
+export interface PooledBrowser {
+  isConnected(): boolean;
+  /**
+   * `ignoreHTTPSErrors` accepts a self-signed or local-CA certificate for this context only.
+   * `jsCoverage` starts JS coverage on each page before its first script runs.
+   */
+  newContext(
+    opts?: { ignoreHTTPSErrors?: boolean; jsCoverage?: boolean } & LeaseEmulation,
+  ): Promise<PooledContext>;
+  close(): Promise<void>;
+  /** Fires when the browser process dies/crashes so the pool can relaunch on the next acquire. */
+  onDisconnected(handler: () => void): void;
+}
+
+/** Produces a freshly launched browser. Injected so tests can supply a fake. */
+export type Launcher = () => Promise<PooledBrowser>;
+
+/** How a page is captured: the whole page or the viewport, and JPEG at a quality instead of PNG. */
+export interface ScreenshotOptions {
+  fullPage?: boolean;
+  jpegQuality?: number;
+  /** One image pixel per CSS pixel, so a high-density display does not double a step screenshot. */
+  cssScale?: boolean;
+  /** One region of the page, in CSS pixels: what `reticle_screenshot { clip | ref }` asked for. */
+  clip?: { x: number; y: number; width: number; height: number };
+}

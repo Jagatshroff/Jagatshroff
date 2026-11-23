@@ -1,0 +1,215 @@
+---
+title: Telemetry
+description: 'The complete description of the usage data Reticle collects, what it is for, and how to turn it off.'
+icon: chart-line
+---
+
+Reticle sends usage counters (which commands ran, which tools an agent called, whether a verification produced a verdict) and nothing from the app under test. To turn it off permanently, run `npx @reticlehq/server telemetry disable`.
+
+This page is the complete description of what is collected. If something is not listed here, it is not sent.
+
+## The short version
+
+- **No name, no email, no account.** The events do not carry who you are, and we do not try to find out. Two fields can connect events to an organization: the workspace id of a project you linked, and the licence id of a licensed build. See [the fields on every event](#what-is-sent).
+- **No code, no app data.** Nothing from the app under test (no DOM, no network traffic, no console output, no source, no file paths) ever leaves your machine.
+- **The one exception is feedback you deliberately send us**, and it is never collected passively. See [Feedback](#feedback) below.
+- **Opt out any time**, permanently, with one command:
+
+  ```bash
+  npx @reticlehq/server telemetry disable
+  ```
+
+## What is sent
+
+Twenty-five kinds of events, each a single small JSON object. This is the whole list, and it is the same list the code enumerates:
+
+| Event | When | Extra data |
+| --- | --- | --- |
+| `reticle_installed` | The first real command Reticle runs on a machine. `--version`, `--help` and `telemetry` do not count | Which published install route you came through, declared by that route with `RETICLE_INSTALL_SOURCE` and never inferred, and `unknown` when nothing declared one |
+| `cli_command_run` | You run a `reticle` command | Which subcommand (`verify`, `status`, …) and which flags were present, by name |
+| `daemon_started` | The local daemon starts | n/a |
+| `daemon_stopped` | The local daemon stops | A summary of the session; see below |
+| `session_progress` | Periodically, from a daemon that is still running | The same summary as `daemon_stopped`, marked `final: false`. It exists so a long session is not invisible until it exits |
+| `app_instrumented` | The first time your app's SDK connects in a given daemon run | Whether `reticle init` ran in this folder, whether an agent was already attached, how long the daemon ran before the app connected, and whether this is the first app ever on this machine and project. It is the second half of the install funnel: registering the MCP server is one thing, getting the SDK into a running page is another |
+| `verification_completed` | A verification produces a verdict | Whether it passed, whether Reticle refused to call a passing check verified, **why** the verdict came out that way, and the version of the Reticle SDK in the page; see below |
+| `project_profiled` | Once per daemon start | The shape of the project; see below |
+| `version_changed` | Reticle starts on a version that differs from the last start on this machine, or you update or roll back | The two version numbers, which direction, and whether an agent had been told about the new version |
+| `runtime_crashed` | The daemon hits an uncaught error | The error's type, **Reticle's own** stack frames, and the message with variables stripped; see below |
+| `mcp_client_connected` | An agent's MCP server attaches to the daemon. A proxy that reconnects does not send it again | Whether this daemon had an agent before, how long the daemon had been up, the client's name from its handshake, whether an app was already connected, and the random id of the process that gives the agent its tools |
+| `mcp_connection_lost` | The agent's MCP tools go away, or come back | Which stage (`first`, `recovered` when the link came back on its own, or `budget_spent` when it stopped retrying), the cause from a closed list, the socket error code from a closed list, the attempt count, how many tool calls in flight the drop killed, and the random id of the process that gives the agent its tools. **Each stage is sent at most once per proxy process** (once for a planned daemon exit and once for a fault), because a reconnect loop can fire many times in a row and an event each would bill for the pathology instead of measuring it. The planned idle exit of the daemon sends no `first` row |
+| `mcp_proxy_exited` | The process that gives your agent its Reticle tools ends | Why it ended (`stdin_end`, `idle`, `client_gone_storm`, `wake_failed`), how long it ran, and two counts: how many times it lost the daemon and how many tool calls it carried, with its random id. Never what the calls were |
+| `daemon_died_unclean` | Reticle finds that an earlier daemon stopped without a clean exit | How long that daemon had run. Nothing else |
+| `wake_refused` | Reticle will not use the daemon port it found, because something else holds it | Whether the holder was another program (`foreign`) or a Reticle daemon for another project (`other_project`). Never the port or the project |
+| `onboarding_step` | One step of getting set up begins, finishes, fails, is skipped, or is walked away from | Which phase (`install`, `onboard`, `first_run`), which step, what became of it, how long it took, and the framework. The step name comes from a closed list we define -- it can only ever be one of the names in `core/src/onboarding.ts`, so nothing you typed or any path on your disk can arrive in it. `unattended` says whether anybody was asked anything. A step that failed can carry why setup stopped, also from a closed list (`no_node`, `node_too_old`, `no_web_app`, `dev_server_failed`, `chromium_unavailable`, and so on) |
+| `init_completed` | `reticle init` finishes | Whether it worked, a classified reason when it did not, and which published install route you came through, DECLARED by that route via `RETICLE_INSTALL_SOURCE` and never inferred, and `unknown` when nothing declared one |
+| `bug_found` | Reticle finds a defect in the app under test | The **kind** of defect (`signal-contradicted`, `console-error`, …) and how it was found, never what it was found in |
+| `tool_refused` | A tool cannot do what an agent asked | Which tool, why (one of six buckets: no session, no match, unsupported, bad arguments, not ready, other), the cause inside the bucket as a name from a closed list (such as `chromium_missing` or `throttled`), and whether the same call was retried. **Never the message**, because a refusal interpolates whatever you asked for, so only the tool name and the bucket are sent. Capped at 50 per daemon run |
+| `feedback_submitted` | **Only** when you or your agent explicitly send feedback | The report; see [Feedback](#feedback). The AGENT's call does not wait for the network: the receipt says `accepted` (validated, redacted, queued), never `sent`, and a delivery that then fails is reported back on the agent's next tool result. `reticle feedback` typed by a human still waits, because a person at a terminal is owed the real answer |
+| `hud_viewed` | You open a page of the in-page HUD (Agent Log, Flows, Notes, Harness, Impact, Settings) or its account menu | Which page, from a closed list, and how many tabs had a HUD (a bucket: `1`, `2-3`, and so on). The same page opened again within 30 seconds counts once for the whole daemon run, also after a reload. The Agent Log that the HUD opens by itself when a page loads is not a view |
+| `hud_signin_prompted` | The HUD shows you a sign-in or "link this project" prompt | Which prompt (`rail`, `harness` or `header`), once per prompt for each daemon run |
+| `platform_linked` | A project on this machine is linked to a Reticle workspace | How (`connect`, `hud` or `link`) and the workspace's id; see [The platform side](#the-platform-side) |
+| `harness_run` | A Reticle Harness run starts, and again when it ends | Who started it (`agent`, `hud`, `dashboard`, `cli_try`, `plan`), whether the platform drove it, and at the end how it went (`proved`, `not_proved`, `failed`, `blocked`, `stopped`), how many journeys it answered and replayed, as buckets, and for a `blocked` or `failed` run why it did not drive, from a closed list (`not_linked`, `harness_off`, `no_credits`, and so on) |
+| `gate_completed` | `reticle gate` ends | How it ended (`pass`, `fail`, `nothing_to_check`, `regression` or `error`) and how many saved flows it judged. Never a flow name or a file path |
+| `identified` | **Never** from this version. Only an earlier version's `reticle identify`, which has been removed | What you chose to tell us then; see [Telling us who you are](#telling-us-who-you-are) |
+
+**There is no per-tool-call event.** Tool usage is counted in memory and leaves once, inside `daemon_stopped`, as a histogram like `{"reticle_act": 40, "reticle_assert": 12}`. That is counts of tool NAMES from a fixed list we define, never arguments, results, selectors, or URLs.
+
+**Parameter and flag NAMES are collected; their VALUES are not.** We record that `reticle_act` was called with `ref` and `action`, and that you ran `reticle serve --headed --port`. We do not record what you set them to. This distinction is the whole safety property, and it is absolute for CLI flags: `--http-token` holds a secret, `--drive` holds a URL, `--storage-state` holds a file path, so no flag value is ever sent. For tool parameters there is one narrow exception: a short, explicit allowlist of parameters whose values are enums _we_ defined (`action: "click"`, and the name of the Reticle tool that `reticle_run` calls), listed in [`argument-shape.ts`](https://github.com/reticlehq/reticle/blob/main/server/src/telemetry/argument-shape.ts). A value outside that allowlist reports as `other`, so a future schema change cannot quietly start forwarding free text. `reticle_act`'s `args` (the text being typed into your app, which on a login form is a password) is **never** in that allowlist.
+
+`daemon_stopped` carries: how long the session ran, how many tool calls and of which tools, how many of those calls came before an app connected, the version of the Reticle SDK in the last page that connected, how long each tool took (total and worst case), how many failed, how many verifications ran, browser/lease connection attempts with their failure causes, and which MCP clients connected (`claude-code`, `cursor`). It also carries how the in-page HUD was used: presses per control (`hudControls`, by the control's name from a closed list Reticle defines, a toggle as `name:on` / `name:off`), how long the HUD sat as a bubble, collapsed or open and on which page (`hudViewMs`, `hudPanelMs`), which rail slides were shown (`hudSlides`), and the order of those presses and views, cut at 60 (`hudJourney`). Control names, never anything typed or shown on the page.
+
+It also carries a snapshot of the **machine's** state (our own process's memory, free and total system RAM, load average and CPU count), taken at shutdown and again on any crash. This is what separates "your machine ran out of memory" from "Reticle has a bug", which otherwise produce identical-looking failures. No hostname, no username, no paths, no process list.
+
+### Why a verdict came out that way
+
+`verification_completed` carries the **clause** that decided the verdict, from a fixed list we define: `proved`, `contradicted`, `assertion_failed`, `already_true`, `hidden_match`, `unclean_capture`, `vacuous_grade`, `nothing_declared`, `outcome_pending`, `outcome_unread`, `unsettled`, `evidence_incomplete`, `absence_blind_spot`, `observation_lost`, `window_closed_early`, `dialog_declined`, `inconclusive`, `version_skew`, `capability-absent`.
+
+It exists because `verified: "unknown"` covered seven different situations belonging to three different owners (your app, your agent, and Reticle's own blind spots), and they arrived as one value. It is a **name from our own vocabulary**, never a description of your app: `contradicted` says two channels disagreed, not which ones, about what, or on which page.
+
+When the clause is `unclean_capture`, one further name says which of our losses caused it: `buffer_loss` (our server's event buffer), `transport_gap` (our browser-side queue), `journal_loss` (our on-disk event ledger reached its size cap), `blind_spot` (a boundary in the page, such as a cross-origin frame), or `other`. All five are facts about **Reticle's** ability to observe, not about what it observed. This field is how we found that Reticle was refusing to answer over windows that were completely intact.
+
+### Bugs Reticle finds
+
+When Reticle catches a defect in the app it is verifying, it records **that a class of defect was found**, never what it was found in. The event carries the kind (`signal-contradicted`, `duplicate-request`, `console-error`, …) and how it surfaced, and nothing else: no selector, no URL, no element, no description of your app or its behaviour.
+
+This is the number we use to say whether Reticle works at all, and the one we would publish. It is counted conservatively on purpose: a defect explained by a contradiction is not also counted as a failed assertion, because an inflated number would be worse than none.
+
+### Errors and crashes
+
+The SDK that runs inside your page reports its own failures too: an observer that could not start, a patch that would not install. It does this over the **local bridge it is already connected to**; the SDK still makes no outbound request of its own, and the daemon decides what (if anything) is reported onward. What travels is our module name (`network_observer`), the error type, and the message with variables stripped, never your page's URL, and never anything from your app.
+
+Errors are grouped by a **hash of the error's shape**, with every variable part removed first, so `no baseline named 'checkout-v3'` and `no baseline named 'login'` become one anonymous group and neither flow name is sent. Alongside the hash we send that stripped shape (`no baseline named *`) and the tool that produced it, because a hash on its own can be counted but never understood.
+
+A crash additionally carries **Reticle's own stack frames** (`resolveAnchor@act-tools.js:142`), plus the tool that was running, the preceding tool names, and the Node version and CPU architecture. Those frames are our published npm code, readable by anyone who unpacks the tarball.
+
+**Stack frames belonging to your application are dropped entirely**, along with node internals. In the example below only the two Reticle frames survive; your file, your function, and your home directory do not:
+
+```
+at doCheckout (/Users/ada/secret-app/src/checkout.tsx:42:9)   ← dropped
+at resolveAnchor (…/@reticlehq/server/dist/tools/act-tools.js:142:19)   ← sent
+```
+
+**One narrow exception, for the crash that otherwise says nothing.** A refused connection (`connect ECONNREFUSED`) has a stack that is _entirely_ node internals, so the rule above correctly keeps nothing and the report arrives with no location at all. Those crashes now also carry the failing **syscall** (`connect`), the **errno** (`ECONNREFUSED`), whether the target was **loopback** (one boolean), whether the port was **one of Reticle's own** (the enum `reticle` / `other`), and the innermost frame naming **Node's own source** (`node:net:1637`).
+
+The address and the port number are used to compute those two answers and are then discarded; neither is ever sent. The Node frame is a line in Node's published source, not yours: it says a connect failed rather than a DNS lookup, and carries nothing about your machine, your app, or your directory layout. The frame is included **only** when the crash is a system error and no Reticle frame survived: the report that would otherwise be blind.
+
+`project_profiled` carries: the framework and its major version, a size **bucket** (`tiny` … `huge`, never a file count), whether it is a monorepo, its age in whole **weeks**, how many saved flows/baselines/runs exist, and which Reticle feature families have been used. It also carries whether the project has git at all, whether it has ever been pushed (`none` / `local_only` / `remote`), and which forge hosts it: `github`, `gitlab`, `bitbucket`, `azure`, `sourcehut`, `codeberg`, or just `self_hosted` for anything else. A private git host is usually `git.<company>.com`, so self-hosted repos report **only** that they are self-hosted, never the hostname.
+
+This is how we learn whether people are getting value from the whole product or only a corner of it. No file names, no paths, no flow names, no dependency list.
+
+Every event carries the same few fields:
+
+| Field | What it is | What it is not |
+| --- | --- | --- |
+| `anonymousId` | A random UUID minted locally on first run, stored at `~/.reticle/telemetry-id` | Not derived from your name, email, hardware, or anything else about you |
+| `projectId` | A SHA-256 hash of the git origin URL, or of the directory path outside a repo | Not the URL or the path. We use it to count _distinct_ projects. A hash cannot be turned back into a URL, but anyone who has a URL can hash it and compare: for a public repository, the id can be matched to the repository. Hashing the origin means one repo counts once instead of once per teammate and per clone |
+| `actor` | Whether a person or an agent caused this: a typed `reticle` command is a person, an MCP tool call is the agent | Not a claim about _why_. Whether you asked your agent to verify, or it decided to, lives in a prompt Reticle never sees, and we do not guess |
+| `sessionId` | A random id for this daemon run, held in memory and never written to disk | Not a device id and not persistent: a restarted daemon gets a new one. It only groups one run's own events together |
+| `accountState` / `linked` | Whether this machine is signed out, signed in, or signed in with this project linked to a workspace | Not who is signed in: read from whether a sign-in file exists, never from what is in it |
+| `workspaceId` | Only once this project is linked: the Reticle workspace's id, the `orgId` in `.reticle/cloud.json` | Not the workspace's name and not your email. It is the one key the Reticle platform can join this usage to the workspace you created there; see [The platform side](#the-platform-side) |
+| `licenseId` | Only on a licensed (enterprise) build: the id of the licence key it runs with, sent as the event's `organization` group | Not sent by an open-source install. Our licence records connect each licence id to the company that holds the key, so these events are not anonymous to us |
+| `client` | Which coding agent the event came from, from a closed list (`claude_code`, `cursor`, `codex`, and so on, or `other`) | Not the name your agent sent: a name we do not list arrives as `other` |
+| `launch` | How `reticle` was started: `npx`, `global`, `project` or `other` | Not the path it was started from; only the bucket leaves |
+| `projectIdSource` | Whether `projectId` came from a shared git origin or from the local directory path | Not the origin or the path. It exists so we can tell when "how many people share this project" is a real measurement. Outside a pushed repo there is nothing shared to hash, so those rows always show one user |
+| `version` | The Reticle version running | n/a |
+| `os` | The platform (`darwin` / `linux` / `win32`) | Not the OS version, hostname, or hardware |
+| `ci` | Whether the run is inside CI | n/a |
+| `internal` | `true`, only on the Reticle team's own machines and test runs, which set it on purpose | Not set for anybody else, and never guessed from a name, an email or a path |
+
+There are no IP-based profiles, no cookies, no fingerprinting, and no person profiles: events are processed in "personless" mode, so they are never joined into a person profile.
+
+Your IP address is not stored, and no location is found from it. Each event tells PostHog not to look up a location (`$geoip_disable: true`). Each event also sets `$ip` to `0.0.0.0`, so PostHog does not store the address the request came from. Events from older versions do not do this.
+
+## The platform side
+
+When you sign in to Reticle and link a project, the platform (a separate service, with its own analytics) knows your email and your workspace, because you gave them to it. The open-source runtime never sends either. Once a project is linked, its events carry the workspace's id and nothing else about the account, so the two sides can be joined per workspace on that id. Emails stay on the platform side only. Unlinked, nothing in these events refers to an account at all.
+
+The sign-in page Reticle opens also says where the sign-in started (`from=terminal` or `from=hud`), so the platform can tell which one brought you in.
+
+## What is never sent
+
+Your code. Your app's DOM, network requests or responses, console logs, application state, or screenshots. File paths, project names, or git remote URLs. Your name or email, except a reply address that you give with [feedback](#feedback). Any account identifier, with two exceptions: the workspace id of a project you linked, and the licence id of a licensed build, both above. Environment variables. Anything typed into the app under test. The names of your flows, baselines, or tests. Error messages, and any stack frame belonging to your application.
+
+A few of these are worth being explicit about, because they are the ones a product team is most tempted by:
+
+- **We do not send your project's name or its GitHub URL.** `projectId` is a hash of the URL. It lets us count distinct projects and see that a project came back next week. We do not use it to find the repository. The hash is not a secret: for a public repository, anyone who has the URL can compute the same id.
+- **We do not try to work out who you work for.** No domain sniffing, no email inference, no matching a repo against a company. If you _want_ us to know, [email us](#telling-us-who-you-are).
+- **We do not record what you asked your agent to verify.** The `verification_completed` event knows that a verification happened and how it turned out. The prompt behind it is not something Reticle can see, and we do not reconstruct it.
+
+## Feedback
+
+Reticle verifies apps for AI agents, and for a long time it had no way to hear when it got something wrong. An agent would hit a tool that misbehaved, work around it, and that knowledge would vanish at the end of the turn. The feedback channel is the fix, and because it is the only part of Reticle that transmits words someone wrote, it gets stricter rules than everything above.
+
+**It is never passive.** There is no code path that sends feedback on its own. A `feedback` event exists only because one of these happened:
+
+| Who | How | What it carries |
+| --- | --- | --- |
+| Your agent | Calls the `reticle_session { action: "feedback" }` MCP tool (after a failure, **or to ask for a feature**) | What it wrote: an analysis, or a request with the goal behind it, what would improve, and how it works around the gap today. Plus the model it is running, which it tells us because MCP cannot. If it gives a call trail, only the Reticle tool names and verdict words in it are kept. Everything else in the trail is removed before it is sent |
+| You | Run `npx @reticlehq/server feedback [--rating 1-5] [--bug] [--contact you@example.com] "your words"` | Your words and your rating, and your reply address if you give one |
+| Your agent, before Reticle works | Runs `npx @reticlehq/server feedback --agent --kind <bug\|gap\|ambiguity\|feature_request\|improvement\|experience> "what happened"` | The same words, filed from the shell. This exists for the phase where there is no daemon and no MCP tools (a failed `init`, half-finished wiring), which is the failure we are otherwise never told about |
+
+Agents are instructed, in the tool description itself, never to include app source, secrets, or user data, and to describe the failure in their own words instead.
+
+**It is redacted before it leaves your machine.** Emails, credentials in URLs, `Authorization` headers and API-key assignments, recognizable vendor tokens (`sk-…`, `ghp_…`, `AKIA…`, `xoxb-…`, JWTs), and home-directory paths are stripped and replaced with `[redacted]`. This runs client-side, in [`feedback.ts`](https://github.com/reticlehq/reticle/blob/main/server/src/telemetry/feedback.ts), so you can read exactly what it removes rather than take our word for it. It is a safety net, not a guarantee: it cannot catch a secret that looks like an ordinary sentence, which is why the instruction above comes first.
+
+**A reply address is sent only when you give it.** `--contact you@example.com` on `reticle feedback` adds one email address so that the maintainers can answer you. Your agent can pass one on with `contact`, but only an address that you typed for this purpose. It must not guess one or reuse one from somewhere else. The address goes as `feedback_contact` on that one report. It is not redacted, because you gave it to be read. Without `--contact` or `contact`, no address is sent.
+
+**It shows you what it sends.** `reticle feedback` prints the exact payload before transmitting, and names any redaction rule that fired.
+
+Alongside the report, a feedback event carries context about the environment it came from, never about you:
+
+| Field | Example | Why |
+| --- | --- | --- |
+| `stack` / `stackMajor` | `next` / `15` | Which frameworks a bug actually affects. Major version only |
+| `runtime` | `web`, `electron`, `tauri` | Desktop bugs look nothing like browser bugs |
+| `engine` | `blink`, `gecko`, `webkit` | Coarse bucket, never the user-agent string |
+| `driver` | `cdp`, `sdk` | Whether Reticle drove the page or observed your own browser |
+| `client` / `clientVersion` | `claude-code` / `1.0.0` | The MCP client's own name and version from its handshake |
+| `mcpScope` | `user`, `project` | How Reticle is registered |
+| `kind` | `bug`, `gap`, `ambiguity`, `feature_request`, `improvement`, `experience` | A defect, a blind spot, an undecidable verdict, a thing that does not exist, a thing that exists but is awkward, or a human's overall take |
+
+Plus the `version`, `os`, and `ci` fields every event carries. No paths, no project name, no dependency list, no user-agent string.
+
+**It has its own off switch.** To keep the usage counters but never send free text:
+
+```bash
+RETICLE_FEEDBACK=0
+```
+
+Every switch in [Your choices](#your-choices) disables feedback too. If telemetry is off, feedback is off, and `reticle feedback` will tell you so rather than silently discard what you wrote.
+
+## Telling us who you are
+
+Nothing above names you, and no command adds your name: `reticle identify`, which used to, has been removed, and this version never sends an `identified` event. If you want support, an enterprise licence, or to be a design partner, email hey@reticle.sh.
+
+An identity sent by an earlier version with `reticle identify` stays linked to that machine's anonymous id until you ask for it to be removed: email hey@reticle.sh.
+
+## Where it goes
+
+Events are sent over HTTPS to [PostHog](https://posthog.com) (US cloud), a product-analytics service acting as our data processor, and are used only in aggregate (counts, retention curves, tool popularity). We do not sell or share this data.
+
+## Your choices
+
+Telemetry is on by default and Reticle tells you so the first time it runs: once, in one line, with a pointer to this page. To see the current state at any time:
+
+```bash
+npx @reticlehq/server telemetry status
+```
+
+Three ways to opt out, in whatever form fits your setup:
+
+| Method | Scope |
+| --- | --- |
+| `reticle telemetry disable` | This machine, permanently (until `reticle telemetry enable`) |
+| `RETICLE_TELEMETRY=0` | Wherever the variable is set; handy for CI or a fleet-wide profile |
+| `DO_NOT_TRACK=1` | The [cross-tool convention](https://consoledonottrack.com), which Reticle honors |
+
+Opting out changes nothing about how Reticle works. A failed or blocked telemetry send never delays, alters, or fails a command either; sends are best-effort and asynchronous by design.
+
+To also remove the locally stored random id, delete `~/.reticle/telemetry-id`.
+
+## A note on data protection
+
+The data described above is designed not to identify you: the only identifier is a locally minted random UUID, the project reference is a one-way hash, and no personal data is collected. We collect it on the basis of our legitimate interest in understanding and improving Reticle, we minimize what is collected to the fields listed here, and we honor every opt-out signal above. If you believe something in this design falls short of that intent, please open an issue. That is a bug, and we will treat it as one.
+
+Any change to what is collected will be listed on this page and called out in the release notes of the version that introduces it.

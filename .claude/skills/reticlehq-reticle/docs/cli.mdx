@@ -1,0 +1,333 @@
+---
+title: CLI reference
+description: Every reticle command. What it does, what it prints, and what it exits with. Captured from real runs.
+icon: terminal
+---
+
+The `reticle` CLI installs Reticle into a project and proves the install works (`init`), runs and diagnoses the daemon your app connects to (`status`, `doctor`, `stop`, `restart`), and gates a build on verification in CI (`verify`, `affected`, `gate`). This page is the index; each command has its own page with real captured output and measured exit codes.
+
+The CLI is mostly for you, not your agent. Your agent talks MCP; you use these to set things up, work out why nothing connected, and wire verification into CI.
+
+```bash
+npx @reticlehq/server <command>
+```
+
+<Warning>
+  If you used the installer, run `reticle <command>`: it put that bin on your PATH. Otherwise use
+  `npx @reticlehq/server <command>`. Do not put `npx` before the bare `reticle` bin name: the npm
+  package with that name belongs to an unrelated author.
+</Warning>
+
+<Note>
+  Every output block on this page was captured by running the command. Where an exit code is quoted,
+  it was measured, not assumed. The CLI emits each structured line as one line of JSON; the blocks
+  below are pretty-printed so you can read them, and long lists are trimmed where the label says so.
+</Note>
+
+## Every command
+
+`reticle --help` prints the short list, grouped the way you meet the commands. `reticle help all` prints every command, and `reticle <command> --help` prints one command's detail.
+
+### Get started
+
+| Command | What it does | Page |
+| --- | --- | --- |
+| `reticle init` | Wire Reticle into this project, boot the app, prove a session connected | [init](/cli/init) |
+| `reticle connect [--project <name\|id>] [--workspace <name\|id>] [--url <origin>]` | Wire if needed, sign in, link this folder to a cloud project (created if it does not exist) in the workspace named (else the one you are signed in to, said when you belong to several), send local history | [cloud](/cli/cloud) |
+| `reticle try <url> [--persona <who>]` | Signed in: one free Harness drive of a URL, in a window you watch, then which journeys work | [try](/cli/try) |
+
+### Check your app
+
+| Command | What it does | Page |
+| --- | --- | --- |
+| `reticle verify <url>` | One-shot: drive the URL, verify saved flows or one predicate, exit 0 on pass | [verify](/cli/verify) |
+| `reticle compare <reference-url> <candidate-url> [--base <url>] [--state <file>] [--json] [--report <file>]` | Drive two running builds the same way and list each difference in what users see; exit 0 same, 1 different, 2 invalid | [compare](/cli/compare) |
+| `reticle grade <snapshot\|judge\|tables\|suggest> [flags]` | Grade a finished run of an app from snapshots of its stored data, and check its final answer; exit 0 pass, 1 fail, 2 unverified | [grade](/cli/grade) |
+| `reticle gate [--since <ref>] [--accept-coverage] [--hook]` | Exit non-zero unless passing artifacts cover the affected flows | [gate](/cli/gate) |
+| `reticle gate --list [--since <ref>]` | Which saved flows must re-verify for the changed files | [affected](/cli/affected) |
+
+### Reticle on this machine
+
+| Command | What it does | Page |
+| --- | --- | --- |
+| `reticle status [--json]` | Is the daemon up, which pages connected, who is signed in, is this repo linked, which license is active | [status](/cli/status) |
+| `reticle doctor` | Find what is wrong with the setup (Chromium, daemon, port, agent link), and what is missing from coverage | [doctor](/cli/doctor) |
+| `reticle open [url]` | Show the app: reuse the connected tab, else open one | [open](/cli/open) |
+| `reticle stop [--force]` | Stop the daemon we started; `--force` frees the port by its listener, never the agent's MCP proxy | [stop](/cli/stop) |
+| `reticle update [--rollback]` | Install the latest server version and restart; `--rollback` restores the previous one | [update](/cli/update) |
+
+### Account
+
+| Command | What it does | Page |
+| --- | --- | --- |
+| `reticle logout [--url <u>]` | Sign out of one host; others stay signed in | [cloud](/cli/cloud#reticle-logout) |
+| `reticle feedback` | Tell us what worked and what did not | [feedback](/cli/feedback) |
+| `reticle telemetry [status\|enable\|disable]` | Anonymous usage metrics: what is sent, and the switch | [telemetry](/cli/telemetry) |
+
+### More commands (`reticle help all`)
+
+| Command | What it does | Page |
+| --- | --- | --- |
+| `reticle sync [--watch] [--move-history]` | Send what has not synced yet; `--watch` keeps going; `--move-history` also sends the runs, flows and records made under the folder's previous link | [cloud](/cli/cloud#reticle-sync) |
+| `reticle runs [<runId>]` | The linked project's recent runs, or one of them | [cloud](/cli/cloud#reticle-runs) |
+| `reticle runs regression` | Which flows broke; exits `3` if any did | [cloud](/cli/cloud#reticle-runs-regression) |
+| `reticle runs share <runId>` | Mint a public proof link for one run | [cloud](/cli/cloud#reticle-runs-share) |
+| `reticle runs issues [--fix <fp>]` | The triage queue; `--fix` prints one issue's fix prompt | [cloud](/cli/cloud#reticle-runs-issues) |
+| `reticle runs memory` | What the linked project has learned | [cloud](/cli/cloud#reticle-runs-memory) |
+| `reticle config` | Choose what syncs: runs, memory, flows; where verification runs | [cloud](/cli/cloud#reticle-config) |
+| `reticle hook [status\|install\|uninstall]` | The prompt hook: is each prompt captured here, add it, or remove exactly what was added | [prompt capture](/prompt-capture#reticle-hook) |
+| `reticle setup mcp` | Register the MCP server with your coding agents (the installer's registration half) | [setup](/cli/setup) |
+| `reticle serve [--restart]` | Start the daemon and wait for it to bind; `--restart` frees the port first | [serve](/cli/serve) |
+| `reticle mcp` | The MCP stdio proxy your agent runs; starts the daemon if needed | [mcp](/cli/mcp) |
+| `reticle drive <url>` | Foreground mode, for debugging | [drive](/cli/drive) |
+| `reticle context --compact [--session <id>]` | Resume after a compaction: what was proved, failed and is still owed | none |
+| `reticle report [--session <id>] [--hook]` | What the latest session claimed, and what held | [report](/cli/report) |
+| `reticle version` | Print the version | [version](/cli/version) |
+| `reticle help [all\|<command>]` | Usage: the short list, every command, or one command | [help](/cli/help) |
+
+### Renamed and removed
+
+The old names below still work for one release and print one line naming the new one.
+
+| Old                | Now                         |
+| ------------------ | --------------------------- |
+| `reticle affected` | `reticle gate --list`       |
+| `reticle license`  | `reticle status`            |
+| `reticle rollback` | `reticle update --rollback` |
+| `reticle restart`  | `reticle serve --restart`   |
+
+These names were removed. Each prints what to use instead and exits `1`.
+
+| Removed | Use |
+| --- | --- |
+| `reticle kill` | `reticle stop --force` |
+| `reticle login`, `reticle link` | `reticle connect`. Sign-in is only in the browser, with Google or GitHub. Without a browser, set `RETICLE_API_KEY` |
+| `reticle project` | `reticle connect --project <name\|id>` |
+| `reticle whoami` | `reticle status` |
+| `reticle push` | `reticle sync` |
+| `reticle regression`, `share`, `issues`, `memory` | `reticle runs regression`, `runs share`, `runs issues`, `runs memory` |
+| `reticle watch` | `reticle gate --list` or `reticle gate` |
+| `reticle tutorial` | `reticle init` or `reticle try <url>` |
+| `reticle identify` | `reticle feedback` |
+| `reticle hunt`, `reticle capsules` | nothing. Saved capsules stay in `.reticle/capsules` |
+
+## Setup and diagnosis
+
+### `reticle connect`
+
+From an app directory, one command wires an unwired app, proves a browser session, signs in through browser approval if needed, links the chosen cloud project, and syncs existing local history. A saved sign-in is reused only after the intended cloud host accepts it. Run `reticle init` instead for local-only verification.
+
+```bash
+npx @reticlehq/server connect --project "My App"
+```
+
+For a self-hosted cloud, add `--url <cloud origin>`. If the app was already wired, `connect` keeps its local setup and refreshes the cloud link. A fresh app has no run to send until you verify a flow with your agent.
+
+### `reticle init`
+
+Wires Reticle into the project in the current directory, then boots the app and proves a session connected. It exits non-zero if nothing connected, and prints what is left to do. It does not drive: proving a flow is the FIRST RUN, which your agent drives with `reticle_act_and_wait` and an `until` on its last step, or, with a linked project, `reticle verify <url> --explore --persona "<who does what>"`.
+
+```
+reticle init  [--env KEY=VALUE]... [--app <dir>] [--license <key>]
+              [--json] [--files-only] [--relaunch] [--no-open] [--no-agents]
+              [--url <app url>] [--timeout S] [--dry-run] [--hooks]
+              [--port N] [--no-mcp] [--no-install] [--start]
+              [--capture-bodies] [--no-first-run] [--new-id] [--no-prompt-capture]
+```
+
+`--env` and `--app` are the answers the command cannot work out for itself: what the app needs to reach a usable state, and which app in a monorepo. Which journey proves what you care about is asked on the first run, as `--persona`. `--files-only` is what `init` did before it learned to boot the app: it still registers the MCP server and pre-approves Reticle's tools, so it doubles as the upgrade path for an existing install.
+
+<Card title="Full walkthrough with real output" icon="wand-magic-sparkles" href="/install-agentic">
+  What it writes, and how to read its five status marks.
+</Card>
+
+### `reticle doctor`
+
+The first thing to run when something is wrong. One command, the whole setup.
+
+```bash
+npx @reticlehq/server doctor
+```
+
+```
+reticle doctor
+  node         v22.14.0
+  chromium     ✓ installed (chromium-1234)
+  daemon       ✓ running on :4400 (pid 72698, v3.8.0)
+  sessions     ✓ 1 page connected
+  bridge port  4400  (your app must dial THIS port, not your dev-server port)
+  agent link   ✓ an MCP client attached here and called tools before (a record, not a live check)
+  project      ✓ wired here (my-app)
+  daemon log   /Users/you/.reticle/daemon-4400.log
+  tracing      RETICLE_TRACE=1 on the daemon for per-stage timings in that log
+```
+
+Exits `0`. That parenthetical about the bridge port is doing a lot of work. Mixing it up with the dev-server port is the most common setup failure there is.
+
+### `reticle status`
+
+Whether the daemon is up, which apps have connected, who is signed in, and whether this repo is linked to a cloud project.
+
+```text
+reticle status
+  daemon       ✓ running on :4400 (pid 90790)
+  sessions     ✓ 1 page connected
+               http://localhost:4310/
+  agent link   ✓ your agent has read and used Reticle's tools
+```
+
+Add `--json` for the same facts as one machine-readable event line. See [`reticle status`](/cli/status) for the fields.
+
+Exits `0`. A session listed means the SDK reached the page. Setup is finished when the first run returns a verdict.
+
+### `reticle telemetry [status|enable|disable]`
+
+```bash
+npx @reticlehq/server telemetry status
+```
+
+```
+telemetry    disabled  (this is a Reticle source checkout; developing it is not using it)
+policy       https://github.com/reticlehq/reticle/blob/main/docs/telemetry.md
+```
+
+<Card title="Exactly what is collected" icon="chart-line" href="/telemetry">
+  The complete list, and how to turn it off.
+</Card>
+
+## Running the app
+
+| Command | What it does |
+| --- | --- |
+| `reticle serve` | Start the daemon and wait for it to bind. `--drive <url>`, `--headless`, `--headed`, `--http`, `--http-port N`, `--http-token T` |
+| `reticle stop` | Stop the daemon we started, by its recorded pid. `--quiet` |
+| `reticle stop --force` | Free the port by asking who is **listening** on it |
+| `reticle serve --restart` | Free the port, then start a daemon and wait for a real bind. `--force` |
+| `reticle open [url]` | Show the app. Reuse the connected tab, or open one |
+| `reticle drive <url>` | Foreground mode, for debugging |
+| `reticle mcp` | The MCP stdio proxy. Auto-starts the daemon if needed. This is what your agent runs |
+
+A bare `reticle` with no arguments is not help. In a project that `init` wired, it is `reticle serve`. In a folder that Reticle has not wired, it gives a first verdict with no agent and no `init`. It finds the folder's web app (it starts the dev script when the app does not run), or the one dev server that runs on this computer. It opens the page in a Reticle browser and checks four things: the page loads, no console error, no failed request, and each same-origin link opens (8 at most). It prints `verified: yes` or `verified: no` with each fault, and exits 0 only for `yes`. A page that goes to a sign-in page is verified up to there. It stops the dev server it started.
+
+<Note>
+  When the Reticle SDK installed in the project is a different **major** version from the CLI you ran,
+  the CLI hands the same command to `npx @reticlehq/server@<that version>`, so an unpinned
+  `npx @reticlehq/server` never pairs a daemon with an SDK it cannot talk to. `init`, `update`,
+  `update --rollback`, `setup install`, `version` and `help` always run as typed, and so does a command whose
+  version you pinned yourself (`npx @reticlehq/server@<version> …`). Set `RETICLE_NO_VERSION_MATCH=1` to
+  turn it off. Because `--help` runs as typed too, it describes the CLI you ran. When the command it
+  describes would run at the project's version instead, the help opens with a line naming that version.
+</Note>
+
+<Note>
+  `reticle verify` works whether or not a daemon is running. With none, it starts its own browser on
+  the bridge port. With one, it replays the saved flows (or answers `--expect`) through that daemon.
+  Only `--headed` and `--storage-state` need their own browser, so with a daemon running those two
+  refuse and say so. Do not stop the daemon to get around it: that cuts your agent's MCP link. Point
+  `verify` at a free port with `--port N` instead.
+</Note>
+
+## Verification
+
+### `reticle verify <url>`
+
+One-shot: drive the URL, replay the saved flows, exit `0` on pass. This is the command for CI when you do not want a model in the loop.
+
+```bash
+npx @reticlehq/server verify http://localhost:5173 --timeout 60000
+```
+
+Options:
+
+- `--headed`, `--timeout N`, `--port N`.
+- `--storage-state <file>`: verify flows behind a login without scripting the login every time.
+- `--session-id <id>`: use a tab that is already connected.
+- `--select <label>`: verify only flows carrying this label. Repeatable.
+- `--expect '<json predicate>'` or `--expect-file <path>`: one verdict, no saved flows needed. Asks the running daemon; with none, it refuses. Waits up to `--timeout` ms (default `4000`) for the predicate to come true. Exits `0` only on `verified: "yes"`.
+- `--explore` with `--persona "<who does what>"`: no saved flows yet? The Harness drives the app and records them. Needs a linked project (`reticle connect`).
+- `--results-json <file>`: also write one verdict per journey as JSON, for CI.
+- `--confirm-dangerous`: let this run press what the replay guard holds as destructive.
+
+### `reticle gate --list`
+
+Which saved flows must re-verify for a set of changed files. It checks nothing.
+
+```bash
+npx @reticlehq/server gate --list --since HEAD~1
+```
+
+```json
+{
+  "t": "2026-08-15T18:42:57.431Z",
+  "event": "reticle_affected",
+  "changedFiles": ["SKILL.md", "docs/cli/doctor.mdx", "init/src/agent-rules.ts"],
+  "affected": ["WEB-flow", "deploy-journey", "verify-modal", "verify-route"],
+  "unknownProvenance": ["WEB-flow", "deploy-journey", "verify-modal", "verify-route"]
+}
+```
+
+Both lists are trimmed here; the real run named 47 flows.
+
+<Note>
+  `unknownProvenance` lists flows Reticle could not map to source files, so it includes them to be
+  safe. A flow recorded before provenance tracking existed has no file list, and Reticle would
+  rather re-run it than skip it and miss a regression. A large `unknownProvenance` means your flows
+  predate the feature. Re-record the ones you care about to get precise selection.
+</Note>
+
+### `reticle gate`
+
+The CI gate. Exits non-zero unless passing artifacts cover the affected flows.
+
+```bash
+npx @reticlehq/server gate --since HEAD~1
+```
+
+```json
+{
+  "t": "2026-08-15T18:42:58.434Z",
+  "event": "reticle_gate",
+  "pass": false,
+  "uncovered": ["WEB-flow", "deploy-journey", "verify-modal", "verify-route"],
+  "quarantined": ["asserted-demo", "blast-radius-compose", "drift-demo", "qa2-flow"],
+  "coverage": { "pct": 0, "covered": 0, "total": 47 }
+}
+```
+
+Measured exit code: **`1`**, with the flow lists trimmed above. That run genuinely failed, with 0 of 47 flows covered, which is what a gate is supposed to do when you have not verified anything yet.
+
+`quarantined` flows are excluded from the pass/fail decision. Quarantine is for a flow that is known flaky and being fixed; it is not a place to hide failures, because the list is printed on every run.
+
+## Maintenance
+
+| Command                     | What it does                                                 |
+| --------------------------- | ------------------------------------------------------------ |
+| `reticle update`            | Install the latest server version and restart                |
+| `reticle update --rollback` | Restore the previous version and restart                     |
+| `reticle status --json`     | Carries `license`: active, eval, missing, expired or invalid |
+| `reticle version`           | Print the version                                            |
+| `reticle help`              | The short list; `help all` for every command                 |
+
+<Tip>
+  `rollback` exists because an auto-updating dev tool that cannot go back is a dev tool that can
+  ruin your afternoon. It restores the previous version and restarts in one step.
+</Tip>
+
+## Feedback
+
+```bash
+# humans
+npx @reticlehq/server feedback "what worked, what didn't"
+
+# humans who want a reply: one email address, sent only when you give it
+npx @reticlehq/server feedback --contact you@example.com "what worked, what didn't"
+
+# agents, including from a setup that never finished
+npx @reticlehq/server feedback --agent --kind <bug|gap|ambiguity|feature_request|improvement|experience> "what happened"
+```
+
+The `--agent` form matters more than it looks: the setup that failed halfway is exactly the setup worth hearing about, and in that state the MCP tools do not exist yet.
+
+<Card title="How feedback is handled" icon="comments" href="/tools/session-and-feedback">
+  What each kind means, and what happens when a report cannot be delivered.
+</Card>

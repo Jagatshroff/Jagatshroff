@@ -1,0 +1,402 @@
+/**
+ * The apps this machine has connected, told to the platform so its chat can list them by name.
+ *
+ * The chat used to ask for a `localhost` address, and an address names nothing: two projects on
+ * `localhost:3000` are one address, and one project restarted on another port is two. So an app here
+ * is a project checkout on a machine, keyed by a hash of both, and its address is only where it was
+ * last open. Neither the project's path nor the home directory leaves the machine, only their hash.
+ *
+ * Every few seconds, with or without an app open, each linked project's credential reports its apps.
+ * The answer can name apps somebody asked to bring back (opened here, headless) and say a drive is
+ * waiting, which is how a daemon with nothing open hears about one without polling every few seconds.
+ */
+import { createHash } from 'node:crypto';
+import { relative, sep } from 'node:path';
+import {
+  LinkReportKey,
+  type CoverageCapability,
+  LinkPath,
+  type LinkAppGap,
+  type LinkDevServer,
+  type LinkHelloFailure,
+  type LinkUnsyncedRoot,
+  PLATFORM_LINK_VERSION,
+  RETICLE_URL_PARAM,
+  parseLinkNotices,
+  type LinkCapability,
+  type LinkNotice,
+} from '@reticlehq/core';
+import { pickDriveSession, type DriveCandidate } from './remote-drive.js';
+
+/** How often apps are reported. The platform counts an app live for two and a half of these. */
+export const LOCAL_APPS_REPORT_MS = 10_000;
+const REQUEST_TIMEOUT_MS = 10_000;
+/** How long a drive waits for an app it opened to connect before it is refused. */
+export const APP_OPEN_WAIT_MS = 20_000;
+const APP_OPEN_POLL_MS = 250;
+const KEY_LENGTH = 16;
+/** The shell a plain browser tab reports: not worth a word on a card that says what it is built with. */
+const WEB_RUNTIME = 'web';
+
+export interface Platform {
+  url: string;
+  apiKey: string;
+}
+
+export interface Machine {
+  id: string;
+  name: string;
+}
+
+/** One connected tab, as far as reporting and picking go. */
+export interface AppTab extends DriveCandidate {
+  title?: string;
+  projectId?: string;
+  adapters: string[];
+  runtime?: string;
+  /** The SDK the page announced. The dashboard compares it with `reticleVersion` per app. */
+  sdkVersion?: string;
+  /** The page's HELLO channels, plus the coverage markers (`source`, `testid`) it earned. */
+  channels?: string[];
+  /** Instrumentation gaps this tab's verdicts recorded, newest first. */
+  gaps?: LinkAppGap[];
+  /** Coverage capabilities that do not apply to this app. */
+  notApplicable?: CoverageCapability[];
+}
+
+export interface ReportedApp {
+  key: string;
+  name: string;
+  url: string;
+  title?: string;
+  stack: string[];
+  sdkVersion?: string;
+  channels?: string[];
+  gaps?: LinkAppGap[];
+  adapters?: string[];
+  notApplicable?: CoverageCapability[];
+}
+
+/** What a report carries beside its apps. Every field additive; see `LinkReportKey`. */
+export interface ReportExtras {
+  devServers?: LinkDevServer[];
+  helloFailure?: LinkHelloFailure;
+  unsynced?: LinkUnsyncedRoot[];
+}
+
+/** `path` under `home` as `~/...`, so no home directory leaves the machine in a report. */
+export function homeRelative(path: string, home: string): string {
+  const inside = relative(home, path);
+  if (0 === inside.length) return '~';
+  if (inside.startsWith('..') || inside.startsWith(sep) || /^[a-zA-Z]:/.test(inside)) return path;
+  return `~/${inside.split(sep).join('/')}`;
+}
+
+const hash = (text: string): string =>
+  createHash('sha256').update(text).digest('hex').slice(0, KEY_LENGTH);
+
+/** This machine: a stable id that is not its home path, and the name a person knows it by. */
+export const machineOf = (hostname: string, home: string): Machine => ({
+  id: hash(`${hostname}\u0000${home}`),
+  name: hostname.replace(/\.local$/i, ''),
+});
+
+/**
+ * One project checkout on one machine. Its port is not part of it. The tab's projectId is: a daemon
+ * that cannot map a project to its checkout files every such project under one shared directory.
+ */
+export const appKeyOf = (
+  machineId: string,
+  projectDir: string,
+  projectId: string | undefined,
+): string => hash(`${machineId}\u0000${projectDir}\u0000${projectId ?? ''}`);
+
+const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/** What a refused open is told. */
+export const NOT_AN_APP_ADDRESS =
+  'Reticle only opens a web address on this machine or one of the apps already open here.';
+
+/**
+ * Whether the daemon may open an address the platform named: a web page on this machine, or one on
+ * an origin a connected tab already has. Never a file, and never anywhere else on the network.
+ */
+export function mayOpen(url: string, openUrls: readonly string[]): boolean {
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return false;
+  }
+  if ('http:' !== target.protocol && 'https:' !== target.protocol) return false;
+  if (LOOPBACK_HOSTS.has(target.hostname) || target.hostname.endsWith('.localhost')) return true;
+  return openUrls.some((open) => {
+    try {
+      return new URL(open).origin === target.origin;
+    } catch {
+      return false;
+    }
+  });
+}
+
+/** A project id as a name: the SDK stamps `<package>-<8 hex>`, and the hash means nothing to a person. */
+export const nameFromProjectId = (projectId: string): string =>
+  projectId.replace(/-[0-9a-f]{8}$/, '');
+
+const RETICLE_MARKS = new Set<string>(Object.values(RETICLE_URL_PARAM));
+
+/** The address as the app knows it: the params Reticle put on it to adopt a tab are not the app's. */
+export const withoutMarks = (raw: string): string => {
+  try {
+    const url = new URL(raw);
+    for (const mark of [...url.searchParams.keys()])
+      if (RETICLE_MARKS.has(mark)) url.searchParams.delete(mark);
+    return url.href;
+  } catch {
+    return raw;
+  }
+};
+
+/** Every channel either tab announced, once each; undefined when neither said. */
+function mergedChannels(
+  a: readonly string[] | undefined,
+  b: readonly string[] | undefined,
+): string[] | undefined {
+  return a === undefined && b === undefined
+    ? undefined
+    : [...new Set([...(a ?? []), ...(b ?? [])])];
+}
+
+/** Every gap either tab recorded, once per kind + missing, the first seen kept. */
+function mergedGaps(
+  a: readonly LinkAppGap[] | undefined,
+  b: readonly LinkAppGap[] | undefined,
+): LinkAppGap[] {
+  const out = new Map<string, LinkAppGap>();
+  for (const gap of [...(a ?? []), ...(b ?? [])]) {
+    const id = `${gap.kind}\u0000${gap.missing}`;
+    if (!out.has(id)) out.set(id, gap);
+  }
+  return [...out.values()];
+}
+
+/** `app` carrying the merged channels and gaps, omitting each when there is nothing to say. */
+function withSeen<T extends object>(
+  app: T,
+  channels: string[] | undefined,
+  gaps: LinkAppGap[],
+): T & { [LinkReportKey.CHANNELS]?: string[]; [LinkReportKey.GAPS]?: LinkAppGap[] } {
+  return {
+    ...app,
+    ...(channels === undefined ? {} : { [LinkReportKey.CHANNELS]: channels }),
+    ...(0 === gaps.length ? {} : { [LinkReportKey.GAPS]: gaps }),
+  };
+}
+
+/**
+ * The apps to report, grouped by the platform credential each one's project is linked with. The
+ * linked credential is reported even with no app open: it is how the chat knows the machine is there
+ * to open one. A tab whose project is not linked is left out: no chat can drive it.
+ */
+export async function appsByPlatform(
+  tabs: readonly AppTab[],
+  linked: Platform | undefined,
+  machineId: string,
+  describe: (tab: AppTab) => Promise<{ platform?: Platform; dir: string; name: string }>,
+): Promise<{ platform: Platform; apps: ReportedApp[] }[]> {
+  const groups = new Map<string, { platform: Platform; apps: Map<string, ReportedApp> }>();
+  const group = (platform: Platform) => {
+    const id = `${platform.url}\u0000${platform.apiKey}`;
+    const found = groups.get(id) ?? { platform, apps: new Map<string, ReportedApp>() };
+    groups.set(id, found);
+    return found;
+  };
+  if (undefined !== linked) group(linked);
+  // A visible tab speaks for its project over a hidden one.
+  const ordered = [...tabs].sort((a, b) => Number(a.hidden) - Number(b.hidden));
+  for (const tab of ordered) {
+    const about = await describe(tab).catch(() => undefined);
+    if (undefined === about?.platform) continue;
+    const key = appKeyOf(machineId, about.dir, tab.projectId);
+    const apps = group(about.platform).apps;
+    // Of two tabs of one app, the one that has seen the most speaks for it (a tie keeps the earlier,
+    // so a visible one still speaks over a hidden one). What they have SEEN is merged, so the setup
+    // score does not depend on which tab happened to report: a fresh tab opened beside a driven one
+    // once dropped it and locked the Harness.
+    const held = apps.get(key);
+    const channels = mergedChannels(held?.[LinkReportKey.CHANNELS], tab.channels);
+    const gaps = mergedGaps(held?.[LinkReportKey.GAPS], tab.gaps);
+    if (
+      held !== undefined &&
+      (tab.channels?.length ?? 0) <= (held[LinkReportKey.CHANNELS]?.length ?? 0)
+    ) {
+      apps.set(key, withSeen(held, channels, gaps));
+      continue;
+    }
+    const stack = [
+      ...new Set([...tab.adapters, ...(tab.runtime === undefined ? [] : [tab.runtime])]),
+    ].filter((part) => WEB_RUNTIME !== part);
+    apps.set(key, {
+      key,
+      name: about.name,
+      url: withoutMarks(tab.url),
+      ...(tab.title === undefined ? {} : { title: tab.title }),
+      stack,
+      ...(tab.sdkVersion === undefined ? {} : { sdkVersion: tab.sdkVersion }),
+      ...(0 === tab.adapters.length ? {} : { [LinkReportKey.ADAPTERS]: tab.adapters }),
+      ...(tab.notApplicable === undefined
+        ? {}
+        : { [LinkReportKey.NOT_APPLICABLE]: tab.notApplicable }),
+      ...withSeen({}, channels, gaps),
+    });
+  }
+  return [...groups.values()].map(({ platform, apps }) => ({ platform, apps: [...apps.values()] }));
+}
+
+type FetchLike = (url: string, init: RequestInit) => Promise<Response>;
+
+export interface AppReportDeps {
+  machine: Machine;
+  version: string;
+  /** What this daemon can do for the platform: it offers a person only what is here. */
+  capabilities: readonly LinkCapability[];
+  apps: () => Promise<{ platform: Platform; apps: ReportedApp[] }[]>;
+  /**
+   * Open an app so it connects: one somebody asked to bring back, named by its app key so the tab
+   * writes into that app's own `.reticle`. A throw is logged, never fatal.
+   */
+  open: (url: string, appKey?: string) => Promise<void>;
+  /** A drive is waiting for the project this credential is for. */
+  drivePending: (platform: Platform) => void;
+  /** Dev servers, the last refused hello and unsent runs: read once per report. */
+  extras?: () => Promise<ReportExtras>;
+  /**
+   * Something the platform wants the person told ("update Reticle"), for the project this credential
+   * is for. Called once per notice for the daemon's life, however often the platform repeats it.
+   */
+  notify?: (notice: LinkNotice, platform: Platform) => void;
+  fetch?: FetchLike;
+  intervalMs?: number;
+  log?: (line: string) => void;
+}
+
+export interface AppReports {
+  tick: () => Promise<void>;
+  stop: () => void;
+}
+
+export function startAppReports(deps: AppReportDeps): AppReports {
+  const doFetch: FetchLike = deps.fetch ?? ((url, init) => fetch(url, init));
+  let busy = false;
+  /** Notices already shown, by what they say: the platform repeats them on every report. */
+  const told = new Set<string>();
+  const tick = async (): Promise<void> => {
+    if (busy) return;
+    busy = true;
+    try {
+      const extras = (await deps.extras?.().catch(() => undefined)) ?? {};
+      for (const { platform, apps } of await deps.apps()) {
+        try {
+          const res = await doFetch(`${platform.url}${LinkPath.APPS}`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              authorization: `Bearer ${platform.apiKey}`,
+            },
+            body: JSON.stringify({
+              machine: deps.machine,
+              reticleVersion: deps.version,
+              protocol: PLATFORM_LINK_VERSION,
+              capabilities: deps.capabilities,
+              apps,
+              ...(extras.devServers === undefined
+                ? {}
+                : { [LinkReportKey.DEV_SERVERS]: extras.devServers }),
+              ...(extras.helloFailure === undefined
+                ? {}
+                : { [LinkReportKey.HELLO_FAILURE]: extras.helloFailure }),
+              ...(extras.unsynced === undefined
+                ? {}
+                : { [LinkReportKey.UNSYNCED]: extras.unsynced }),
+            }),
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+          });
+          if (!res.ok) continue;
+          const answer = (await res.json()) as {
+            wake?: unknown;
+            pendingDrive?: unknown;
+            notices?: unknown;
+          };
+          for (const notice of parseLinkNotices(answer.notices)) {
+            const key = `${platform.apiKey}\u0000${notice.text}`;
+            if (told.has(key)) continue;
+            told.add(key);
+            deps.notify?.(notice, platform);
+          }
+          const open = new Set(apps.map((app) => app.key));
+          for (const wake of Array.isArray(answer.wake) ? answer.wake : []) {
+            const { key, url } = (wake ?? {}) as { key?: unknown; url?: unknown };
+            if ('string' !== typeof key || 'string' !== typeof url || open.has(key)) continue;
+            open.add(key);
+            deps.log?.(`reticle: opening ${url}, asked for from the platform chat`);
+            await deps.open(url, key).catch((error: unknown) => {
+              deps.log?.(`reticle: could not open ${url}: ${String(error)}`);
+            });
+          }
+          if (true === answer.pendingDrive) deps.drivePending(platform);
+        } catch {
+          // Offline, or the platform is down: the next report tries again.
+        }
+      }
+    } catch {
+      // The credentials could not be read: nothing to report this time.
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(() => void tick(), deps.intervalMs ?? LOCAL_APPS_REPORT_MS);
+  timer.unref();
+  const reports: AppReports = {
+    tick,
+    stop: () => {
+      clearInterval(timer);
+      if (running === reports) running = undefined;
+    },
+  };
+  running = reports;
+  return reports;
+}
+
+/** The daemon's running reports. ponytail: one per daemon, the last one started. */
+let running: AppReports | undefined;
+
+/**
+ * Report now rather than on the next tick: the Harness gate just learned what an app's pages carry,
+ * and the platform, which locks a drive on its last report, would otherwise refuse on the old one.
+ */
+export const reportAppsNow = (): Promise<void> => running?.tick() ?? Promise.resolve();
+
+/**
+ * The tab a drive the chat attached to one app uses: a tab of that app and no other, even on the
+ * same port. None open: open the app, and wait for it to connect. Null when it never does.
+ */
+export async function pickAppTab(
+  app: { key: string; url: string | null },
+  goal: string,
+  tabs: () => readonly AppTab[],
+  keyOf: (sessionId: string) => string | undefined,
+  open: (url: string) => Promise<void>,
+  waitMs = APP_OPEN_WAIT_MS,
+): Promise<string | null> {
+  const ofApp = (): AppTab[] => tabs().filter((tab) => keyOf(tab.sessionId) === app.key);
+  const now = pickDriveSession(ofApp(), goal);
+  if (now !== undefined) return now;
+  if (null === app.url) return null;
+  await open(app.url).catch(() => undefined);
+  for (let waited = 0; waited <= waitMs; waited += APP_OPEN_POLL_MS) {
+    const opened = pickDriveSession(ofApp(), goal);
+    if (opened !== undefined) return opened;
+    await new Promise((resolve) => setTimeout(resolve, APP_OPEN_POLL_MS));
+  }
+  return null;
+}

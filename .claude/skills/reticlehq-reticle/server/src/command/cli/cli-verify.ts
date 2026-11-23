@@ -1,0 +1,992 @@
+/**
+ * `reticle verify <url>` — one-shot, non-MCP verification. It boots the engine in drive mode (Reticle owns
+ * a browser pointed at the preview URL), waits for the in-page SDK to dial back, replays every saved
+ * flow, renders the verdict, and exits 0 on pass / 1 otherwise. The same ReticleRunner + verdict the MCP
+ * and HTTP paths use — so a platform/CI agent that can only run a shell command (Lovable, Emergent,
+ * GitHub Actions) gets a byte-identical artifact without speaking MCP.
+ *
+ * The orchestration (runVerify) is split from the live wiring (openLiveConnection) behind VerifyPorts,
+ * so the decision logic — including the two honesty guards (no session, no flows ⇒ never a green pass)
+ * — is unit-tested without launching a real browser.
+ */
+
+import { cliRunAuthor } from '@/judgement/runs/verification-sync.js';
+import { join, basename } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { noSessionMessage } from './verify-no-session.js';
+import { runAdhocVerdict } from './adhoc-verdict.js';
+import { callerArtifactRoot } from '@/memory/project/link-directory.js';
+import { verifyResults } from './verify-results.js';
+import { writeFile } from 'node:fs/promises';
+import { runAdhocExplore, runAdhocSuite } from './adhoc-suite.js';
+import {
+  cutOffReason,
+  exploreApp,
+  harnessAvailable,
+  MSG_NO_HARNESS_KEY,
+  withLinkedCredential,
+} from '@/surface/tools/harness-explore.js';
+import { linkedCloudPort } from '@/memory/cloud/cloud-config.js';
+import { CONNECT } from '@/surface/tools/platform-moment.js';
+import { resolveSuiteSelection } from '@/language/flows/suite-selection.js';
+import { projectOnly } from '@/memory/project/session-root.js';
+import {
+  configuredPairingToken,
+  nodePairingTokenDeps,
+  readOrCreatePairingTokenSync,
+  defaultPairingTokenDir,
+} from '@/portal/bridge/pairing-token.js';
+import { randomUUID } from 'node:crypto';
+import {
+  MCP_SSE_PATH,
+  MCP_MESSAGE_PATH,
+  RETICLE_DEFAULT_PORT,
+  ReticleEnv,
+  bridgeWsUrl,
+  isLoopbackHostname,
+  ReticleDir,
+  RunFramework,
+  RunProfile,
+  VerdictStatus,
+  VerifyPhase,
+  type ReticleVerificationRun,
+} from '@reticlehq/core';
+import { start, type RunningServer } from '@/index.js';
+import {
+  probePresence,
+  describePresence,
+  PortPresence,
+} from '@/command/daemon/binding/port-presence.js';
+import { EXPECT_FLAG } from './cli-parse-grammar.js';
+import { probeDaemon } from '@/surface/mcp/mcp-proxy.js';
+import { fetchStatus, summarizeStatus } from '@/command/daemon/binding/daemon-status-probe.js';
+import {
+  cloudFetch,
+  createProgressReporter,
+  syncProgressToCloud,
+  syncRunToCloud,
+  SyncOutcome,
+  type CloudConfig,
+} from '@/memory/cloud/cloud-sync.js';
+import { readProjectId } from './ports/resolve/cli-port.js';
+import { linkedRunsCloudPort, resolveProjectCloud } from '@/memory/cloud/cloud-config.js';
+import { readDashboardUrl } from '@/memory/project/sync-status.js';
+import { seeRunLine } from '@/memory/project/sync-status.js';
+import { homedir } from 'node:os';
+import { ReticleRunner, type VerifyProgressListener } from '@/judgement/runs/reticle-runner.js';
+import { createRunnerPort } from '@/judgement/runs/runner-port.js';
+import { RunStore } from '@/judgement/runs/artifact/run-store.js';
+import { renderRunReport } from '@/judgement/runs/artifact/render-report.js';
+import { BaselineStore } from '@/memory/project/baselines.js';
+import { RecordingStore } from '@/language/flows/recording/tape/recordings.js';
+import { FlowStore } from '@/language/flows/flows.js';
+import { ProjectStore } from '@/memory/project/project-store.js';
+import { AnnotationStore } from '@/language/flows/stores/annotation-store.js';
+import { createNodeFileSystem } from '@/memory/project/fs/fs-port.js';
+import type { SessionManager } from '@/portal/session/session-manager.js';
+import type { ToolDeps } from '@/surface/tools/tool-kit.js';
+
+const EXIT_PASS = 0;
+const EXIT_FAIL = 1;
+const DEFAULT_SESSION_TIMEOUT_MS = 15_000;
+const SESSION_POLL_MS = 250;
+const DEFAULT_PROJECT_NAME = 'app';
+
+/**
+ * The project a verify run is named for: the dashboard project this checkout is linked to, else the
+ * id its `.reticle.json` carries, else the folder. A CI run read "ci-repo" on a dashboard whose
+ * project, and the repo's own committed config, said `web-ci`.
+ */
+export function verifyProjectName(
+  linked: string | null,
+  configured: string | undefined,
+  folder: string,
+): string {
+  return linked ?? configured ?? (folder || DEFAULT_PROJECT_NAME);
+}
+
+const MSG_NO_FLOWS =
+  'No saved flows to verify (.reticle/flows is empty), so refusing to report a pass for verifying nothing.\n' +
+  '  Flows are recorded interactively by an agent (reticle_record{action:"start"} → act → reticle_flow_save via the\n' +
+  '  MCP tools), then committed to .reticle/flows/. In CI, check those files in and re-run `reticle verify`.\n' +
+  '  Or let Reticle record them for you: `reticle verify <url> --explore` drives the app itself and saves what it\n' +
+  '  drove, so every run after the first one replays with no model in the loop.';
+
+/** What a drive that produced nothing is allowed to be reported as. Never a pass — see runVerify. */
+const MSG_EXPLORED_NOTHING =
+  'The drive saved no flows, so there is still nothing to verify. Nothing was proved.';
+const MSG_VERIFY_PREFIX = 'verify failed: ';
+
+/** What a drive left, and how it ended: `broken` and `stopped` are drives cut off part-way. */
+export interface ExploreOutcome {
+  savedFlows: readonly string[];
+  steps: number;
+  stopReason?: string;
+  error?: string;
+}
+
+/** The live capabilities runVerify needs — faked in tests so the logic runs without a browser. */
+export interface VerifyConnection {
+  /** Resolve true once a browser session has connected, or false at timeout. */
+  sessionReady(timeoutMs: number): Promise<boolean>;
+  /**
+   * Flow names to verify, after selection. `select` narrows to flows carrying ANY of those labels.
+   *
+   * The connection applies it rather than the caller, because a label lives inside the flow file and
+   * only the connection can read one.
+   */
+  listFlows(select?: readonly string[]): Promise<string[]>;
+  /**
+   * Each named flow's saved step count, for the results score: without it a replay that stopped at
+   * step 2 of 10 reads as a 2-step journey. Optional; a name it cannot read is left out.
+   */
+  plannedSteps?(names: readonly string[]): Promise<ReadonlyMap<string, number>>;
+  /**
+   * Drive the app with a model and save what it drove. Present only when a model is configured.
+   *
+   * Optional on the interface on purpose: the harness is unavailable on a machine with no key, and
+   * every other path through this command has to keep working exactly as it did.
+   */
+  explore?: (focus?: string) => Promise<ExploreOutcome>;
+  /**
+   * `onProgress` is narration for a run in flight — see `verify-progress.ts` in core. Optional at
+   * every layer: a connection that ignores it behaves exactly as it did before.
+   */
+  verify(onProgress?: VerifyProgressListener): Promise<ReticleVerificationRun>;
+  close(): Promise<void>;
+}
+
+export interface VerifyPorts {
+  connect: () => Promise<VerifyConnection>;
+  out: (line: string) => void;
+  fail: (line: string) => void;
+  exit: (code: number) => void;
+  /**
+   * The platform credential for this repo: the stored key for a linked repo, else the exported
+   * one. A port so the push is testable, and so this reads what every other caller reads.
+   */
+  cloud: () => Promise<CloudConfig | null>;
+  /** Write `--results-json`. A port so the test reads what would have been written. */
+  writeResults?: (path: string, text: string) => Promise<void>;
+  /** The dashboard `reticle link` recorded, so a synced run is printed as a link to its page. */
+  dashboardUrl?: () => string | undefined;
+}
+
+interface VerifyArgs {
+  url: string;
+  timeoutMs: number;
+  /** Drive the app with a model first, saving flows, when there is nothing saved yet. */
+  explore?: boolean;
+  /** Who to be, or what to accomplish, while exploring. Implies `explore`. */
+  persona?: string;
+  /** Verify only flows carrying ANY of these labels. */
+  select?: string[];
+  /** Also write the per-journey verdicts here, as JSON. See verify-results.ts. */
+  resultsJson?: string;
+}
+
+function errMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function openConnection(ports: VerifyPorts): Promise<VerifyConnection | undefined> {
+  try {
+    return await ports.connect();
+  } catch (error) {
+    ports.fail(MSG_VERIFY_PREFIX + errMessage(error));
+    ports.exit(EXIT_FAIL);
+    return undefined;
+  }
+}
+
+/** Orchestration: boot → wait for a session → replay flows → verdict → exit code. Browser-free. */
+export async function runVerify(args: VerifyArgs, outer: VerifyPorts): Promise<void> {
+  const conn = await openConnection(outer);
+  if (conn === undefined) {
+    return;
+  }
+  /*
+   * The exit is held until the connection has closed. The live exit is process.exit, and close()
+   * runs the last cloud sync cycle that sends this run's flows and screenshots: exiting first skipped
+   * the `finally` below, so with no daemon running the run reached the dashboard without them.
+   */
+  let exitCode: number | undefined;
+  const ports: VerifyPorts = {
+    ...outer,
+    exit: (code) => {
+      exitCode = code;
+    },
+  };
+  try {
+    const ready = await conn.sessionReady(args.timeoutMs);
+    if (!ready) {
+      ports.fail(noSessionMessage(args.timeoutMs));
+      ports.exit(EXIT_FAIL);
+      return;
+    }
+    let names = await conn.listFlows(args.select);
+    /*
+     * A selection that matched nothing is NOT "no flows to verify".
+     *
+     * The generic refusal below would send somebody to record a flow they already have, while the
+     * real fault is a label that does not exist. And treating it as an empty suite is how a typo
+     * becomes a green pass over zero flows -- exactly the shape this command's exit code exists to
+     * prevent.
+     */
+    if (0 === names.length && args.select !== undefined && args.select.length > 0) {
+      ports.fail(
+        `No flow carries ${args.select.map((label) => `"${label}"`).join(' or ')}, so nothing ran ` +
+          `and nothing was proved. Check the label, or run without --select to verify every flow.`,
+      );
+      ports.exit(EXIT_FAIL);
+      return;
+    }
+    /*
+     * Drive the app ourselves, but only when asked and only when there is nothing to replay.
+     *
+     * Never automatic. A drive spends somebody's model budget and really clicks things in their app,
+     * and neither is a decision this command gets to make on their behalf. And never INSTEAD of
+     * replaying: saved flows are the cheap, deterministic path, so a project that already has them
+     * pays nothing here.
+     */
+    if (0 === names.length && (true === args.explore || args.persona !== undefined)) {
+      const explored = await explore(conn, args, ports);
+      if (!explored) {
+        return;
+      }
+      names = await conn.listFlows();
+    }
+    if (0 === names.length) {
+      ports.fail(MSG_NO_FLOWS);
+      ports.exit(EXIT_FAIL);
+      return;
+    }
+    /*
+     * Narrate the run while it happens.
+     *
+     * Everything else the CLI reports is a finished artifact, which is the right shape for evidence
+     * and the wrong shape for the minutes a verification actually takes. Without this the dashboard
+     * has nothing to show between "linked" and "done", and a run that is working looks exactly like
+     * one that has died — the ambiguity somebody spent fifteen minutes inside.
+     *
+     * Opt-in and best-effort: no cloud credentials means nothing is buffered and nothing is sent.
+     */
+    /*
+     * A correlation id for the STREAM, minted before the run exists.
+     *
+     * The artifact's own `runId` is only assigned once verification finishes, and these events have
+     * to be attributable from the first one — so the stream gets its own id, and the dashboard keys
+     * live progress by it until the finished run replaces the whole picture.
+     */
+    const streamId = randomUUID();
+    const cloud = await ports.cloud().catch(() => null);
+    const progress = createProgressReporter(streamId, cloud, cloudFetch);
+    let run: ReticleVerificationRun;
+    try {
+      run = await conn.verify(progress.onProgress);
+    } finally {
+      // Stopped before the last flush so the timer cannot fire mid-send, and flushed after it so the
+      // events from the final flow are not thrown away with the interval that would have sent them.
+      progress.stop();
+      await progress.flush().catch(() => undefined);
+    }
+    const pushed = await pushRunToCloud(run, cloud, ports); // best-effort; opt-in; never changes the verdict or exit code
+    /*
+     * The last event anybody watching is waiting for, sent after the artifact has actually landed —
+     * so "pushed" on a dashboard means the run is really there, not that we were about to try.
+     */
+    await syncProgressToCloud(
+      streamId,
+      // The run's OWN injected timestamp — no wall clock is read in this path (rule 7).
+      [{ phase: VerifyPhase.PUSHED, at: run.createdAt }],
+      cloud,
+      cloudFetch,
+    ).catch(() => undefined);
+    if (args.resultsJson !== undefined && ports.writeResults !== undefined) {
+      await ports.writeResults(
+        args.resultsJson,
+        `${JSON.stringify(
+          verifyResults(
+            run,
+            pushed,
+            (await conn.plannedSteps?.(run.flows.map((f) => f.name))) ?? new Map(),
+          ),
+          null,
+          2,
+        )}\n`,
+      );
+    }
+    ports.out(renderRunReport(run));
+    ports.exit(run.verdict.status === VerdictStatus.PASS ? EXIT_PASS : EXIT_FAIL);
+  } catch (error) {
+    ports.fail(MSG_VERIFY_PREFIX + errMessage(error));
+    ports.exit(EXIT_FAIL);
+  } finally {
+    await conn.close().catch(() => undefined);
+    // In the finally, so the early refusals that `return` from the try exit too.
+    if (exitCode !== undefined) {
+      outer.exit(exitCode);
+    }
+  }
+}
+
+/**
+ * Drive the app with a model, and say plainly what came of it.
+ *
+ * Returns false when the run should stop. A drive that saved nothing is NOT a pass: the honest
+ * refusal below it is the whole reason this command exists, and reaching it through an expensive
+ * drive rather than an empty directory changes nothing about what was proved.
+ */
+async function explore(
+  conn: VerifyConnection,
+  args: VerifyArgs,
+  ports: VerifyPorts,
+): Promise<boolean> {
+  if (conn.explore === undefined) {
+    ports.fail(MSG_NO_HARNESS_KEY);
+    ports.exit(EXIT_FAIL);
+    return false;
+  }
+  ports.out('No saved flows yet — driving the app to record some.');
+  const drive = await conn.explore(args.persona);
+  const cut = cutOffReason(drive);
+  if (cut !== undefined) {
+    ports.fail(cut);
+    ports.exit(EXIT_FAIL);
+    return false;
+  }
+  if (0 === drive.savedFlows.length) {
+    ports.fail(MSG_EXPLORED_NOTHING);
+    ports.exit(EXIT_FAIL);
+    return false;
+  }
+  ports.out(
+    `Recorded ${String(drive.savedFlows.length)} flow(s) in ${String(drive.steps)} step(s): ` +
+      `${drive.savedFlows.join(', ')} — every future run replays these with no model in the loop.`,
+  );
+  return true;
+}
+
+/**
+ * Best-effort push of a finished run to the cloud dashboard. Opt-in: only fires when this repo is
+ * linked or RETICLE_API_KEY is set. Absent → no-op, nothing leaves the machine (the no-phone-home
+ * default). A push failure NEVER changes the verdict or exit code — the run is
+ * already reported locally; the cloud copy is an enhancement.
+ */
+async function pushRunToCloud(
+  run: ReticleVerificationRun,
+  config: CloudConfig | null,
+  ports: VerifyPorts,
+): Promise<boolean> {
+  if (null === config) {
+    ports.out(
+      `run ${run.runId} was kept on this computer: this repo is not linked, so nothing was sent ` +
+        `to the dashboard. To save runs for your team: ${CONNECT}`,
+    );
+    return false;
+  }
+  const result = await syncRunToCloud(run, config, cloudFetch);
+  if (result.outcome === SyncOutcome.SYNCED) {
+    const dashboard = ports.dashboardUrl?.();
+    ports.out(
+      dashboard === undefined
+        ? `↑ run ${run.runId} recorded on the Reticle dashboard`
+        : seeRunLine(dashboard, run.runId),
+    );
+    return true;
+  }
+  ports.fail(runSyncFailure(result.status, result.error));
+  return false;
+}
+
+/** The platform answered: the credential was not accepted. */
+const REFUSED_STATUSES: ReadonlySet<number> = new Set([401, 403]);
+
+/**
+ * Why the run did not reach the dashboard. A revoked key left CI green with "cloud run sync failed
+ * (401)" in the log as the only trace; a refused key is said as one, loudly.
+ */
+export function runSyncFailure(status: number | undefined, error: string | undefined): string {
+  if (status !== undefined && REFUSED_STATUSES.has(status)) {
+    return (
+      `⚠ The platform refused this project's API key (${String(status)}): this run did NOT reach ` +
+      'the dashboard, and nothing pushed with this key will. The key was revoked, or its owner no ' +
+      'longer has access to the workspace — mint a new one in Settings → API keys. Run kept locally.'
+    );
+  }
+  return `cloud run sync failed (${String(status ?? error ?? 'error')}); run kept locally`;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForSession(
+  sessions: SessionManager,
+  timeoutMs: number,
+  now: () => number,
+): Promise<boolean> {
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    if (sessions.count() > 0) {
+      return true;
+    }
+    await delay(SESSION_POLL_MS);
+  }
+  return sessions.count() > 0;
+}
+
+/**
+ * Reconstruct the disk-backed ToolDeps over the live bridge + driven browser the daemon owns.
+ *
+ * Exported because the demo tour needs the same thing, and a second copy of this constructor is a
+ * second place to forget a field when `ToolDeps` grows one — the failure being a tool that refuses
+ * at runtime for want of a store nobody noticed was missing.
+ */
+export function buildVerifyDeps(
+  running: RunningServer,
+  reticleRoot: string,
+  now: () => number,
+): ToolDeps {
+  const fs = createNodeFileSystem();
+  const deps: ToolDeps = {
+    sessions: running.bridge.sessions,
+    baselines: new BaselineStore(),
+    recordings: new RecordingStore(),
+    flows: new FlowStore(fs, reticleRoot, { now }),
+    annotations: new AnnotationStore(),
+    project: new ProjectStore(fs, reticleRoot, { now }),
+    fs,
+    reticleRoot,
+    now,
+    // The key `reticle connect` filed. Without it a connected machine that never exported
+    // RETICLE_API_KEY was told to run `reticle connect` when asking the Harness to drive.
+    linkedCloud: linkedCloudPort(fs, reticleRoot, homedir(), process.env),
+  };
+  if (running.realInput !== undefined) {
+    deps.realInput = running.realInput;
+  }
+  return deps;
+}
+
+interface LiveOpts {
+  url: string;
+  headless: boolean;
+  reticleRoot: string;
+  projectName: string;
+  now: () => number;
+  /** Bridge port the driven browser's SDK must dial — must match the app's configured port
+   *  (--port / RETICLE_PORT / .reticle.json), or a custom-port app never connects. */
+  port: number;
+  storageState?: string;
+  /** Which connected tab to verify, when the app has more than one open on this port. */
+  sessionId?: string;
+  /** `--confirm-dangerous`: acknowledge the replay guard's destructive steps for this run. */
+  confirmDangerous?: boolean;
+  /** `--require-start-control`: a missing step 1 control on a fresh start page fails the flow. */
+  requireStartControl?: boolean;
+  /** `--sweep`: keep judging after a step whose consequence failed. */
+  sweep?: boolean;
+}
+
+/** Split a drive URL into its origin + whether it's loopback — decides token/injection pairing. */
+export function urlParts(url: string): { origin?: string; loopback: boolean } {
+  try {
+    const u = new URL(url);
+    return { origin: u.origin, loopback: isLoopbackHostname(u.hostname) };
+  } catch {
+    return { loopback: false };
+  }
+}
+
+async function openLiveConnection(opts: LiveOpts): Promise<VerifyConnection> {
+  // A localhost preview connects natively (the app's own reticle.connect is allowed on loopback), so the
+  // bridge stays token-free. A HOSTED (non-localhost) preview is blocked by the SDK's connection policy
+  // and rejected as a foreign origin — so there we pair via a one-shot token both the bridge and the
+  // injected reticle.connect share, plus the preview's origin on the allow-list. That split is what makes
+  // both "verify my dev server" and "verify a live Lovable URL" work from the same command.
+  // `reticle verify` boots its OWN daemon. Hardcoding the default port meant it crashed with EADDRINUSE
+  // on any machine already running a daemon — i.e. every developer machine — so honour RETICLE_PORT.
+  const envPort = Number(process.env[ReticleEnv.PORT]);
+  const port = Number.isFinite(envPort) && envPort > 0 ? envPort : opts.port;
+  const { origin, loopback } = urlParts(opts.url);
+  // The configured token when there is one: an app in a container presents the one in the shared
+  // token directory, and a fresh one-shot token refused it (#1251).
+  const token = loopback
+    ? undefined
+    : ((await configuredPairingToken(process.env, nodePairingTokenDeps())) ?? randomUUID());
+  const pairing =
+    token === undefined
+      ? {}
+      : {
+          token,
+          injectConnect: { token, url: bridgeWsUrl(port) },
+          ...(origin !== undefined ? { allowedOrigins: [origin] } : {}),
+        };
+  const running = await start({
+    port,
+    driveUrl: opts.url,
+    headless: opts.headless,
+    mcp: false,
+    reticleRoot: opts.reticleRoot,
+    now: opts.now,
+    ...pairing,
+    ...(opts.storageState !== undefined ? { storageState: opts.storageState } : {}),
+  });
+  const deps = buildVerifyDeps(running, opts.reticleRoot, opts.now);
+  const harnessEnv = await withLinkedCredential(deps, process.env);
+  const runner = new ReticleRunner(
+    createRunnerPort(deps, opts.sessionId, {
+      confirmDangerous: true === opts.confirmDangerous,
+      requireStartControl: true === opts.requireStartControl,
+      sweep: true === opts.sweep,
+    }),
+  );
+  return {
+    sessionReady: (timeoutMs) => waitForSession(deps.sessions, timeoutMs, opts.now),
+    plannedSteps: async (names) => {
+      const planned = new Map<string, number>();
+      for (const name of names) {
+        const loaded = await deps.flows.load(name).catch(() => undefined);
+        if (true === loaded?.ok) {
+          // A sequence counts its sub-steps, as the score does.
+          planned.set(
+            name,
+            loaded.value.steps.reduce((n, step) => n + (step.steps?.length ?? 1), 0),
+          );
+        }
+      }
+      return planned;
+    },
+    listFlows: async (select) =>
+      select === undefined || 0 === select.length
+        ? deps.flows.list()
+        : (await resolveSuiteSelection(deps, projectOnly(undefined), { labels: [...select] })).run,
+    // Absent, not throwing, when no model is configured: the CLI reads its absence as "unavailable"
+    // and prints the one sentence that makes it available.
+    ...(harnessAvailable(harnessEnv)
+      ? {
+          explore: async (focus?: string) => {
+            const result = await exploreApp(deps, harnessEnv, {
+              ...(focus === undefined ? {} : { focus }),
+              ...(opts.sessionId === undefined ? {} : { sessionId: opts.sessionId }),
+            });
+            return {
+              savedFlows: result.savedFlows,
+              steps: result.drive.steps,
+              stopReason: result.drive.stopReason,
+              ...(result.drive.error === undefined ? {} : { error: result.drive.error }),
+            };
+          },
+        }
+      : {}),
+    verify: async (onProgress) => {
+      const run = await runner.verify({
+        project: { name: opts.projectName, framework: RunFramework.OTHER, previewUrl: opts.url },
+        ...cliRunAuthor(process.env),
+        profile: RunProfile.PROD_PREVIEW,
+        ...(onProgress === undefined ? {} : { onProgress }),
+      });
+      // Persist the artifact. `reticle gate` decides from the runs in the store, so without this the
+      // documented CI loop is broken end to end: `reticle verify` could pass and the gate would still
+      // block, because it never sees a passing run. (Only the optional `serve --http` endpoint used to
+      // persist.) Best-effort — a disk failure must not turn a passing verification into a failure.
+      try {
+        await new RunStore(deps.fs, opts.reticleRoot).write(run);
+      } catch {
+        // artifact persistence is not the verdict
+      }
+      return run;
+    },
+    close: () => running.close(),
+  };
+}
+
+/** CLI entry — wires the live ports and runs the one-shot verification. Exits the process itself. */
+/**
+ * What a user reads when the bridge port is already taken by a daemon.
+ *
+ * `verify` boots its OWN daemon, and it has to do so on the port the APP dials — a loopback page
+ * connects natively to the port baked into its config, so verify cannot simply pick a free one and
+ * still be found. On any machine with Reticle set up, that port already belongs to a running daemon.
+ *
+ * It used to die there. The listen failure surfaces asynchronously on the server object, after
+ * `start` has resolved, so nothing caught it and the process printed a raw `node:net` stack — the
+ * worst answer available, and reached most often by the people with the fewest other options, since
+ * the skill offers this command as the way to a verdict with no MCP at all.
+ *
+ * The message says every way out rather than picking one, and it says FIRST that a busy port is the
+ * normal state rather than a fault — an install that worked leaves a daemon on it, so a reader who
+ * arrives here has done nothing wrong and should not go looking for what they broke (#689).
+ *
+ * `reticle drive` leads, because it is the only option that works in the state most people are in
+ * when they reach this message: the client exposes no `reticle_*` tools (Codex, Cursor Cloud,
+ * Antigravity, a session whose MCP link dropped), which is exactly when the CLI is reached for. It
+ * ATTACHES to the running daemon rather than binding — see cli/drive/drive-attach.ts — so there is nothing
+ * to stop, nothing to race, and it hands back a sessionId the daemon owns. The advice that used to
+ * lead, "ask the daemon through the tools", is the one thing that reader by construction cannot do.
+ *
+ * Stopping the daemon stays on the list and stays LAST of the working options, with the reason: the
+ * MCP proxy respawns one into the gap, so `stop` is a race the caller usually loses, and it kills
+ * the agent's own link on the way past.
+ *
+ * `verify` itself attaching, rather than needing the port at all, is the real fix and is #689's
+ * first bullet — not this change.
+ */
+export function portBusyMessage(port: number): string {
+  return (
+    `reticle verify needs port ${String(port)} — the port your app dials — and a Reticle daemon is ` +
+    'already listening on it. It did not start a second one.\n\n' +
+    '  This is the NORMAL state after a working install, not a fault: the daemon your MCP client ' +
+    'started owns that port.\n\n' +
+    `  • Drive the app through the daemon that is already there — this needs no tools and stops ` +
+    `nothing: npx @reticlehq/server drive <url>\n` +
+    '  • If your client HAS the Reticle tools, ask that daemon directly: ' +
+    'reticle_run { tool: "reticle_verify", args: { action: "change", files: ["..."] } }\n' +
+    `  • Or run both on another port, if your app is configured for it: RETICLE_PORT=<port> ` +
+    'npx @reticlehq/server verify <url>\n' +
+    `  • Stopping the daemon (npx @reticlehq/server stop --port ${String(port)}) works, but it cuts ` +
+    "your agent's MCP link and the proxy usually respawns a daemon into the gap before verify can " +
+    'bind — prefer one of the above.'
+  );
+}
+
+/**
+ * What `--expect` is answered with when the port is not serving a daemon.
+ *
+ * It used to be answered with nothing at all. The predicate was read only inside the daemon branch,
+ * so on a free or foreign port the flag was dropped without a word and the command carried on into
+ * the saved-flows path — where it reported, accurately and about something else entirely, that there
+ * were no saved flows to verify. Byte-identical output to the same command with no `--expect` on it.
+ *
+ * That is the documented recovery for a client that never loaded the `reticle_*` tools, so it failed
+ * for the people with no other route to a verdict, and it failed in the one way they could not
+ * diagnose: the refusal they got was true.
+ */
+export function expectNeedsDaemonMessage(port: number, presence: PortPresence): string {
+  return (
+    `${EXPECT_FLAG} asks the Reticle daemon that already owns port ${String(port)} for the ` +
+    'verdict — it binds nothing and launches nothing, which is what lets it answer while the port ' +
+    `is busy. Right now ${describePresence(presence, port)}.\n\n` +
+    '  The predicate did not run, and nothing was proved.\n\n' +
+    '  • Start a daemon on that port, pointed at the app, then re-run this command: ' +
+    `npx @reticlehq/server serve --port ${String(port)} --drive <url>\n` +
+    `  • Or drop ${EXPECT_FLAG}, and verify drives the url itself and replays your saved flows — ` +
+    'a different question, and it proves nothing about your predicate.\n\n' +
+    `  • Once that daemon is running, you can also drive its HTTP MCP transport for anything ` +
+    `${EXPECT_FLAG} cannot do — click, fill, press (${MCP_SSE_PATH}, then ${MCP_MESSAGE_PATH}). ` +
+    'See https://docs.reticle.sh/http-transport.md.'
+  );
+}
+
+/**
+ * The platform key is set here but not in the daemon, which is what asks the platform. The daemon is
+ * usually the one `init` or the agent's MCP client started, from an environment without the key.
+ */
+export function daemonLacksKeyMessage(port: number): string {
+  return (
+    `${ReticleEnv.API_KEY} is set in this shell, but the daemon on port ${String(port)} was ` +
+    'started without it, and the daemon is what asks the platform to drive. Restart it from this ' +
+    `shell so it inherits the key: npx @reticlehq/server serve --restart --port ${String(port)}`
+  );
+}
+
+/** What `verify` does next, once the options and the state of the port are both known. */
+export const VerifyRoute = {
+  /** Ask the daemon that already owns the port for a one-shot verdict on the predicate. */
+  ADHOC: 'adhoc',
+  /** Ask the daemon that already owns the port to replay the saved flows. See runAdhocSuite. */
+  ADHOC_SUITE: 'adhoc-suite',
+  /** Ask the daemon that already owns the port to explore the url and record flows. */
+  ADHOC_EXPLORE: 'adhoc-explore',
+  /** Boot our own daemon, drive the url, replay the flows saved on disk. */
+  FLOWS: 'flows',
+  /** Answer the caller, and run nothing. */
+  REFUSE: 'refuse',
+} as const;
+export type VerifyRoute = (typeof VerifyRoute)[keyof typeof VerifyRoute];
+
+export type VerifyPlan =
+  | { route: typeof VerifyRoute.ADHOC }
+  | { route: typeof VerifyRoute.ADHOC_SUITE }
+  | { route: typeof VerifyRoute.ADHOC_EXPLORE }
+  | { route: typeof VerifyRoute.FLOWS }
+  | { route: typeof VerifyRoute.REFUSE; message: string };
+
+/**
+ * All four routes this command has, in one pure function.
+ *
+ * They used to be a pair of nested `if`s that consulted `--expect` only after the port had already
+ * answered as a daemon, which is how one of the four went missing: a predicate on any other port
+ * state fell through to a path that cannot see it. Stating the cases together is what makes an
+ * unhandled one visible, and it lets every one of them be driven with no port, no daemon and no
+ * browser — which is where an argument-level decision belongs.
+ */
+export function routeVerify(args: {
+  /** True when the caller supplied a predicate, by `--expect` or `--expect-file`. */
+  hasPredicate: boolean;
+  /**
+   * True when the caller asked for something only a browser of OUR OWN can do: `--headed` or
+   * `--storage-state`, or a rule its replay tool does not take (`--require-start-control`). The
+   * running daemon's tab can honour none of them, so replaying there would silently ignore the request.
+   */
+  wantsOwnBrowser?: boolean;
+  /**
+   * `--explore`: a model drives the url and records flows. The daemon on the port runs the same
+   * drive (`reticle_verify { action: "explore" }`), so this is NOT a reason to need our own browser —
+   * it used to be, and `init` leaves exactly that daemon behind before recommending this command.
+   */
+  explore?: boolean;
+  /**
+   * Whether the project already has saved flows. `--explore` without a daemon drives only when there
+   * are none (a drive spends model credits, a replay does not), and this path keeps the same rule.
+   */
+  hasSavedFlows?: boolean;
+  presence: PortPresence;
+  port: number;
+}): VerifyPlan {
+  if (args.hasPredicate) {
+    return args.presence === PortPresence.DAEMON
+      ? { route: VerifyRoute.ADHOC }
+      : { route: VerifyRoute.REFUSE, message: expectNeedsDaemonMessage(args.port, args.presence) };
+  }
+  if (args.presence !== PortPresence.DAEMON) {
+    return { route: VerifyRoute.FLOWS };
+  }
+  if (true === args.explore && true !== args.wantsOwnBrowser && true !== args.hasSavedFlows) {
+    return { route: VerifyRoute.ADHOC_EXPLORE };
+  }
+  // No predicate, but there may be SAVED FLOWS, and a daemon already owns the port: replay them
+  // there rather than refusing, unless the request needs a browser that path never opens.
+  return true === args.wantsOwnBrowser
+    ? { route: VerifyRoute.REFUSE, message: portBusyMessage(args.port) }
+    : { route: VerifyRoute.ADHOC_SUITE };
+}
+
+export function handleVerify(
+  parsed: {
+    url: string;
+    /** A parsed predicate for a flow-free, one-shot verdict against the running daemon. */
+    expect?: unknown;
+    /** The same predicate in a file, which is the form no shell can mangle. Resolved below. */
+    expectFile?: string;
+    headless: boolean;
+    timeoutMs?: number;
+    storageState?: string;
+    sessionId?: string;
+    /** Verify only flows carrying ANY of these labels. */
+    select?: string[];
+    /** Drive the app with a model and record flows, when there are none saved yet. */
+    explore?: boolean;
+    /** Who to be, or what to accomplish, while exploring. Implies `explore`. */
+    persona?: string;
+    /** Bridge port — parseCliArgs already resolves --port / RETICLE_PORT / .reticle.json into this. */
+    port: number;
+    /** Write the per-journey verdicts here as JSON, for a CI step to post. */
+    resultsJson?: string;
+    /** Acknowledge the replay guard's destructive steps ("Place order") for this run only. */
+    confirmDangerous?: boolean;
+    /** Fail a flow whose step 1 control is missing on its freshly loaded start page. */
+    requireStartControl?: boolean;
+    /** Judge every step, also after one fails. */
+    sweep?: boolean;
+  },
+  /**
+   * Called once, after the last verdict line and before the exit. `cli.ts` passes the CI line:
+   * `telemetry` already reaches this directory, so this directory does not reach back.
+   */
+  beforeExit: () => void = () => undefined,
+): void {
+  const now = (): number => Date.now();
+  /*
+   * `--expect-file` is `--expect` with the shell taken out of the loop.
+   *
+   * Resolved here rather than in the parser because the parser is pure and reads no disk, and
+   * because the two failures a reader can hit — the file is not there, and what is in it is not
+   * JSON — are worth saying apart. Either one ends the run before anything binds: a predicate that
+   * could not be read produces NO verdict, and exiting 1 with the reason is the only honest answer.
+   */
+  let expectation = parsed.expect;
+  if (parsed.expectFile !== undefined) {
+    let text: string;
+    try {
+      text = readFileSync(parsed.expectFile, 'utf8');
+    } catch {
+      process.stderr.write(`--expect-file: cannot read ${parsed.expectFile}\n`);
+      process.exit(1);
+      return;
+    }
+    try {
+      expectation = JSON.parse(text) as unknown;
+    } catch {
+      process.stderr.write(
+        `--expect-file: ${parsed.expectFile} is not valid JSON, so no predicate was read\n`,
+      );
+      process.exit(1);
+      return;
+    }
+  }
+  const reticleRoot = join(process.cwd(), ReticleDir.ROOT);
+  const linkedName = async (): Promise<string> =>
+    verifyProjectName(
+      (await resolveProjectCloud(createNodeFileSystem(), reticleRoot, homedir(), process.env))
+        .projectId,
+      readProjectId(process.cwd()),
+      basename(process.cwd()),
+    );
+  const ports: VerifyPorts = {
+    connect: async () =>
+      openLiveConnection({
+        url: parsed.url,
+        headless: parsed.headless,
+        reticleRoot,
+        projectName: await linkedName(),
+        now,
+        port: parsed.port ?? RETICLE_DEFAULT_PORT,
+        ...(parsed.storageState !== undefined ? { storageState: parsed.storageState } : {}),
+        ...(parsed.sessionId !== undefined ? { sessionId: parsed.sessionId } : {}),
+        ...(true === parsed.confirmDangerous ? { confirmDangerous: true } : {}),
+        ...(true === parsed.requireStartControl ? { requireStartControl: true } : {}),
+        ...(true === parsed.sweep ? { sweep: true } : {}),
+      }),
+    out: (line) => process.stdout.write(`${line}\n`),
+    fail: (line) => process.stderr.write(`${line}\n`),
+    exit: (code) => {
+      beforeExit();
+      process.exit(code);
+    },
+    cloud: linkedRunsCloudPort(createNodeFileSystem(), reticleRoot, homedir(), process.env),
+    dashboardUrl: () => readDashboardUrl(reticleRoot),
+    writeResults: (path, text) => writeFile(path, text, 'utf8'),
+  };
+  // Asked BEFORE anything binds. The listen failure arrives asynchronously on the server object,
+  // long after `start` has resolved, so no `.catch` on that promise can ever see it — which is why
+  // this used to reach the user as a raw node stack rather than as an answer.
+  void (async () => {
+    const keyNote = (
+      await resolveProjectCloud(createNodeFileSystem(), reticleRoot, homedir(), process.env)
+    ).note;
+    if (keyNote !== undefined) {
+      process.stderr.write(`${keyNote}\n`);
+    }
+    const port = parsed.port ?? RETICLE_DEFAULT_PORT;
+    // A lease opened for this verdict writes its runs into this folder's project, not `unmatched/`.
+    const root = callerArtifactRoot(process.cwd());
+    const callerRoot = root === undefined ? {} : { root };
+    const presence = await probePresence(port, { tcpOpen: probeDaemon, status: fetchStatus });
+    const plan = routeVerify({
+      hasPredicate: expectation !== undefined,
+      // `--require-start-control` too: the daemon's replay tool does not take that rule.
+      wantsOwnBrowser:
+        !parsed.headless ||
+        parsed.storageState !== undefined ||
+        true === parsed.requireStartControl ||
+        true === parsed.sweep,
+      explore: true === parsed.explore || parsed.persona !== undefined,
+      hasSavedFlows:
+        0 <
+        (await new FlowStore(createNodeFileSystem(), reticleRoot, { now: Date.now }).list()).length,
+      presence,
+      port,
+    });
+    switch (plan.route) {
+      // Either the busy port, or a predicate this state cannot answer. Both are refusals that name
+      // what was asked for — never a report about a check nobody requested.
+      case VerifyRoute.REFUSE:
+        ports.fail(plan.message);
+        ports.exit(EXIT_FAIL);
+        return;
+      // A daemon owning the port is the NORMAL state after a working install, and it used to be the
+      // end of the road: `verify` refused, the other verdict paths need saved flows a first-install
+      // project does not have, and stopping the daemon cuts the agent's own MCP link. An agent could
+      // hold a live, correctly-wired app and have no way to reach a verdict at all.
+      //
+      // With `--expect` there is a way, and it does not need the port: ask the daemon that already
+      // owns it. See runAdhocVerdict.
+      case VerifyRoute.ADHOC: {
+        const verdict = await runAdhocVerdict({
+          port,
+          ...(parsed.url !== undefined && '' !== parsed.url ? { url: parsed.url } : {}),
+          predicate: expectation,
+          // How long the expectation may take to come true (#1533).
+          ...(parsed.timeoutMs === undefined ? {} : { timeoutMs: parsed.timeoutMs }),
+          // Read fresh, not from `presence`: that probe asks whether a daemon is on the port, and
+          // this asks whether a TAB is — the difference between asserting and opening the url first.
+          sessions: async () => summarizeStatus(await fetchStatus(port)).sessions,
+          ...callerRoot,
+          ...(parsed.sessionId === undefined ? {} : { sessionId: parsed.sessionId }),
+          ...((t: string | undefined) => (t === undefined || 0 === t.length ? {} : { token: t }))(
+            readOrCreatePairingTokenSync(defaultPairingTokenDir()),
+          ),
+        });
+        for (const line of verdict.lines) {
+          ports.out(line);
+        }
+        ports.exit(verdict.code);
+        return;
+      }
+      // No predicate, a daemon on the port, and saved flows to run: the other half of the same
+      // dead end. The whole promise of a saved suite is that it runs again without an agent.
+      case VerifyRoute.ADHOC_SUITE: {
+        const suite = await runAdhocSuite({
+          port,
+          ...(parsed.url !== undefined && '' !== parsed.url ? { url: parsed.url } : {}),
+          sessions: async () => summarizeStatus(await fetchStatus(port)).sessions,
+          ...callerRoot,
+          ...(true === parsed.confirmDangerous ? { confirmDangerous: true } : {}),
+          ...(parsed.select === undefined ? {} : { select: parsed.select }),
+          ...(parsed.sessionId === undefined ? {} : { sessionId: parsed.sessionId }),
+          ...((t: string | undefined) => (t === undefined || 0 === t.length ? {} : { token: t }))(
+            readOrCreatePairingTokenSync(defaultPairingTokenDir()),
+          ),
+        });
+        for (const line of suite.lines) {
+          ports.out(line);
+        }
+        ports.exit(suite.code);
+        return;
+      }
+      // `--explore` with a daemon on the port — the state `init` leaves behind right before it names
+      // this command as the first run. The daemon drives and records; this process only asks.
+      case VerifyRoute.ADHOC_EXPLORE: {
+        const explored = await runAdhocExplore({
+          port,
+          url: parsed.url,
+          ...(parsed.persona === undefined ? {} : { persona: parsed.persona }),
+          sessions: async () => summarizeStatus(await fetchStatus(port)).sessions,
+          ...callerRoot,
+          ...((t: string | undefined) => (t === undefined || 0 === t.length ? {} : { token: t }))(
+            readOrCreatePairingTokenSync(defaultPairingTokenDir()),
+          ),
+        });
+        for (const line of explored.lines) {
+          ports.out(line);
+        }
+        // The drive runs INSIDE the daemon, so the key has to be in ITS environment. A reader who
+        // exported it in this shell and was told to link has been told to do the thing they just
+        // did; say where the key is actually missing.
+        if (0 !== explored.code && harnessAvailable(process.env)) {
+          const refusedForKey = explored.lines.some((line) => line.includes(MSG_NO_HARNESS_KEY));
+          if (refusedForKey) {
+            ports.fail(daemonLacksKeyMessage(port));
+          }
+        }
+        ports.exit(explored.code);
+        return;
+      }
+      case VerifyRoute.FLOWS:
+        await runVerify(
+          {
+            url: parsed.url,
+            timeoutMs: parsed.timeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+            ...(true === parsed.explore ? { explore: true } : {}),
+            ...(parsed.persona === undefined ? {} : { persona: parsed.persona }),
+            ...(parsed.select === undefined ? {} : { select: parsed.select }),
+            ...(parsed.resultsJson === undefined ? {} : { resultsJson: parsed.resultsJson }),
+          },
+          ports,
+        );
+        return;
+    }
+  })();
+}

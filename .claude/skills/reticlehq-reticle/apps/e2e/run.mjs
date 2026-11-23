@@ -1,0 +1,308 @@
+// E2E orchestrator: run each committed spec sequentially against already-running servers
+// (api:8787, demo:4310, next-smoke:3100). Specs share a test bridge (:14400 by default),
+// and the runner reaps only its own processes between specs. Exits non-zero if any spec fails — the CI regression gate.
+//
+// Two batteries, one runner. `--desktop` runs the Electron/Tauri specs instead of the web ones,
+// because those two need things the web battery's boot script does not provision — an Electron
+// install, a compiled Tauri binary, and on Linux a display — while needing none of its three HTTP
+// servers. They are a separate JOB, never a silent omission: a spec on disk that belongs to neither
+// list still fails the classification check below.
+import { spawn } from 'node:child_process';
+import { readdirSync, readFileSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { freePortSafely, TEST_BRIDGE_PORT } from './gate-harness.mjs';
+
+const dir = path.dirname(fileURLToPath(import.meta.url));
+const specsDir = path.join(dir, 'specs');
+
+// Order: next-smoke-backed specs first, real-world (demo+api) last.
+const ORDER = [
+  // Needs no browser and none of the three servers — real dist modules against a real capture
+  // endpoint. Runs first because it is the fastest way to learn the build is sane.
+  'telemetry-events-test',
+  // Also needs no browser and no servers: a fake MCP peer and a hand-rolled HELLO, both LYING about
+  // their contract. Runs early for the same reason — it is a cheap check that the three pieces agree.
+  'version-skew-test',
+  // Also serverless and browserless: it drives five tool calls and then reads the call tree the
+  // daemon emitted while doing it. The trace is produced on every RETICLE_TRACE=1 run and was
+  // discarded; it carries the hang signature (a completed child span with no completed parent),
+  // which nothing else here can see.
+  'trace-shape-test',
+  // Serverless too: it holds the bridge port with a plain socket and checks that serve, status and
+  // doctor all say so. They used to report a spawn, `running:false`, and "not running" — three
+  // surfaces disagreeing, none of them naming the port, and the truth only in the daemon's own log.
+  'daemon-port-honesty-test',
+  // Serverless as well: it starts a real daemon with a fast heartbeat, SIGKILLs it, and reads the
+  // daemon's own log back. A killed daemon used to leave NOTHING (installExitTrace hooks 'exit',
+  // which SIGKILL never fires) while a tidy one logged code:0 — so the two were indistinguishable in
+  // the one file users are told to open.
+  'daemon-heartbeat-test',
+  // Serverless as well: a fault proxy sits between the MCP proxy and a real daemon and breaks the
+  // link in NAMED ways — reset, blackhole, truncate, latency — instead of SIGKILLing a process. It
+  // separates the two unanswered-call populations by their timing: a queued call is answered by the
+  // 20s queue timer, a call broken IN FLIGHT by the stream-loss path in well under a second.
+  'transport-faults-test',
+  // Own HTML fixture + real Chromium: overflow-clipped text is hidden until Expand reveals it.
+  'overflow-visibility-test',
+  // Owns its HTTP fixture and daemon: real layout distinguishes ordinary panel removal from
+  // virtualization, then checks the SDK withdraws a blind spot through public absence verdicts.
+  'blind-spot-reset-test',
+  'next-smoke-test',
+  'next-blur-clock-test',
+  // The other half of insertText: the unit tests drive a mock DOM, so only a real ProseMirror editor
+  // can show that the library's OWN document took the text rather than only its textContent.
+  'insert-text-rich-editor-test',
+  'status-honesty-test',
+  'drive-launch-test',
+  // The other half of `press`: a document key through the REAL keyboard, asserting focus actually
+  // moved. The unit tests record `keyboard.press('Tab')` against a fake Page, so they prove the
+  // routing and say nothing about focus — which is the whole of #1176. Needs next-smoke's tab order.
+  'press-real-focus-test',
+  // The other half of drive: what it does when it CANNOT have the port. A daemon on :4400 is the
+  // normal state once an agent has connected, and drive used to die there on a raw EADDRINUSE —
+  // reported twice from the field, both times against the command Reticle itself recommends.
+  'drive-attach-test',
+  'spa-nav-realinput-test',
+  'visual-test',
+  'crawl-test',
+  // The release motive, end to end. The unit tests pin the RULE; only a real app in a real browser
+  // proves the wiring — that the facts reach the rule, that the field survives the outputSchema, and
+  // that a gap raised on one call is still open on the next AND closes when the app stops being
+  // unobservable. Carries its own negative control, because a surface that always reports a finding
+  // is worth exactly nothing.
+  'instrumentation-gap-test',
+  'scroll-find-test',
+  'flow-record-replay-test',
+  'flow-self-heal-test',
+  'project-history-test',
+  'spec-runner-test',
+  // Needs no servers and no browser — it watches the daemon's own life cycle, which nothing else
+  // here can see (every other spec drives a daemon immediately, never leaving one idle).
+  'daemon-lifecycle-test',
+  // The other half of the transport story. daemon-lifecycle covers the daemon exiting on its OWN
+  // terms; this one SIGKILLs it under a live client and asserts the stdio MCP server survives —
+  // the failure a user experiences as "my tools vanished, open /mcp and reconnect". Also needs no
+  // servers and no browser.
+  'mcp-survives-test',
+  // Brute force against the same transport: repeated kills, kills mid-call, concurrent bursts,
+  // garbage on stdin, and a foreign process stealing the port. Survival is only half the bar — the
+  // other half is that every request gets an ANSWER, because a hung call is a hung agent.
+  'mcp-stress-test',
+  // The wire under both of those: SDK <-> daemon. Session cap, oversized frames, malformed frames,
+  // a message flood, and sockets killed mid-handshake. Owns its own daemon on its own port.
+  'bridge-stress-test',
+  // The other channel: daemon <-> page. Tabs closed mid-command, two tabs at once, a backgrounded
+  // page, and a reload under a live ref. Needs the bench-app the dashboard specs use.
+  'browser-stress-test',
+  // Every shipped tool, called WRONG: empty, nulls, wrong types, junk keys, a 100KB argument.
+  // The surface sweep proves the tools work; this proves they refuse safely — bounded, actionable,
+  // and never blaming the caller's typo on Reticle. Needs the same bench-app.
+  'tool-fuzz-test',
+  'live-control-test',
+  'real-world-tests',
+  'response-ignored-test',
+  // A saved flow whose declared consequence outlives replay's default 4s wait. Sits beside
+  // response-ignored because it drives the same bench-app fixture, with its slow-endpoint knob.
+  'slow-endpoint-replay-test',
+  // A 401 the app recovered from must not read as two defects. Same bench-app, its own fixture view.
+  'auth-retry-not-a-defect-test',
+  // A failed write the app acknowledged, beside one it hid (#2173). Same bench-app, its own view.
+  'acknowledged-failed-write-test',
+  // Both directions of `stale-response-applied`: a fan-out stays silent, a real race is reported.
+  // Same bench-app, its own fixture view.
+  'stale-response-both-directions-test',
+  // Both directions of three rules that report less often since #1627, #1629 and #2127 (#2141).
+  // Same bench-app, its own fixture view.
+  'narrowed-rules-both-directions-test',
+  // Both directions of a route claim and of an absence by testid beside a virtualized list (#2176).
+  // Same bench-app, its own fixture view.
+  'route-and-absence-claims-test',
+  // A file input, an unnamed icon button and a canvas — three properties `apps/` had no fixture for.
+  'awkward-controls-test',
+  'multi-agent-lease-test',
+  // Permissions on a leased context, read from inside a real page. Serves its own page.
+  'lease-permissions-test',
+  'lease-zero-install-navigation-test',
+  // An SPA that drops the lease query on load with history.replaceState. Serves its own page.
+  'lease-spa-redirect-test',
+  // An INSTRUMENTED lease (the app ships its own SDK) whose sign-in is a slow full-page form POST:
+  // the act budget expires while the navigation is in flight, and the verdict used to read the
+  // pre-navigation route as a failure (#2009). Serves its own page, like the specs above.
+  'lease-instrumented-navigation-test',
+  // Bare `reticle` in an unwired app folder: one smoke verdict, a pass and a fail. Writes its own app.
+  'first-verdict-test',
+  // `reticle verify <candidate> --against <reference>` through the built CLI, on three builds it
+  // serves itself: one identical, one with a renamed button (#2190).
+  'verify-against-test',
+  // `reticle verify <url> --expect` through the built CLI, against a page that renders its text
+  // 2 s after load, with a long and a short --timeout and a text it never shows (#2144).
+  'verify-expect-test',
+  // `reticle verify` through the built CLI, where one flow goes to a 404 page with no SDK. The
+  // flows after it must get their own verdicts (#2060). Serves its own pages and SDK bundle.
+  'verify-session-lost-test',
+  // A script-defined global, read by the app's OWN first module — the done-when of #1427. The unit
+  // tests prove install order against a fake page; only a real browser can prove the page saw it.
+  // Serves its own fixture page, like the permissions spec above.
+  'lease-init-script-test',
+  // The size a leased page takes, read from inside a real Chromium: headless at the default size,
+  // a requested size kept. Serves its own page, like the specs above.
+  'lease-page-size-test',
+  // A refused request stopped in a real Chromium before it leaves, under the production policy.
+  // Serves its own page, like the two specs above.
+  'lease-production-guard-test',
+  // A coarse pointer on a leased context, read as the page reads it: matchMedia and the rule behind
+  // it. Serves its own page, like the three specs above.
+  'lease-pointer-test',
+  // A deterministic lease read and driven through the tool handlers while its clock stands still.
+  // Serves its own page, like the four specs above.
+  'lease-deterministic-test',
+  'atlas-hard-fixture-test',
+  // Drives a real session and then checks that the EVENTS describe it — a different question from
+  // telemetry-events-test, which only proves each kind can be sent. Owns a browser and writes a flow,
+  // so it sits beside the sweep at the end.
+  'telemetry-stitch-test',
+  // Feedback is the only qualitative channel the product has. This proves a report survives a dead
+  // network (outbox), that a delivered one drains, and that filing from a Reticle checkout works.
+  'feedback-durability-test',
+  // Last: it drives every tool over real MCP, including navigate/crawl/clock, and owns a browser of
+  // its own. Running it earlier would leave the shared bench-app in a state later specs assume fresh.
+  'tool-surface-sweep-test',
+  // Beside the sweep, and deliberately NOT folded into it: the sweep advertises every tool and calls
+  // each one directly, which is right for sweeping a surface and wrong for learning what an ordinary
+  // agent can reach. This one runs at the DEFAULT profile and makes the calls SKILL.md prints, through
+  // the `reticle_run` envelope the skill has to teach because those tools are not advertised. The
+  // sweep can be entirely green while every instruction in the skill is unreachable.
+  'skill-one-call-paths-test',
+  // Last: drive the demo app the way a user's agent does, including a false assertion that MUST be
+  // refused. Everything above proves the pieces; this proves the product.
+  'release-smoke-test',
+];
+// The desktop battery — `pnpm test:e2e:desktop`. Each of these starts its OWN runtime (an Electron main
+// process, including the electron-vite path, or a packaged Tauri binary) and waits for it to dial
+// the bridge, so they need no server from run-ci.sh and would only fail inside it for want of a display.
+const DESKTOP = ['electron-desktop-test', 'electron-vite-desktop-test', 'tauri-desktop-test'];
+// Specs intentionally excluded from BOTH batteries (add here WITH a reason, never by omission).
+const present = new Set(
+  readdirSync(specsDir)
+    .filter((f) => f.endsWith('.mjs'))
+    .map((f) => f.replace(/\.mjs$/, '')),
+);
+// ORDER only SEQUENCES; a spec present on disk but in no list is silently un-run rot (this is how
+// new-features-test.mjs rotted). Fail loud so every new spec must be classified.
+const unclassified = [...present].filter(
+  (n) => !ORDER.includes(n) && !DESKTOP.includes(n),
+);
+if (unclassified.length > 0) {
+  console.error(
+    `\ne2e: spec(s) present but not in ORDER or DESKTOP: ${unclassified.join(', ')}\n` +
+      'Add each to ORDER (web battery) or DESKTOP (Electron/Tauri battery).',
+  );
+  process.exit(1);
+}
+// A named list that resolves to nothing means the battery quietly passed having run zero specs —
+// the same rot in a new shape. Only reachable by deleting a file without updating the list.
+const desktop = process.argv.includes('--desktop');
+const listed = (desktop ? DESKTOP : ORDER).filter((n) => present.has(n));
+// `E2E_SHARD=k/n` runs every n-th spec starting at the k-th, so CI can split the battery across
+// parallel jobs. Each job boots its own servers, so shards share nothing. Round-robin over ORDER
+// rather than by name, and the split is re-checked by eye whenever a slow spec is added.
+const shard = /^(\d+)\/(\d+)$/.exec(process.env['E2E_SHARD'] ?? '');
+const specs =
+  shard === null
+    ? listed
+    : listed.filter((_, i) => i % Number(shard[2]) === Number(shard[1]) - 1);
+if (shard !== null) process.stdout.write(`e2e shard ${shard[0]}: ${specs.length} of ${listed.length} specs\n`);
+if (specs.length === 0) {
+  console.error(`\ne2e: the ${desktop ? 'desktop' : 'web'} battery resolved to zero specs`);
+  process.exit(1);
+}
+// Zero is the collapse. This is the slide.
+//
+// The check above only fires when EVERY spec is gone, and the comment above it says as much:
+// reachable by deleting a file without updating the list. Delete the file AND its entry and the
+// battery shrinks quietly, printing "5/5 specs passed" in the same shape as "39/39" — a green
+// that says less every time somebody tidies, and never says that it is saying less.
+//
+// So the size is recorded, and shrinking the battery costs a deliberate edit to a number a
+// reviewer can see. Growing it costs the same edit, which is the point: both directions are a
+// decision. Measured 2026-11-15: 60 web specs, with verify-session-lost-test (#2060).
+const EXPECTED_SPECS = desktop ? 3 : 60;
+// The WHOLE battery is counted, not this shard's slice of it: a shard is a third of the list by
+// design, and the question here is whether the list itself shrank.
+if (listed.length !== EXPECTED_SPECS) {
+  console.error(
+    `\ne2e: the ${desktop ? 'desktop' : 'web'} battery resolved to ${String(listed.length)} ` +
+      `specs and ${String(EXPECTED_SPECS)} are recorded.\n` +
+      'Added one? Raise the number here in the same commit. Removed one? Lower it, and say in\n' +
+      'the commit what stopped being covered — that is the sentence this check exists to force.\n',
+  );
+  process.exit(1);
+}
+
+// A private state directory lets cleanup identify daemons spawned by this run.
+const stateDir = process.env.RETICLE_TEST_STATE_DIR ?? mkdtempSync(path.join(tmpdir(), 'reticle-e2e-'));
+process.env.RETICLE_STATE_DIR = stateDir;
+process.env.RETICLE_PORT = String(TEST_BRIDGE_PORT);
+
+async function freePort() {
+  let ownedPids = [];
+  try {
+    ownedPids = [Number(readFileSync(path.join(stateDir, `daemon-${TEST_BRIDGE_PORT}.pid`), 'utf8'))];
+  } catch { /* no daemon has been started by this run */ }
+  const { freed, survivors } = await freePortSafely(TEST_BRIDGE_PORT, { ownedPids });
+  if (!freed) throw new Error(`Test bridge port ${TEST_BRIDGE_PORT} is occupied by ` +
+    survivors.map(holder => `pid ${holder.pid} (${holder.command})`).join(', ') +
+    '. Leave that process running and select another RETICLE_PORT.');
+}
+
+let failed = 0;
+/** Names of the specs that failed, so the SUMMARY can name them — see below. */
+const failures = [];
+for (const name of specs) {
+  await freePort();
+  process.stdout.write(`\n──────── ${name} ────────\n`);
+  // `detached` puts the spec in its OWN process group, so anything it spawned — a browser, a server,
+  // a daemon — can be cleaned up as a unit when it exits.
+  //
+  // The port sweep above only frees the BRIDGE port, which is the shape of the failure I happened to
+  // hit rather than the shape of the failure itself: a spec binding any other port leaves the same
+  // cascade behind. Measured: a spec holding :9960 failed every later run of itself the same way
+  // :4400 did. Killing the group is port-agnostic and needs no list of ports to keep up to date.
+  const child = spawn('node', [path.join(specsDir, `${name}.mjs`)], {
+    stdio: 'inherit',
+    detached: true,
+  });
+  // Capture the SIGNAL too. `close` reports (code, signal), and a spec killed by a signal arrives
+  // with code === null — which the failure line then printed as "exit null", a message that says
+  // only "something went wrong somewhere" and sent me to re-run the spec by hand to learn anything.
+  const { code, signal } = await new Promise((res) =>
+    child.on('close', (c, sig) => res({ code: c, signal: sig })),
+  );
+  try {
+    // Negative pid targets the group. ESRCH just means everything already exited, which is the norm.
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    /* group already gone */
+  }
+  if (0 !== code) {
+    const how = signal === null || signal === undefined ? `exit ${code}` : `killed by ${signal}`;
+    failed += 1;
+    failures.push(`${name} (${how})`);
+    process.stdout.write(`\n[e2e] ✗ ${name} FAILED (${how})\n`);
+  }
+}
+
+await freePort();
+process.stdout.write(
+  `\n================ e2e ${desktop ? 'desktop ' : ''}battery: ${specs.length - failed}/${specs.length} specs passed ================\n`,
+);
+// Name them HERE too, not only where they happened. The per-spec line is thousands of lines up by
+// the time the battery ends, so "21/22" was in practice an unnamed failure: two intermittent ones
+// were investigated from scratch because the summary — the part anyone actually reads, and all that
+// survives in a CI tail — did not say which spec it was.
+if (failures.length > 0) {
+  process.stdout.write(`   failed: ${failures.join(', ')}\n`);
+}
+process.exit(failed === 0 ? 0 : 1);

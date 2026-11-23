@@ -1,0 +1,421 @@
+/**
+ * Which daemon does THIS project belong to?
+ *
+ * The system answered that two incompatible ways. Build plugins asked the registry by projectId, the
+ * way `pickDaemonPort` was designed to be asked. The CLI and the MCP proxy asked a NUMBER —
+ * `envPort ?? projectPort ?? 4400` — and then attached to whatever owned it, whoever it belonged to.
+ *
+ * So every project on a machine funnelled into one daemon. Its recorded identity was whichever
+ * project won the race to the port, which made the registry entry wrong the moment a second project
+ * attached, and made one `kill` on one well-known port a machine-wide outage for every agent at once.
+ *
+ * It worked anyway, by luck: everyone defaulted to the same number, so everyone found each other.
+ * The luck ends the moment a daemon is anywhere but the default — which is exactly when discovery was
+ * supposed to help, and exactly when it returned nothing.
+ *
+ * This module is the one answer both sides now use. It is pure and injectable: no process spawning,
+ * no port binding, nothing that needs a real `~/.reticle` to test.
+ */
+
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  DaemonRegistryEntrySchema,
+  daemonRegistryPort,
+  pickDaemonPort,
+  type DaemonRegistryEntry,
+} from '@reticlehq/core/artifacts';
+import { ReticleEnv, RETICLE_DEFAULT_PORT } from '@reticlehq/core';
+import { isSameOrAbove, portFromEnv } from '../setup/init/init-port.js';
+
+const RETICLE_PORT_ENV = ReticleEnv.PORT;
+
+/**
+ * Every well-formed registry entry in `home`.
+ *
+ * A corrupt or half-written entry is skipped rather than thrown on: the registry is written by other
+ * processes that can be killed mid-write, and one bad file must not make a machine's daemons
+ * undiscoverable. Validated through core's schema so a shape change cannot silently pass here.
+ */
+export function readDaemonRegistry(home: string): DaemonRegistryEntry[] {
+  let files: string[];
+  try {
+    files = readdirSync(home);
+  } catch {
+    return []; // no ~/.reticle yet: no daemon has ever run here
+  }
+  const entries: DaemonRegistryEntry[] = [];
+  for (const file of files) {
+    if (null === daemonRegistryPort(file)) {
+      continue;
+    }
+    try {
+      const parsed = DaemonRegistryEntrySchema.safeParse(
+        JSON.parse(readFileSync(join(home, file), 'utf8')),
+      );
+      if (parsed.success) {
+        entries.push(parsed.data);
+      }
+    } catch {
+      continue;
+    }
+  }
+  return entries;
+}
+
+/**
+ * The port of the live daemon serving `projectId`, or undefined when this project has none.
+ *
+ * Undefined means "start one", never "use the default and hope". That distinction is the fix: the old
+ * path had no way to express "no daemon of mine exists", so it fell through to a number and attached
+ * to a stranger.
+ *
+ * The selection rule is core's `pickDaemonPort`, shared with every build plugin, so the daemon side
+ * and the app side cannot disagree about which daemon is ours.
+ */
+export function resolveDaemonForProject(
+  projectId: string | undefined,
+  home: string,
+  alive: (pid: number) => boolean,
+  /** `port` in this project's `.reticle.json`. It wins as it does for the page (#2341). */
+  configuredPort?: number,
+): number | undefined {
+  return pickDaemonPort(readDaemonRegistry(home), projectId, alive, configuredPort) ?? undefined;
+}
+
+/**
+ * May `caller` take over a daemon already sitting on the port it wanted?
+ *
+ * Two deliberate escape hatches, both of which keep an existing install working:
+ *
+ * A daemon that claims NO project was started somewhere without a `.reticle.json` — the global MCP
+ * registration in a directory that is not an app, which is how Reticle is documented to be
+ * installed. It belongs to nobody, so it belongs to whoever asks; refusing would break every user running Reticle
+ * globally, which is how it is documented to be installed.
+ *
+ * A caller with no project of its own has no identity to defend and nothing to be confused about, so
+ * it keeps the old permissive behaviour rather than being locked out of a daemon it can use.
+ *
+ * A daemon that runs inside the caller's project folder is a package of the caller's own workspace,
+ * for example `apps/web` below an agent at the monorepo root (see `daemonInsideProject`). It is the
+ * same repository, so its different id is not another application.
+ *
+ * Everything else — a named daemon and a differently-named caller — is the cross-project bleed, and
+ * is the one case this refuses.
+ */
+export function adoptable(
+  daemonProjectId: string | undefined,
+  callerProjectId: string | undefined,
+  daemonInside = false,
+): boolean {
+  if (daemonInside) {
+    return true;
+  }
+  if (daemonProjectId === undefined || 0 === daemonProjectId.length) {
+    return true;
+  }
+  if (callerProjectId === undefined || 0 === callerProjectId.length) {
+    return true;
+  }
+  return daemonProjectId === callerProjectId;
+}
+
+/**
+ * Does the daemon on `port` run from inside `projectDir`, the folder of the caller's `.reticle.json`?
+ *
+ * Reported from the field: in an agent session at a monorepo root, `init` in `apps/web` replaced the
+ * daemon with one for that app. Both MCP proxies then refused every call, because the root config
+ * named another project id. The registry records each daemon's folder, and a daemon below the
+ * caller's project folder is in the caller's own repository. False when the caller has no project.
+ */
+export function daemonInsideProject(
+  port: number,
+  home: string,
+  projectDir: string | undefined,
+): boolean {
+  if (projectDir === undefined) {
+    return false;
+  }
+  const cwd = readDaemonRegistry(home).find((e) => e.port === port)?.cwd;
+  return cwd !== undefined && isSameOrAbove(projectDir, cwd);
+}
+
+/** The project a daemon on `port` claims, or undefined when it claims none / is not registered. */
+export function daemonProjectAt(port: number, home: string): string | undefined {
+  return readDaemonRegistry(home).find((e) => e.port === port)?.projectId;
+}
+
+/**
+ * Live daemons OTHER than `myPort` that an app for this project has connected to.
+ *
+ * The split brain this whole module was written to prevent has a second half nobody was reporting.
+ * `resolveMcpPort` correctly refuses to adopt a stranger's daemon and relocates to an OS-assigned
+ * port — and the APP, which resolves its own port independently (core's `pickDaemonPort` in the
+ * build plugin, falling back to the documented default when nothing matches), can land on the
+ * stranger. The pairing token is per USER, not per project, so that connect SUCCEEDS: the app is
+ * live on one daemon and the agent is attached to a different, empty one.
+ *
+ * Every individual check is then green. The browser shows an instrumented page, `reticle status`
+ * reports a session, the agent reports Reticle registered and enabled — and the agent's tools see
+ * nothing, with a no-session diagnosis that tells it to start a dev server that is already running.
+ *
+ * `connectedOn` is injected rather than imported so this stays free of the session layer (which
+ * imports from here) and so the rule is testable without a real `~/.reticle`. Callers pass
+ * `hasProjectConnectedBefore` bound to the same projectId.
+ *
+ * Only LIVE daemons are named: a port a session used yesterday is history, not a split.
+ *
+ * A port this project used before `.reticle.json` moved it is history too (#2341). When the
+ * configured port is `myPort` and the page's own rule (core's `pickDaemonPort`, rule 1) picks it,
+ * the current app URL connects here. A live daemon on the prior port and its connection record do
+ * not change where the page dials, so they are not a split.
+ */
+export function daemonsServingProjectElsewhere(
+  projectId: string | undefined,
+  myPort: number,
+  home: string,
+  alive: (pid: number) => boolean,
+  connectedOn: (port: number) => boolean,
+  /** `port` in this project's `.reticle.json`: the port the page dials when a daemon answers there. */
+  configuredPort?: number,
+): readonly number[] {
+  if (projectId === undefined || 0 === projectId.length) {
+    return [];
+  }
+  const entries = readDaemonRegistry(home);
+  if (
+    configuredPort === myPort &&
+    pickDaemonPort(entries, projectId, alive, configuredPort) === myPort
+  ) {
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.port !== myPort && alive(entry.pid) && connectedOn(entry.port))
+    .map((entry) => entry.port)
+    .sort((a, b) => a - b);
+}
+
+/** Live daemons that serve a named project, on any port but `myPort`. */
+export function projectDaemonsElsewhere(
+  myPort: number,
+  home: string,
+  alive: (pid: number) => boolean,
+): { port: number; projectId: string }[] {
+  return readDaemonRegistry(home)
+    .filter((entry) => entry.port !== myPort && alive(entry.pid))
+    .flatMap((entry) =>
+      entry.projectId === undefined || 0 === entry.projectId.length
+        ? []
+        : [{ port: entry.port, projectId: entry.projectId }],
+    )
+    .sort((a, b) => a.port - b.port);
+}
+
+/**
+ * The sentence for a daemon started outside any project while projects run their own daemons, or
+ * `undefined` when there are none. Its sessions are empty because the apps dial their own ports,
+ * and "check your scope" is not something an agent inside an editor can act on (#1240).
+ */
+export function projectlessNote(
+  myPort: number,
+  others: readonly { port: number; projectId: string }[],
+): string | undefined {
+  const first = others[0];
+  if (first === undefined) {
+    return undefined;
+  }
+  const listed = others.map((o) => `${o.projectId} on :${String(o.port)}`).join(', ');
+  return (
+    `this daemon on :${String(myPort)} was started outside any project, and the projects on this ` +
+    `machine run their own daemons: ${listed}. Their apps connect there, not here. Point the MCP ` +
+    `server at one — set ${RETICLE_PORT_ENV}=${String(first.port)} in its config, or launch it from ` +
+    'that project directory.'
+  );
+}
+
+/**
+ * The sentence for a split brain, or `undefined` when there is none.
+ *
+ * Stated as a fact about two ports rather than a hedge, because unlike the sibling-port observation
+ * next door this is not "something is listening somewhere" — it is this project's own connection
+ * record naming a daemon that is not the one being asked. The wording says which side is empty,
+ * since the failure is invisible precisely because both sides look healthy from where they stand.
+ */
+export function splitBrainNote(
+  myPort: number,
+  elsewhere: readonly number[],
+  /** This project and the registry home, to tell whether the app's daemon belongs to another project. */
+  owner?: { projectId: string | undefined; home: string },
+  /** Where `RETICLE_PORT` is read from; injectable so the note is testable. */
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string | undefined {
+  if (0 === elsewhere.length) {
+    return undefined;
+  }
+  const listed = elsewhere.map((port) => `:${String(port)}`).join(', ');
+  const first = elsewhere[0] ?? myPort;
+  // The app landed on ANOTHER project's daemon (#1652): two projects share a port. `resolveMcpPort`
+  // never adopts a daemon registered to a different project, so RETICLE_PORT would only relocate the
+  // agent again. The step that works is giving this project its own port, so its app comes here.
+  // Owner by port alone is safe: `elsewhere` is already liveness-filtered (`daemonsServingProjectElsewhere`).
+  const holder = owner === undefined ? undefined : daemonProjectAt(first, owner.home);
+  if (owner !== undefined && holder !== undefined && !adoptable(holder, owner.projectId)) {
+    // Port resolution is env-first (`--port`, `RETICLE_PORT`, `.reticle.json`, 4400), so a
+    // `RETICLE_PORT` left in the agent's MCP config from the old advice outranks the new `port`.
+    const envFirst =
+      portFromEnv(env) === undefined
+        ? 'Give this project its own port instead: set'
+        : `Give this project its own port instead: first remove ${RETICLE_PORT_ENV} from the agent's ` +
+          'MCP config, because it takes precedence over `.reticle.json`, then set';
+    return (
+      `this project's app is connected to the Reticle daemon on :${String(first)}, which is ` +
+      `registered to another project, "${holder}", while this project's daemon is on ` +
+      `:${String(myPort)} — the two projects share a port, and the agent is attached to the empty ` +
+      `half. Pointing the agent at :${String(first)} will not help: an MCP server never attaches to ` +
+      `another project's daemon. ${envFirst} \`port\` in its ` +
+      `.reticle.json to one no other project uses (for example ${String(myPort)}), then restart the ` +
+      `dev server so the app connects to this project's daemon, and restart the agent session. ` +
+      `Leave :${String(first)} running; it serves "${holder}".`
+    );
+  }
+  // The agent moves, not the app (#1546). The daemon the app is on is a working session this agent
+  // did not start, and it may be a person's, another agent's or another project's. Stopping it was
+  // the first thing this used to say. It comes last now, with what it costs.
+  return (
+    `this project's app is connected to a DIFFERENT Reticle daemon (${listed}), while this one is ` +
+    `on :${String(myPort)} — two daemons for one project, and the agent is attached to the empty ` +
+    'half. Nothing is wrong with the app or the wiring. Move the agent to the app: set ' +
+    `${RETICLE_PORT_ENV}=${String(first)} in this MCP server's config, or launch the agent from the ` +
+    `project directory the dev server runs in, then restart the agent session. Leave :${String(first)} ` +
+    'running. Only if nothing else is using it, `reticle stop --port ' +
+    `${String(first)}\` and a dev server restart move the app here instead; that disconnects every ` +
+    'tab and agent on that daemon.'
+  );
+}
+
+/**
+ * The other stance on the same split, for a command standing on the port that HAS the app.
+ *
+ * `splitBrainNote` is asked from the empty daemon and reads the connection record. From the daemon
+ * the app is connected to there is nothing missing to notice — sessions are live, every check is
+ * green — and the only visible fact is that this project ALSO owns a live daemon somewhere else.
+ * One project, two daemons, is a split whichever end you are standing on, and saying it from both
+ * ends is the difference between a user inferring it from two green checkmarks and being told.
+ *
+ * Silent for a caller with no project (it owns no daemon to be split from) and silent when the port
+ * being inspected is the project's own.
+ */
+export function wrongDaemonNote(
+  inspectedPort: number,
+  ownPort: number | undefined,
+): string | undefined {
+  if (ownPort === undefined || ownPort === inspectedPort) {
+    return undefined;
+  }
+  return (
+    `this is not this project's own daemon: the registry says it owns a live daemon on ` +
+    `:${String(ownPort)} and this command is looking at :${String(inspectedPort)}. Two daemons for ` +
+    'one project means the half your agent is attached to and the half your app is connected to can ' +
+    'be different processes, with both reporting healthy. Stop one of them and restart the dev ' +
+    'server so everything lands on the same port.'
+  );
+}
+
+/**
+ * Why the proxy serves `port` and not the `requested` one, in words a person can act on. It said
+ * "the requested port serves a different project" for every move, including the commonest one: this
+ * project's own daemon was already running elsewhere (a `connect` started it on the default).
+ */
+export function relocationReason(
+  requested: number,
+  port: number,
+  projectId: string | undefined,
+  home: string,
+  alive: (pid: number) => boolean,
+): string {
+  const at = `:${String(port)}`;
+  if (projectId !== undefined && resolveDaemonForProject(projectId, home, alive) === port) {
+    return (
+      `this project's daemon is already running on ${at}, so the agent uses it instead of ` +
+      `:${String(requested)}. To use :${String(requested)}, run \`reticle stop --port ${String(port)}\` ` +
+      'and reconnect the agent.'
+    );
+  }
+  const holder = daemonProjectAt(requested, home);
+  if (holder !== undefined && holder !== projectId) {
+    return (
+      `:${String(requested)} serves project "${holder}", so this one is served on ${at}. Give this ` +
+      'project its own port (RETICLE_PORT, or `port` in its .reticle.json) and restart the agent.'
+    );
+  }
+  if (projectId === undefined) {
+    return `no project here, and the one live project daemon is on ${at}: the agent uses it.`;
+  }
+  return `nothing usable answered on :${String(requested)}, so the agent is served on ${at}.`;
+}
+
+/**
+ * The port this agent's MCP proxy should serve, decided BEFORE the proxy starts.
+ *
+ * Resolved once rather than per reconnect because the proxy's transport is built around a fixed
+ * number, and making it chase a moving port would mean reworking the reconnect path — the one piece
+ * of this system whose failure mode is "the MCP server disappeared mid-session". The port it settles
+ * on is this project's own, so the thing it would be chasing is a daemon it alone is responsible for.
+ *
+ * The order is the whole fix:
+ *   1. our project's live daemon, wherever it is listening — a daemon that moved is still ours;
+ *   2. the preferred port, but only if free or holding a daemon we may adopt;
+ *   3. a port the OS gives us, when the preferred one belongs to somebody else.
+ *
+ * Step 3 is what stops a second project from attaching to the first project's daemon. That single
+ * silent adoption is what made every agent on a machine share one process, one identity and one
+ * blast radius.
+ */
+export async function resolveMcpPort(
+  preferred: number,
+  projectId: string | undefined,
+  home: string,
+  deps: {
+    alive: (pid: number) => boolean;
+    daemonPresent: (port: number) => Promise<boolean>;
+    pickPort: (preferred: number) => Promise<number>;
+  },
+  /** The port this project's `.reticle.json` names: the one its app dials. */
+  own?: number,
+  /** The folder of this project's `.reticle.json`; a daemon below it is this workspace's own. */
+  projectDir?: string,
+): Promise<number> {
+  const mayAdopt = (port: number): boolean =>
+    adoptable(daemonProjectAt(port, home), projectId, daemonInsideProject(port, home, projectDir));
+  const mine = resolveDaemonForProject(projectId, home, deps.alive);
+  if (mine !== undefined) {
+    return mine;
+  }
+  if (!(await deps.daemonPresent(preferred))) {
+    // A caller outside any project (an editor's user-scope MCP, launched from $HOME) used to dial the
+    // default and never see the one project that had moved off it (#1240). With exactly one project
+    // daemon live, that is the one; with several, the no-session answer names them instead.
+    // Only on the DEFAULT port, which is the guess #1240 corrects. A port passed with --port or
+    // RETICLE_PORT is a choice: relocating it attached an unwired app to another project's daemon.
+    const projects =
+      projectId === undefined && RETICLE_DEFAULT_PORT === preferred
+        ? projectDaemonsElsewhere(preferred, home, deps.alive)
+        : [];
+    return 1 === projects.length ? (projects[0]?.port ?? preferred) : preferred;
+  }
+  if (mayAdopt(preferred)) {
+    return preferred;
+  }
+  // Moved off a port another project holds: to the one this project's app dials, when it is free or
+  // already ours. A random port served nobody — the app kept dialling its own, and the agent was
+  // told "wired, and a dev server is listening, but no session".
+  if (own !== undefined && own !== preferred) {
+    if (!(await deps.daemonPresent(own))) {
+      return own;
+    }
+    if (mayAdopt(own)) {
+      return own;
+    }
+  }
+  return deps.pickPort(preferred);
+}

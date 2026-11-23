@@ -1,0 +1,149 @@
+---
+title: Verification for AI coding agents
+description: Reticle is the proof layer for AI coding agents. It verifies a running web app from the inside and returns a verdict with evidence, not a screenshot.
+mode: wide
+---
+
+Your agent says it works. Reticle checks.
+
+AI-written code has a specific failure mode: it looks right and silently doesn't work. The POST returns 200 and nothing persists. The button is wired to a handler that never fires. One click sends two requests. A screenshot shows all of this as a perfectly nice page.
+
+Reticle reads the program from **inside** your running app. Network, state, console, routing, framework internals.
+
+It answers the only question that matters: did the change actually work? On React it also tells your agent which file to open.
+
+## Install it
+
+Four steps. Each command says what it did and is safe to run twice. Needs Node 20.11 or newer.
+
+| Step | Command | Once per | It worked when |
+| --- | --- | --- | --- |
+| 1. Install | `curl -fsSL https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.sh \| sh` | machine | it says Reticle is on this machine, not in your app yet |
+| 2. Wire your app | `reticle init` (in your app's folder) | project | it lists the files it changed and reports a connected session |
+| 3. Connect _(optional)_ | `reticle connect --project "My App"` | project | `reticle status` shows this folder linked |
+| 4. Sync _(optional)_ | `reticle sync` | whenever you like | your runs show on the dashboard |
+
+On Windows, step 1 is `irm https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.ps1 | iex`. The installer puts `reticle` on your PATH, registers it with every coding agent it finds. It does not wire your app: that is step 2. Skip step 2 and your agent can still check the app with the zero-install lease, which installs nothing. It asks you before it wires the app. The [quickstart](/quickstart) walks every step.
+
+A session listed means the SDK reached the page. Setup is finished when the first run returns a verdict.
+
+### Then hand it to your agent
+
+The installer ends with **Next steps**. Do them in order:
+
+1. **Restart your coding agent.** An agent loads its MCP tools only when it starts, so one that was open during the install cannot see Reticle yet. That restart is why setup begins with a command, not a prompt.
+2. **Paste the prompt the installer printed** into the agent, opened in your app's folder. The agent runs `reticle init`, wires your app, and drives one real flow to a verdict.
+
+<Tip>
+  The plugin and the skills CLI are alternatives to the *registration* half only, not to `init`:
+  neither one touches your app, so you still run `reticle init` afterwards to instrument it. On
+  Claude Code, `/plugin marketplace add reticlehq/reticle` then `/plugin install reticle@reticlehq`
+  registers the MCP server and the skills in one step; on most other agents, `npx skills add
+  reticlehq/reticle --skill reticle`.
+</Tip>
+
+<Card title="What that command actually changes" icon="wand-magic-sparkles" href="/install-agentic">
+  The files it writes, the marks it prints, and how to read its report.
+</Card>
+
+<CardGroup cols={3}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install, connect your agent, and get a real verdict. Five minutes.
+  </Card>
+  <Card title="Why Reticle" icon="lightbulb" href="/why-reticle">
+    The false-green problem, and the evidence that this fixes it.
+  </Card>
+  <Card title="Use cases" icon="list-check" href="/use-cases">
+    Agent-built changes, security behaviour, accessibility, performance, SEO basics and personas.
+  </Card>
+</CardGroup>
+
+<CardGroup cols={3}>
+  <Card title="Desktop apps" icon="display" href="/desktop">
+    Electron and Tauri, including the IPC boundary nothing else can see.
+  </Card>
+  <Card title="Install" icon="download" href="/install-agentic">
+    Let your agent do it, or wire it by hand.
+  </Card>
+  <Card title="Tools" icon="wrench" href="/tools/overview">
+    Every tool, with a real request and a real response.
+  </Card>
+  <Card title="Run it in CI" icon="circle-check" href="/testing">
+    Turn a session into a suite that blocks a bad merge.
+  </Card>
+</CardGroup>
+
+## What it looks like
+
+Your agent names the expected consequence _before_ it acts. That ordering is the whole trick. It is the difference between a check and a rationalisation.
+
+```json
+{
+  "ref": "e4",
+  "action": "click",
+  "until": { "kind": "net", "method": "POST", "urlContains": "/api/todos" }
+}
+```
+
+Reticle clicks, watches, and reports what actually happened. A verdict of `unknown` is not a pass; it means Reticle drove the app and could not tell. It says so rather than guessing, which is a rarer quality in software than it should be.
+
+## What makes it different
+
+<CardGroup cols={2}>
+  <Card title="No screenshots" icon="eye-slash">
+    No vision model, no pixel guessing. Reticle reads program truth, so the answer is deterministic
+    and the same every run.
+  </Card>
+  <Card title="Points at the source" icon="crosshairs">
+    On React, a DOM node maps back to `src/App.tsx:104`. Finding the bug is half the job; knowing
+    which file to open is the half that makes an agent useful.
+  </Card>
+  <Card title="Cheap to ask" icon="coins">
+    Narrow questions instead of dumping the whole accessibility tree into the context window every
+    single step.
+  </Card>
+  <Card title="Yours, locally" icon="lock">
+    Dev-only and localhost-only. Your app's data stays on your machine; anonymous usage counts are
+    sent unless you [turn them off](/telemetry).
+  </Card>
+</CardGroup>
+
+## What people use it for
+
+Beyond proving an agent's change, people use Reticle to check security behaviour (access control by role, calls that must never fire, CSP violations), accessibility and UX (roles, names, focus, keyboard), performance (request counts, long tasks, layout shift), SEO basics (titles, headings, links, redirects), and to drive the app as different users. [Use cases](/use-cases) has what each one checks and a call to run.
+
+It pairs well with a visual testing tool for pixel diffs, Playwright for sites you don't own, axe for full WCAG audits and a security scanner for vulnerability discovery.
+
+## The evidence
+
+Every number is measured by a committed harness, including the ties.
+
+![One honest test, two apps: Reticle has the highest Verification Efficiency on the controlled app and the lowest observation cost on the real dashboard](/images/bench-two-apps.png)
+
+<Card title="Read the full benchmark" icon="chart-column" href="/benchmarks">
+  How every number was measured, what it means, and where the tools tie.
+</Card>
+
+## Built for agents, readable by humans
+
+Reticle is used by a coding agent far more often than by a person, so these docs are built to be fetched by one. Every page has a plain-Markdown twin, and the whole site collapses into a single file when an agent wants the lot.
+
+<Card title="Docs for agents" icon="robot" href="/for-agents">
+  Markdown endpoints, `llms.txt`, and which page answers which question.
+</Card>
+
+## Build with us
+
+The roadmap moves on what people actually hit, so tell us.
+
+<CardGroup cols={2}>
+  <Card title="Join the Discord" icon="discord" href="https://discord.gg/BwAbzv9ZRz">
+    Ask questions, show us what you are verifying, and tell us what broke. The roadmap moves on what
+    people actually hit.
+  </Card>
+  <Card title="Star the repo" icon="star" href="https://github.com/reticlehq/reticle">
+    It is the cheapest way to help, and it is genuinely how other people find this.
+  </Card>
+</CardGroup>
+
+Found a bug, or something you wished existed? `reticle_session { action: "feedback" }` sends it in one call from your agent, and `npx @reticlehq/server feedback "…"` from a terminal. If Reticle could not tell you what happened, that is our defect and we want to know.

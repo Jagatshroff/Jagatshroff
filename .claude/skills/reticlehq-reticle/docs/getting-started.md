@@ -1,0 +1,583 @@
+---
+title: Getting started
+description: 'Zero to your agent verifying your real app, step by step, with working code for Vite, Next.js, React and plain HTML.'
+icon: rocket
+---
+
+**To get started: run the installer, then `reticle init` in your app directory before opening your coding agent.** The installer puts the CLI on the machine and registers its MCP tools with supported agents. `init` wires your app and checks that a browser session connected; without it the agent has the tools and nothing to point them at. For a cloud dashboard, use `reticle connect --project "My App"`, which does the same and also links a cloud project and syncs history. The first run is what proves anything: ask your agent to verify one journey in your app, or, on a project linked with `reticle connect`, use `reticle_verify { action: "explore", persona: "<the journey worth proving>" }`. A connected app is not a verified one. You need Node 20.11 or newer, an app you run locally, and an agent that speaks MCP.
+
+> **Looking for the fast path?** [Quickstart](/quickstart) gets you to a real verdict in five minutes, and every response on it was captured live. [Agentic install](/install-agentic) and [Manual install](/install-manual) cover setup in detail, per agent and per framework.
+>
+> This page is the long-form walkthrough: the same ground, more slowly, plus per-framework wiring, multi-app setups and prerelease notes. Start here if you want the whole picture in one file rather than the fast route.
+
+This walks you from zero to your agent verifying your app, step by step, with real code for real frameworks. ~10 minutes.
+
+- [What you set up](#what-you-set-up)
+- [Prerequisites](#prerequisites)
+- [Step 1: Connect your coding agent to the MCP server](#step-1-connect-your-coding-agent-to-the-mcp-server)
+- [Wire your app: on the first run, or `reticle init`](#wire-your-app-on-the-first-run-or-reticle-init)
+- [Add a cloud dashboard: `reticle connect`](#add-a-cloud-dashboard-reticle-connect)
+- [Step 2: Embed the SDK in your app](#step-2-embed-the-sdk-in-your-app)
+  - [Vite and React](#vite-and-react)
+  - [Next.js](#next-js)
+  - [Plain HTML and other frameworks](#plain-html-and-other-frameworks)
+- [Step 3: (React) component and source-file mapping](#step-3-react-component-and-source-file-mapping)
+- [Step 4: Run it and verify the connection](#step-4-run-it-and-verify-the-connection)
+- [Step 5: Your first verification](#step-5-your-first-verification)
+- [Step 6: Make your app agent-legible](#step-6-make-your-app-agent-legible-optional-high-leverage)
+- [Common setups at a glance](#common-setups-at-a-glance)
+- [Troubleshooting](#troubleshooting)
+
+---
+
+## What you set up
+
+Three pieces, each tiny:
+
+```mermaid
+flowchart LR
+    A["coding agent<br/>(Claude Code)"]
+    S["reticle bridge + server<br/>npx @reticlehq/server"]
+    B["your app<br/>+ the Reticle SDK<br/>(dev only)"]
+
+    A <-- "MCP over stdio" --> S
+    S <-- "WebSocket<br/>localhost:4400" --> B
+```
+
+Three pieces, each from the package for its audience:
+
+1. **The MCP server.** Your agent launches it with `npx @reticlehq/server mcp`; it hosts the tools _and_ the WebSocket bridge your app connects to. You don't run it by hand; the agent does.
+2. **The SDK**: `import { reticle } from '@reticlehq/react'`, a few lines in your app's dev entry point.
+3. **(Optional) React adapter + source-mapping**, so `reticle_look { action: "element" }` can tell the agent which component/file to edit (also from `@reticlehq/react`).
+
+By default, everything is **dev-only** and **localhost-only**, and it is removed from production builds. [Production mode](/production-mode) is a separate opt-in.
+
+## Prerequisites
+
+- Node 20.11 or newer, and a package manager (npm/pnpm/yarn).
+- A coding agent that speaks MCP: Claude Code, Cursor, Windsurf, Claude Desktop, etc.
+- A web app you run locally in dev (any framework; React gets the richest features).
+
+---
+
+## Step 1: Connect your coding agent to the MCP server
+
+You don't start the server manually; your agent starts it via MCP. Register Reticle **once, at the user (global) scope** so every project picks it up. There's nothing to add per project.
+
+**The installer does this for every agent on the machine**, which is why it is the first thing on the [quickstart](/quickstart):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.sh | sh     # macOS, Linux
+irm https://raw.githubusercontent.com/reticlehq/reticle/main/install/install.ps1 | iex          # Windows PowerShell
+```
+
+Run it in a terminal before you open your agent and there is nothing to restart. The rest of this section is what it writes, for a machine where you would rather do it by hand.
+
+**Claude Code**, one command:
+
+```bash
+claude mcp add reticle -s user -- npx @reticlehq/server mcp
+```
+
+(`reticle setup mcp` and `reticle init` both run exactly this for you. `-s user` is what makes it global; drop it for a project-local registration instead.)
+
+**Cursor**: add to your global `~/.cursor/mcp.json` (not per-project; `reticle init` writes this for you):
+
+```jsonc
+{
+  "mcpServers": {
+    "reticle": { "command": "npx", "args": ["@reticlehq/server", "mcp"] },
+  },
+}
+```
+
+Other MCP clients (Windsurf, Claude Desktop, …) use the same `command`/`args` shape. An agent that was already open reads its server list at startup, so reopen it once. When it launches Reticle, the bridge starts listening on `ws://localhost:4400`.
+
+> Want a different port? Set `RETICLE_PORT` in the server `env` and pass the same URL to `reticle.connect({ url })` in Step 2.
+
+---
+
+## Wire your app: on the first run, or `reticle init`
+
+Installing Reticle changes nothing in your project, and your agent's Reticle calls do not wire it either. In a project that has never connected, the first `reticle_session { action: "list" }` changes no file. It names the zero-install lease, which checks the running app now with nothing installed, and it tells the agent to ask you before it runs `init`. `init` changes files, so it runs only when you agree. Run `init` yourself to wire a project ahead of time or to preview the changes.
+
+From your project root:
+
+```bash
+RETICLE_INSTALL_SOURCE=docs_site npx @reticlehq/server init
+```
+
+It detects your framework, package manager, and React version, then:
+
+- **registers the Reticle MCP server once, globally, for each agent you have installed** (Claude Code via `claude mcp add reticle -s user`, plus every other agent config it finds: Cursor, Windsurf, VS Code, Gemini CLI, OpenCode and Antigravity; Codex CLI through `codex mcp add`, or the lines to paste when that command is missing), so every project on this machine gets it; you never re-add it per project,
+- **writes a verification rule into your agent's instruction file** (`CLAUDE.md`, `.cursor/rules/reticle.mdc`, or `AGENTS.md`), so the agent knows to verify a feature with Reticle _after building it_, not only when you remember to ask (idempotent; appended below anything you already have),
+- installs the SDK kit (`@reticlehq/react`) and the right build plugin (`@reticlehq/vite-plugin` or `@reticlehq/next`) as dev dependencies,
+- **Vite:** adds the `reticle()` plugin to your config, which wires source mapping _and_ `reticle.connect()` for you, so there is nothing else to edit,
+- **Next:** wraps `next.config` in `withReticle` and mounts a generated `<ReticleDev />` component in your root layout; on a config shape it does not recognise it prints the snippet to paste instead (it never half-edits a build config).
+- **Other frameworks:** writes or prints the connect wiring for that framework (see [Frameworks](/frameworks)).
+
+The MCP registration is the same command for every project, so it is registered at **user scope**, not in a per-project `.mcp.json`. Reticle starts a daemon for each project when an agent needs one. Only the SDK (the `reticle()` plugin or the connect call) is added per project.
+
+Re-running is safe: already-registered and already-patched steps are skipped, and on a wired project it goes straight to proving the app still works. Preview without writing via `npx @reticlehq/server init --dry-run`.
+
+`init` does not stop at writing files. It starts your dev server, opens the app, and waits for a session to connect from inside it. That connection is the whole proof that onboarding worked. If a dev server was already running without Reticle, restart it once: it read the build config before `init` edited it. It exits non-zero if nothing connected and prints what is left to do. It does NOT drive. Then prove a flow. That is the FIRST RUN, and it is a separate call: drive one journey with `reticle_act_and_wait` and an `until` on its last step. On a project linked with `reticle connect`, `reticle_verify { action: "explore", persona: "<who does what>" }` lets the Reticle Harness drive it on the platform instead (every plan includes credits, Free too). Either way what was driven is saved as a flow, so later checks replay it with no model in the loop.
+
+These carry what the command cannot work out for itself:
+
+| Flag | What only you know |
+| --- | --- |
+| `persona: "<what>"` | Belongs to the first run, not to `init`. Which journey proves the thing you care about: Reticle can list the buttons on your page; it cannot know that checkout matters and the theme toggle does not. |
+| `--env KEY=VALUE` | What your app needs to reach a usable state: the key from `.env.example`, the mock backend, the variable that skips an auth wall. Repeatable. |
+| `--app <dir>` | Which app in a monorepo. It finds the servable ones; only you know which you are working in. |
+
+The rest are dials: `--license <key>` (writes it to `.env` and keeps `.env` out of git), `--json` (one object for an agent to read), `--files-only` (write, register, pre-approve, and stop, which is what `init` did before it learned to boot the app, and what an existing install re-runs to pick up new wiring), `--relaunch` (prints the command that restarts the conversation you are in, with the tools loaded: the restart step most installs stall on, and it composes with `--files-only`), `--no-open`, `--dry-run`, `--port N`, `--no-mcp`, `--no-install`.
+
+If you ran `--files-only` with a dev server already running, restart it, then skip to [Step 4](#step-4-run-it-and-verify-the-connection). The manual steps below explain what `init` sets up, if you prefer to wire it yourself.
+
+---
+
+## Add a cloud dashboard: `reticle connect`
+
+Optional. Instead of, or after, `init`, run this in your app directory:
+
+```bash
+npx @reticlehq/server connect --project "My App"
+```
+
+The browser opens. Sign in with Google or GitHub, or create a free account at app.reticle.sh, then approve the short code that the browser and the terminal show. A new account gets free credits to try the Harness. What syncs, and how to switch each part off, is in [What is recorded](what-is-recorded.md). The command then links this folder and sends any history already on the machine. Open or restart your coding agent and ask it to verify one real journey. For a new project, the dashboard has no result until that first run is recorded.
+
+## Step 2: Embed the SDK in your app
+
+Install the SDK kit plus your framework's build plugin as dev dependencies (the kit re-exports the browser sensor, so one install gives both `reticle` and `install`):
+
+```bash
+npm i -D @reticlehq/react @reticlehq/vite-plugin     # Vite; or: pnpm add -D …
+# Next.js instead? npm i -D @reticlehq/react @reticlehq/next
+```
+
+Then call `reticle.connect()` once, in dev only. Where you put it depends on your framework.
+
+### Vite and React
+
+**Recommended: the Vite plugin (one line, does everything).** Add `reticle()` to your `vite.config.ts`:
+
+```ts
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+import { reticle } from '@reticlehq/vite-plugin';
+
+export default defineConfig({
+  plugins: [reticle(), react()],
+});
+```
+
+This injects `reticle.connect()` for you _and_ handles React 19 source mapping (Step 3), so there's no entry-file edit and no separate Babel setup. A production `vite build` injects nothing and replaces the SDK with an inert stub, so it can never reach production. (This is exactly what `reticle init` adds.)
+
+<details>
+<summary>Prefer to wire it by hand instead of the plugin?</summary>
+
+In your entry file (`src/main.tsx`), call `connect()` in dev only:
+
+```tsx
+import { StrictMode } from 'react';
+import { createRoot } from 'react-dom/client';
+import { reticle, SESSION_AUTO } from '@reticlehq/react';
+import { App } from './App';
+
+if (import.meta.env.DEV) {
+  // SESSION_AUTO gives this tab a unique session id, so multiple apps/tabs never collide.
+  // The token is the contents of ~/.reticle/pairing-token; see "The pairing token" below.
+  reticle.connect({ session: SESSION_AUTO, token: import.meta.env.VITE_RETICLE_TOKEN }); // ws://localhost:4400 by default
+}
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+```
+
+On React 19 you then also need the source-mapping Babel plugin from Step 3. The Vite plugin above bundles both, which is why it's the recommended path.
+
+</details>
+
+### The pairing token (why some setups need one line more)
+
+The daemon auto-generates a **pairing token** on first run and stores it at `~/.reticle/pairing-token` (owner-only, `0600`). The bridge requires it, so another app running on `http://localhost:<some-other-port>` can't quietly register or drive your session. Only code that can read that file (your dev server, not a web page) can present it.
+
+- **Vite plugin users:** nothing to do. The plugin reads the token server-side and injects it into `connect()` for you.
+- **Next.js:** wrap `next.config` in `withReticle` from `@reticlehq/next` (see [Next.js](#next-js) below). It reads the token on the server and gives it to the browser as `NEXT_PUBLIC_RETICLE_TOKEN`, which the `ReticleDev` component passes to `connect()`. You do not set the token yourself.
+- **Hand-wired `connect()` (no plugin):** run `npx @reticlehq/server init`. It writes the token to a git-ignored `reticle.local.js` and prints a snippet that imports it (see [Plain HTML and other frameworks](#plain-html-and-other-frameworks)).
+- **Keep the token out of `.env` files.** Pass it on the dev command (`VITE_RETICLE_TOKEN="$(cat ~/.reticle/pairing-token)" npm run dev`). A production build reads `.env` too, and would write the token into the JavaScript it ships.
+
+### Next.js
+
+First wrap `next.config` in `withReticle`. It reads the pairing token on the server and passes it to the browser. Without it, the bridge refuses the connect:
+
+```ts
+// next.config.ts
+import { withReticle } from '@reticlehq/next';
+import type { NextConfig } from 'next';
+
+const nextConfig: NextConfig = {};
+export default withReticle(nextConfig); // no-op in production
+```
+
+Then create a small client component and mount it in your root layout, in development only:
+
+```tsx
+// app/reticle-dev.tsx
+'use client';
+import { useEffect } from 'react';
+
+export function ReticleDev() {
+  useEffect(() => {
+    if (process.env.NODE_ENV === 'development') {
+      // SESSION_AUTO = a unique id per tab, so several Next apps/tabs never collide on one session.
+      // NEXT_PUBLIC_RETICLE_TOKEN carries the pairing token to the browser (see "The pairing token").
+      const token = process.env.NEXT_PUBLIC_RETICLE_TOKEN;
+      void import('@reticlehq/react').then(({ reticle, SESSION_AUTO }) =>
+        reticle.connect({ session: SESSION_AUTO, ...(token ? { token } : {}) }),
+      );
+    }
+  }, []);
+  return null;
+}
+```
+
+```tsx
+// app/layout.tsx
+import { ReticleDev } from './reticle-dev';
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        {process.env.NODE_ENV === 'development' && <ReticleDev />}
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+### Streamlit
+
+Streamlit owns the top-level HTML document, so it has no template where the plain script tag below can be added. Scripts passed through `st.markdown(..., unsafe_allow_html=True)` are rendered but do not execute.
+
+With Streamlit 1.63 or newer, run `npx @reticlehq/server init` from the project. It detects a `streamlit` dependency or import and prints a copy-pasteable `st.html(..., unsafe_allow_javascript=True)` helper that loads Reticle once in the app document. The helper reads this machine's pairing token from `~/.reticle/pairing-token` when the page is served, so the token is not in the code you paste. Keep the helper development-only.
+
+### Plain HTML and other frameworks
+
+Anywhere your app boots in dev:
+
+```ts
+// What `reticle init` prints for a bundled app with no Vite or Next plugin.
+// reticle.local.js holds this machine's pairing token. Init writes it and adds it to .gitignore.
+if (process.env.NODE_ENV !== 'production') {
+  void Promise.all([
+    import('@reticlehq/react'),
+    import('./reticle.local.js').catch(() => ({})),
+  ]).then(([{ reticle, install }, local]) => {
+    install();
+    reticle.connect({ token: local.token });
+  });
+}
+```
+
+Change the `./reticle.local.js` path so that it points to the project root from your entry module. Do not commit `reticle.local.js`: the token is for this machine only. A teammate runs `reticle init` to get their own.
+
+Plain HTML with no build step: run `npx @reticlehq/server init` in the folder that holds `index.html`. Init does not change `index.html`. It serves the folder with Reticle's static server, which adds a dev-only connect snippet to the page that it serves. With `--url` or `--files-only`, nothing of Reticle's serves the page, so init writes the snippet into `index.html`. That snippet connects only on localhost. Init puts this machine's pairing token in a gitignored `reticle.local.js` beside the page, so the token never lands in anything you publish. A hand-written script tag without that token is refused by the bridge.
+
+> **Want to watch the agent work?** Add `present: true` to `reticle.connect()` for a glowing border, a synthetic cursor that flies to targets, click/hover effects, and a narration HUD. See [usage §16](usage.md#16-presenter-mode-narration-&-fake-clock-watch-+-control).
+
+### Running multiple apps at once
+
+It's common to have several apps open in dev: a few Next.js and React projects, or multiple tabs of the same app. Reticle handles this cleanly **as long as each connection has a unique session id**, which is exactly what `SESSION_AUTO` gives you (a fresh id per tab). The examples above all use it, so you get this for free. When more than one app is connected, a read or a single action targets the focused / most recently active one automatically. A tool that gives a verdict does not guess: it refuses and lists the tabs, so pass an explicit `sessionId` to target a specific app.
+
+**Two separate projects, fully isolated.** If you want each repo to have its own independent Reticle bridge (separate sessions, separate `.reticle/` workspace), give each project its own port. Set the same port in both the MCP server config and the app's connection:
+
+```jsonc
+// project-b/.mcp.json: give this project its own bridge port
+{
+  "mcpServers": {
+    "reticle": {
+      "command": "npx",
+      "args": ["-y", "@reticlehq/server", "mcp"],
+      "env": { "RETICLE_PORT": "4401" },
+    },
+  },
+}
+```
+
+```ts
+// project-b's app: dial the same port
+reticle.connect({ session: SESSION_AUTO, url: 'ws://localhost:4401/reticle' });
+```
+
+**On the Vite plugin?** You don't have a hand-written `connect()` to edit; the plugin injects it. Set the port on the plugin instead, and it bakes the matching URL in for you:
+
+```ts
+// project-b/vite.config.ts
+plugins: [reticle({ port: 4401 }), react()],
+```
+
+Either way, the rule is the same: **the app's bridge port must equal the daemon's `RETICLE_PORT`**, and it's the Reticle bridge port, never your dev-server port. Project A stays on the default `4400`, project B on `4401`; they never touch each other. (A port that is already in use now fails fast with a clear error instead of hanging, so a misconfiguration is obvious.)
+
+---
+
+## Step 3: (React) component and source-file mapping
+
+This is optional but high-value: it lets `reticle_look { action: "element" }` map a DOM element back to the **React component and the source file:line**, so when the agent finds a problem, it knows which file to edit. (The React adapter ships in `@reticlehq/react`; nothing extra to install.)
+
+```ts
+import { install as installReticleReact } from '@reticlehq/react';
+if (import.meta.env.DEV) installReticleReact(); // call before reticle.connect()
+```
+
+**React ≤ 18:** that's all; it uses React's dev `_debugSource`.
+
+**React 19:** React removed `_debugSource`, so the source has to be stamped at build time. **If you added the `reticle()` Vite plugin in Step 2, this is already handled, so skip ahead.** Otherwise add the Babel plugin (`@reticlehq/babel-plugin`) to stamp the source onto elements in dev:
+
+```ts
+// vite.config.ts
+import react from '@vitejs/plugin-react';
+import reticleSource from '@reticlehq/babel-plugin';
+
+export default defineConfig({
+  plugins: [react({ babel: { plugins: [reticleSource] } })],
+});
+```
+
+> **Next.js:** verified on **Next.js 15 / React 19 (app router, SWC)**. For source-file mapping, use `@reticlehq/next` instead of the Babel plugin. It adds a **dev-only webpack pre-loader that keeps SWC** and stamps `data-reticle-source` so `reticle_look { action: "element" }` returns `file:line` (e.g. `app/page.tsx:30`):
+>
+> ```ts
+> // next.config.ts
+> import { withReticle } from '@reticlehq/next';
+> import type { NextConfig } from 'next';
+>
+> const nextConfig: NextConfig = {};
+> export default withReticle(nextConfig); // no-op in production
+> ```
+>
+> This is exactly what `reticle init` writes. `@reticlehq/next` is CommonJS, so a default import (`import reticleNext from '@reticlehq/next'` then `reticleNext.withReticle(...)`) and a CJS `const { withReticle } = require('@reticlehq/next')` both work too, if your config is `.mjs` or `.js`.
+>
+> Component identity works with or without it (Next's internal wrappers are filtered out so you see your components, e.g. just `Page`).
+
+---
+
+## Step 4: Run it and verify the connection
+
+> `reticle init` does this for you: it starts the dev server, opens the app and waits for the session. Read on only if you are wiring by hand, or if it told you it could not.
+
+1. Start your app's dev server as usual (`npm run dev`).
+2. Open it in the browser (the SDK connects when the page loads).
+3. In your agent, ask it to confirm the connection:
+
+> "List Reticle sessions."
+
+The agent calls `reticle_session { action: "list" }` and should see your tab:
+
+```jsonc
+{ "sessions": [{ "sessionId": "my-app", "url": "http://localhost:3000/", "title": "…" }] }
+```
+
+If the list is empty, see [Troubleshooting](#troubleshooting).
+
+---
+
+## Step 5: Your first verification
+
+> On a project linked with `reticle connect`, `reticle_verify { action: "explore", persona: "<what>" }` drives this for you on the platform and saves the flow. This section is what it does, for when you want to do it yourself.
+
+Now just talk to your agent in plain language. For example:
+
+> "Add a 'Refresh' button to the header that re-fetches the dashboard data, then use Reticle to verify clicking it fires `GET /api/dashboard` and shows no console errors."
+
+What the agent does under the hood:
+
+```jsonc
+// finds the button it just added
+reticle_look({ action: "find", by: "role", value: "button", name: "Refresh" })   // → ref e12
+
+// clicks it
+reticle_act({ ref: "e12", action: "click" })                       // → { since: 920 }
+
+// verifies the reaction
+reticle_assert({ timeout_ms: 2000, predicate: { kind: "allOf", predicates: [
+  { kind: "net", method: "GET", urlContains: "/api/dashboard", status: 200, since: 920 },
+  { kind: "console", level: "error", absent: true }
+]}})
+// → { verified: "yes", verdict: { pass: true, … } }
+```
+
+You get a real, evidence-backed answer. If it fails, the agent sees the reason (e.g. the call 404'd, or a `TypeError` in `Dashboard.tsx:88`) and can fix it and re-check.
+
+That's the whole loop. From here, the [Usage Guide](usage.md) covers every tool, the full predicate DSL, and a dozen real situations (login, long lists, eventual consistency, file uploads, LLM calls, regressions, and more).
+
+---
+
+## Step 6: Make your app agent-legible (optional, high-leverage)
+
+The basics above work with zero app changes. These four additions make the agent dramatically faster and let it verify things the DOM can't express; they're what turn Reticle from "usable" into "magic." All are dev-only.
+
+**1. Stable `data-testid` on key elements.** Agents target testids more reliably than visible text (which changes with copy/i18n). Reticle matches testids _exactly_.
+
+```tsx
+<button data-testid="refresh">Refresh</button>
+```
+
+**2. `reticle.signal` for off-DOM facts.** When something matters but isn't visible (a save committed, a webhook arrived, an edit applied, an LLM caption finished), emit a signal the agent can assert on. This is the single highest-value instrumentation.
+
+```ts
+import { reticle } from '@reticlehq/react';
+onSaved(() => reticle.signal('order:saved', { id, total }));
+// agent: reticle_assert({ predicate: { kind: 'signal', name: 'order:saved', dataMatches: { id: '*' } } })
+```
+
+> **Recommended:** instead of importing `reticle` into components, inject a `createReticleEmitter()` emitter and pair each commit with `commitAndSignal(...)` so the mutation↔signal can't drift. `reticle.signal` stays the primitive underneath. See [integration-patterns.md](integration-patterns.md).
+
+**3. `registerStore` so the agent reads state directly.** No need to broadcast a signal for every fact: expose the store and the agent reads it via `reticle_look { action: "state" }`.
+
+```ts
+import { registerStore } from '@reticlehq/react';
+registerStore('cart', useCart); // pass the store itself → auto STATE_CHANGE diffs
+// agent: reticle_look({ action: "state", store: 'cart' })  → { stores: { cart: {...} } }
+```
+
+**4. `registerCapabilities` so a fresh agent learns the surface without reading source.**
+
+```ts
+import { registerCapabilities } from '@reticlehq/react';
+registerCapabilities({
+  testids: ['refresh', 'cart-open', 'checkout'],
+  signals: ['order:saved', 'cart:updated'],
+  stores: ['cart'],
+});
+// agent: reticle_run({ tool: "reticle_capabilities", args: {} })  → the whole testable surface
+```
+
+> **Multi-domain apps:** prefer `registerReticleDomain({ testids, signals, stores })` co-located in one `reticle.ts` per domain. Each self-registers and `reticle_run({ tool: "reticle_capabilities", args: {} })` assembles the union, so there's no central map to forget. See [integration-patterns.md](integration-patterns.md).
+
+> Watch the agent work: pass `present: true` to `reticle.connect()` for a glowing border, a cursor that flies to targets, and a HUD; the agent can call `reticle_session({ action: "narrate", text })` to show its intent. See [usage §16](usage.md#16-presenter-mode-narration-&-fake-clock-watch-+-control).
+
+> **Hover-gated UI (tooltips, hover menus, pointer drag)?** Synthetic events can't trigger native `onMouseEnter`. Enable **real input** by launching your browser with `--remote-debugging-port=9222` and setting `RETICLE_CDP_URL` in the MCP server `env`. Reticle then drives real pointer input and `reticle_act` reports `inputMode:"real"`. See [usage §18](usage.md#18-real-input-mode-native-hover-&-drag).
+
+---
+
+## Going further
+
+Once the loop works, these turn ad-hoc runs into a maintained suite:
+
+- **[Flows, recorder & self-healing](flows.md)**: record a golden path once; Reticle saves it to a git-checked `.reticle/` flow anchored on testid+signal, replays it (with legible drift), and `reticle_verify { action: "heal" }` repairs renamed anchors.
+- **[Testing with `@reticlehq/test`](testing.md)** gives you declarative `reticleTest` specs you run headless / in CI; flows can _become_ the specs.
+- **[Human-in-the-loop control](human-control.md)**: with `present: true`, pause / message / end the agent from the floating panel.
+- **[Integration patterns](integration-patterns.md)** covers the recommended zero-prod-bundle emit adapter, store-layer signals, and incremental adoption.
+
+---
+
+## Common setups at a glance
+
+Everything below comes from the `@reticlehq/react` kit plus your framework's build plugin.
+
+| Stack | SDK connect | Source mapping |
+| --- | --- | --- |
+| Vite + React (any) | `reticle()` plugin (auto), or `connect()` | `reticle()` plugin handles it (incl. React 19) |
+| Next.js (app router) | `ReticleDev` client component in layout (dev) | `@reticlehq/next` (`withReticle`) → component + file:line |
+| SvelteKit | `src/hooks.client.ts` (written by `reticle init`) | `reticle()` plugin stamps `.svelte` → file:line |
+| Vanilla / plain HTML | `reticle.connect()` at boot (dev) | none (refs and testids only) |
+
+### What Svelte support is, and what it is not
+
+`reticle init` detects SvelteKit and writes both halves: a client hook that calls `connect()` (SvelteKit renders through `app.html`, so the plugin's HTML injection never fires) and `reticle()` in `vite.config`, which is what stamps `data-reticle-source`.
+
+**You get** `file:line` on every element in a `.svelte` component, plus everything the framework-agnostic core already gave you (DOM, network, console, routing, storage, actions), and `svelteStore` for reading a Svelte store (see [usage](usage.md)).
+
+**You do not get** component identity. `@reticlehq/react` walks the fiber tree to answer "which component rendered this element"; there is no Svelte equivalent, so snapshots carry the file and line but no component name. Stamping targets Svelte 5's compiler AST and also accepts Svelte 4's; `.svelte.ts` runes modules are code rather than markup and are not stamped.
+
+**It is install-gated, drive-unverified.** The install gate scaffolds a SvelteKit app from scratch, runs `init`, boots it and waits for a session, so the setup is proven. There is no SvelteKit example app that CI drives to a verdict, so the drive is not. [Frameworks](/frameworks) has the full status table.
+
+**Vue is install-gated, drive-unverified.** `init` detects a Vue app (as a Vite app with Vue as the UI library) and the install gate scaffolds one from scratch, runs `init`, boots it and waits for a session, so the setup is proven. What is not proven is the drive: there is no Vue example app in CI. `piniaStore` reads a Pinia store, and everything the framework-neutral core provides works. What you do not get is a `source` field, because source stamping covers JSX and Svelte components and a `.vue` single-file component is neither. See [Frameworks](/frameworks) for the full status table.
+
+---
+
+## Troubleshooting
+
+**`reticle_session { action: "list" }` is empty / "no browser session connected"**
+
+- Run **`reticle status`**. It shows whether the daemon is up and which tabs are connected (url, health, pending flagged bugs) at a glance. No connected sessions means the SDK isn't reaching the bridge.
+- Is your app actually running and open in a browser tab?
+- Is `reticle.connect()` running? (Check it's inside your dev guard and the guard is true.)
+- Port mismatch? If you set `RETICLE_PORT`, pass the same URL to `reticle.connect({ url: 'ws://localhost:<port>/reticle' })`.
+- Need to restart the daemon? **`reticle stop`** cleans it up, no `pkill` needed.
+
+The errors that Reticle returns to the agent carry a `recovery` hint for this case, and for several or unknown sessions, a throttled tab and a missing baseline. The hint tells the agent what to do next.
+
+**The agent can't find an element**
+
+- Ask it to `reticle_look({ action: "page", mode: "interactive" })` to see what's actionable.
+- Add a `data-testid` to the element for a stable handle.
+- Narrow with `scope` (a CSS selector or a ref).
+
+**Assertions are flaky on async UIs**
+
+- Use `timeout_ms` on `reticle_assert` / `reticle_assert { action: "wait" }`.
+- Pass the `since` cursor returned by `reticle_act` so only post-action events count.
+
+**Source file isn't resolving on React 19**
+
+- Wire up `@reticlehq/babel-plugin` (Step 3). Without it, only component identity is available.
+
+**Nothing should run in production**
+
+- Keep `reticle.connect()` behind a dev guard (`import.meta.env.DEV` / `NODE_ENV`). The package is side-effect free and tree-shakes out when unused. As a backstop, `connect()` also self-disables when the build reports `NODE_ENV=production` (so an SSR healthcheck or a prod bundle opened on localhost won't activate it). Pass `allowInProduction: true` only for a deliberate prod diagnostic.
+
+## Installing alongside a Next.js or React prerelease
+
+`@reticlehq/next` declares `peer next >=13`, and `@reticlehq/react` declares `peer react >=18`. If your app runs a **prerelease**, such as a Next.js canary/preview (`16.3.0-preview.9`) or a React RC, npm will refuse the install with `ERESOLVE`.
+
+That is npm's semver rule, not a Reticle restriction: a prerelease version satisfies a range only when some comparator shares its exact `major.minor.patch`. No floor-style range accepts it (verified, including `*`). Marking the peer optional does not help either, because npm still version-checks a peer that is present.
+
+Install with either of these instead. Both are safe; the floor is a real minimum, not a maximum:
+
+```bash
+npm install @reticlehq/next --legacy-peer-deps
+# or use pnpm, whose peer resolution does not hard-fail here
+pnpm add @reticlehq/next
+```
+
+---
+
+## Frequently asked questions
+
+### What exactly does `reticle init` change in my project?
+
+A handful of files, none of them mysterious: a `.reticle.json` project config, your build config (the `reticle()` Vite plugin, or `withReticle` in `next.config`), `package.json` (two dev dependencies), a dev-only capabilities file at `src/reticle-dev.ts` (or `app/reticle-dev.tsx` on Next.js), and your agent's rule files (`CLAUDE.md`, `AGENTS.md`, `RETICLE.md`, `.claude/commands/reticle.md`). It then starts your dev server and opens the app, neither of which changes your source: the dev server is left running for you afterwards. It also registers the MCP server globally, which is a once-per-machine step rather than a per-project one. Run `npx @reticlehq/server init --dry-run` first to see the exact plan before anything is written.
+
+### Do I have to re-register the MCP server for every project?
+
+No. The registration is one command, `npx @reticlehq/server mcp`, for every project, so `init` registers it at user scope. Every later project starts with the tools already there. Only the SDK wiring is per project.
+
+### Why do the Reticle tools not appear after installing?
+
+Because your agent read its MCP server list at startup, before Reticle existed, and no slash command re-reads it. Restart the agent process: quit and reopen Claude Code, reload the window in Cursor, or press Start in `.vscode/mcp.json` in VS Code. `/mcp` only manages servers that are already loaded, so it cannot discover a new one.
+
+### Which Node version do I need?
+
+Node 20.11 or newer.
+
+### Do I need the React adapter?
+
+No, it is optional enrichment and the core works without it. What it adds is component identity, meaning `reticle_look { action: "element" }` can say which React component rendered an element. Combined with a build plugin that stamps source, that is what turns a DOM node into `src/components/Login.tsx:81`, which is the difference between an agent knowing something failed and knowing which file to open.
+
+### Can I run several apps against Reticle at once?
+
+Yes, as long as each connection has a unique session id, which `SESSION_AUTO` gives you automatically. Tool calls target the focused or most recently active app, or you can pass an explicit `sessionId`. If you want two projects fully isolated, give each its own bridge port and set the same port in both the MCP server config and the app's connection.
+
+### Will Reticle end up in my production bundle?
+
+No. Keep `connect()` behind a dev guard (`import.meta.env.DEV` or a `NODE_ENV` check); the packages are side-effect free and tree-shake out when unused. A production `vite build` with the Vite plugin injects nothing and replaces the SDK with an inert stub. As a backstop, `connect()` also self-disables when the build reports `NODE_ENV=production`.
+
+### Why is my install failing with `ERESOLVE`?
+
+You are almost certainly on a Next.js canary or a React RC. That is npm's semver rule for prereleases, not a Reticle restriction. Install with `--legacy-peer-deps`, or use pnpm, whose peer resolution does not hard-fail here. See [Installing alongside a Next.js or React prerelease](#installing-alongside-a-next-js-or-react-prerelease) above.

@@ -1,0 +1,131 @@
+/**
+ * The verification-run assembler. A PURE mapping from already-produced verification results
+ * (flow-replay outcomes, standalone checks, risks, evidence, repair packets) into the stable
+ * ReticleVerificationRun artifact, with a deterministic verdict computed here. The clock is injected
+ * (the single `createdAt` site — never Date.now in logic, per rule 7). Gathering the inputs from a
+ * live session is a separate adapter concern; this file owns the shape + the verdict rules so both
+ * the MCP path and the programmatic Replay/Verify API produce byte-identical verdicts.
+ */
+
+import {
+  ReticleVerificationRunSchema,
+  RUN_FILE_VERSION,
+  Verified,
+  RunConfidence,
+  RunFlowStatus,
+  VerdictStatus,
+  type ReticleVerificationRun,
+  type RunVerdict,
+} from '@reticlehq/core';
+import { redactForProfile } from './profile-redact.js';
+import { supersededChecks } from '@reticlehq/engine/evidence/superseded-checks.js';
+
+/**
+ * Everything a caller supplies; schemaVersion/createdAt/verdict are filled/computed by the builder.
+ * runId is a plain string here (string in) — the schema brands it to RunId on the way out (branded out),
+ * so construction sites stay ergonomic while consumers get the nominal type.
+ */
+export type VerificationRunInput = Omit<
+  ReticleVerificationRun,
+  'schemaVersion' | 'createdAt' | 'verdict' | 'runId'
+> & { runId: string };
+
+/**
+ * Compute the verdict deterministically from the run's flows, checks, and risks.
+ * Rules (in order): a gated risk blocks → FAIL; mixed pass+fail → PARTIAL; any fail → FAIL;
+ * nothing proved either way → UNKNOWN; else PASS.
+ *
+ * A check that came out `unknown` or `no-fault` counts as NEITHER, which is what those words mean.
+ * A run of nothing but undetermined checks therefore reaches UNKNOWN rather than PASS -- the whole
+ * reason those two values now survive into the artifact instead of being dropped at its door.
+ * Confidence: nothing ran → LOW; an oracle-backed flow or any check ran → HIGH; only smoke → MEDIUM.
+ */
+export function computeVerdict(raw: VerificationRunInput): RunVerdict {
+  // A passive check that read too early is superseded by the same claim holding later: the one
+  // rule every fold applies (superseded-checks.ts).
+  const superseded = supersededChecks(
+    raw.checks.map((c) => ({
+      key: c.predicate,
+      passive: false === c.declaredBeforeActing,
+      held: Verified.YES === c.status,
+      failed: Verified.NO === c.status,
+    })),
+  );
+  const input = { ...raw, checks: raw.checks.filter((_, at) => !superseded.has(at)) };
+  const passes =
+    input.flows.filter((f) => f.status === RunFlowStatus.PASS || f.status === RunFlowStatus.HEALED)
+      .length + input.checks.filter((c) => c.status === Verified.YES).length;
+  const fails =
+    input.flows.filter((f) => f.status === RunFlowStatus.FAIL).length +
+    input.checks.filter((c) => c.status === Verified.NO).length;
+  const skippedFlows = input.flows.filter((f) => f.status === RunFlowStatus.SKIPPED).length;
+  // Ran and decided nothing, as the agent's own result block counts them: never part of a pass.
+  const undecidedChecks = input.checks.filter(
+    (c) => c.status !== Verified.YES && c.status !== Verified.NO,
+  ).length;
+  const blockingRisks = input.risks.filter((r) => r.gated).length;
+
+  const reasons: string[] = [];
+  for (const f of input.flows) {
+    if (f.status === RunFlowStatus.FAIL) {
+      reasons.push(
+        f.failureReason !== undefined
+          ? `flow ${f.name}: ${f.failureReason}`
+          : `flow ${f.name} failed`,
+      );
+    } else if (f.status === RunFlowStatus.SKIPPED && f.failureReason !== undefined) {
+      reasons.push(`flow ${f.name}: ${f.failureReason}`);
+    }
+  }
+  for (const c of input.checks) {
+    if (c.status === Verified.NO) reasons.push(`check failed: ${c.predicate}`);
+  }
+  for (const r of input.risks) {
+    if (r.gated) reasons.push(`blocked: ${r.surface} risk — ${r.detail}`);
+  }
+
+  let status: VerdictStatus;
+  if (blockingRisks > 0) status = VerdictStatus.FAIL;
+  // A failure beside things that passed is a fail, not a partial: the result block, the CLI and the
+  // platform's grade all call it that, and a "partial" beside "Reticle result: failed" was one run
+  // with two verdicts. A partial is only ever a pass with something skipped or undecided beside it.
+  else if (fails > 0) status = VerdictStatus.FAIL;
+  else if ((skippedFlows > 0 || undecidedChecks > 0) && passes > 0) {
+    status = VerdictStatus.PARTIAL;
+    if (0 < undecidedChecks) reasons.push(`${String(undecidedChecks)} check(s) undecided`);
+  } else if (0 === passes) {
+    // Nothing passed and nothing failed, so nothing was proved -- an empty run, or one whose every
+    // flow was skipped. Reporting that as PASS is the false green this whole file exists to prevent:
+    // every consumer here reads `status` and none reads `confidence`, so a caveat parked in the
+    // confidence field would never reach the person deciding whether to ship.
+    status = VerdictStatus.UNKNOWN;
+    reasons.push('nothing ran, so nothing was proved');
+  } else status = VerdictStatus.PASS;
+
+  const ran = input.flows.length + input.checks.length;
+  let confidence: RunConfidence;
+  if (0 === ran) confidence = RunConfidence.LOW;
+  else if (input.flows.some((f) => f.oracle !== undefined) || input.checks.length > 0)
+    confidence = RunConfidence.HIGH;
+  else confidence = RunConfidence.MEDIUM;
+
+  return { status, reasons, confidence, blockingRisks };
+}
+
+/**
+ * Assemble the final, schema-valid ReticleVerificationRun. Stamps schemaVersion + createdAt (injected
+ * clock) and computes the verdict; the result is parsed through the protocol schema so a malformed
+ * input can never escape as an "artifact".
+ */
+export function buildVerificationRun(
+  input: VerificationRunInput,
+  now: () => number,
+): ReticleVerificationRun {
+  const run = {
+    schemaVersion: RUN_FILE_VERSION,
+    createdAt: now(),
+    verdict: computeVerdict(input),
+    ...input,
+  };
+  return redactForProfile(ReticleVerificationRunSchema.parse(run));
+}

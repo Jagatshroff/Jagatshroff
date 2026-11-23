@@ -1,0 +1,102 @@
+---
+title: 'Why Reticle: seeing is not believing'
+sidebarTitle: Why Reticle
+description: AI-written code fails by looking correct. Reticle reads the running program instead of the pixels, so a silent failure stops being invisible.
+icon: lightbulb
+---
+
+**Use Reticle because AI-written code fails by looking correct.** A screenshot cannot show you whether a request fired, what status it returned, whether application state changed, or whether one click sent one request or two. Reticle reads the running program instead of the pixels, so those silent failures stop being invisible.
+
+Software has always had bugs. What changed is the _kind_ of bug that reaches you.
+
+A human writing code by hand produces errors that announce themselves: a stack trace, a red screen, a test that goes red. An agent writing code produces something more dangerous: a change that looks completely correct, renders beautifully, and does nothing. The page is fine. The data never saved.
+
+We call it a **false green**, and it is the defining failure mode of the AI-coding era.
+
+## What a false green actually looks like
+
+<CardGroup cols={2}>
+  <Card title="Mock data" icon="ghost">
+    The POST returns `200`. The row appears in the table. Reload the page and it's gone. Nothing was
+    ever persisted.
+  </Card>
+  <Card title="Dead handler" icon="plug-circle-xmark">
+    The button has an `onClick`. The `onClick` calls a function. The function was never wired to the
+    store. It looks connected all the way down.
+  </Card>
+  <Card title="Double submit" icon="clone">
+    One click, two POSTs. The user gets charged twice. Nothing on screen is wrong.
+  </Card>
+  <Card title="Silent validation" icon="triangle-exclamation">
+    The form accepts `"abc"` as a quantity and cheerfully sends it to your database.
+  </Card>
+</CardGroup>
+
+Every one of these renders as a perfectly nice page. A screenshot approves them all. So does an agent that just took the screenshot, and the agent is the one telling you it's done.
+
+## Why looking harder doesn't fix it
+
+The instinct is to give the agent better eyes: a screenshot, a vision model, a full accessibility tree. This does not work, for a reason that has nothing to do with model quality.
+
+**The information is not in the picture.** Whether a request fired, what status it returned, whether application state changed, whether the console logged an error, whether one click sent one request or two, none of that is visible. You cannot see a network call. You cannot photograph a state mutation. Asking a better model to look more carefully at a screenshot of a page whose bug is non-visual is asking it to hallucinate more confidently.
+
+Reticle takes the other route. It runs **inside** your app and reads the program: network, state, console, routing, framework internals, and the app's own success signals. The answer is not interpreted from pixels. It is read from the running program, which means it is deterministic and the same every time.
+
+## The evidence
+
+We built eleven scenarios: ten bugs, plus a control where nothing is wrong, so anything flagged on the control counts as a false positive. Each tool got the same app, the same moment, the same task. This pass last ran on 2026-06-22, against `@playwright/mcp@0.0.76` and `chrome-devtools-mcp@1.3.0`.
+
+| Tool | Bugs caught | Detection accuracy | Avg tokens per look | Verification efficiency |
+| --- | --- | --- | --- | --- |
+| **Reticle** | **10 / 10** | **1.00** | **815** | **12.27** |
+| Playwright MCP | 9 / 10 | 0.91 | 1,292 | 6.97 |
+| Chrome DevTools MCP | 8 / 10 | 0.82 | 758 | 10.55 |
+
+Observing one real dashboard once, with no bug involved:
+
+| Tool | Snapshot | Network | Observe total | Can it assert success? |
+| --- | --- | --- | --- | --- |
+| **Reticle** | 678 | 345 | **1,023** | Yes, via the app's own signal. 46 tokens, un-fakeable |
+| Chrome DevTools MCP | 1,105 | 252 | 1,357 | No. DOM and network only |
+| Playwright MCP | 1,522 | 671 | 2,193 | No. DOM and network only |
+
+That last column is the one that matters more than the token counts. The other tools can _describe_ what a page looks like. Only Reticle can check whether the thing the app itself considers success actually happened.
+
+<Card title="How every number was measured" icon="chart-column" href="/benchmarks">
+  The full method, the raw data, and the scenarios where the tools tie.
+</Card>
+
+On raw cost per glance, Chrome DevTools MCP is cheaper: 758 tokens against 815. It catches fewer bugs, which is why the efficiency column favours Reticle.
+
+## What the fix-rate test measured
+
+We ran a fix-loop ablation: agents fixed 8 bugs injected into a small fixture app, with Reticle and without it, on a strong model and on a weaker one. **It did not show a fix-rate improvement at either tier.** The strong model fixed 8 of 8 in both conditions and the weaker one 7 of 8 in both, and the Reticle arm made roughly five to six times the tool calls, because driving an app costs more than reading a few short files.
+
+The test cannot settle the question in either direction, and the reasons are specific: the fixture is small enough to read whole, several injected bugs were labelled by a comment on the changed line, and "fixed" was checked by a string disappearing rather than by the app behaving. One case pointed each way. The weaker model without Reticle claimed a fix it never applied, and the live re-check caught that with Reticle; with Reticle, the same model over-edited a stylesheet the string check scored as a pass. The full log is in [`bench/fix-loop/results.md`](https://github.com/reticlehq/reticle/blob/ffe58e32a5b5860869be8b164ad68bb5d23d69e9/bench/fix-loop/results.md), kept in git history since the benchmark was retired.
+
+A separate, smaller measurement of the source pointer alone found the same fix rate with and without it (6 of 6) and fewer tool calls with it (12 against 22). The pointer removed the search; it did not make the agent more capable.
+
+That is what Reticle is designed to improve: not the agent, but the verdict it reports. A broken build reads as broken, a failure arrives with the evidence and the `file:line`, and "I couldn't tell" is reported as that. In the 88-bug head-to-head against a Playwright script, Reticle reported one false green where the script reported 29.
+
+## When to use it
+
+You own the app, an agent edits it, and you want the agent to prove its work rather than assure you of it. It needs a dev build it can instrument, and React (and any framework whose build plugin stamps source) adds source pointers on top. [Use cases](/use-cases) covers what people check with it beyond change verification, from access control to accessibility.
+
+## Pairs well with
+
+- **Playwright** for driving sites you don't own and a cross-browser matrix. Reticle needs its dev-only SDK inside the app.
+- **A visual testing tool** for pixel-level regression. Reticle reads the program, not the screen, so "the button is three pixels too far left" is a job for pixels.
+- **axe** for full WCAG audits, and **a security scanner** for vulnerability discovery.
+
+## The one-sentence version
+
+Your agent already tells you it works. Reticle is the part that checks. And, more usefully, the part that says "I couldn't tell" instead of guessing.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Five minutes to your first real verdict.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    How it reads the program without slowing your app down.
+  </Card>
+</CardGroup>

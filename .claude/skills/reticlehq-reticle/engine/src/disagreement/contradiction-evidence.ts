@@ -1,0 +1,996 @@
+/**
+ * What a request IS, which requests are OURS, and how to say one out loud.
+ *
+ * Split out of `contradictions.ts` when that file crossed the line cap — and the seam was already
+ * there rather than invented for the occasion. Everything here answers a question ABOUT NETWORK
+ * EVIDENCE: what did this event mean, was it a write, did a retry rescue it, is it the toolchain's
+ * own traffic rather than the app's, is this cadence a poll, what did a write carry, which page did
+ * a list request ask for, and which `net` clause would name this call — and whether a settled field
+ * reading shows the app wrote the screen forward. Nothing here knows what a contradiction is.
+ *
+ * The rules next door read this vocabulary and decide what disagrees. Keeping the two apart means a
+ * new rule cannot quietly redefine what "in flight" or "ours" means for itself, which is how two
+ * rules end up disagreeing about the same window.
+ */
+
+import {
+  CanvasTrigger,
+  DepartedNetField,
+  EventType,
+  FieldChangeField,
+  FieldChangeKind,
+  MUTATING_METHODS,
+  NEXT_ACTION_FIELD,
+  PredicateKind,
+  REQUEST_SHAPE_FIELD,
+  ROUTE_CHANGE_HOW_FIELD,
+  RouteChangeHow,
+  asNumber,
+  asString,
+  isDevToolingUrl,
+  isForeignTraffic,
+  urlForMatch,
+  type ReticleEvent,
+} from '@reticlehq/core';
+import { isReticleVoice, tiedReaction } from '../state-bookkeeping.js';
+import type { ContradictionOptions } from './contradiction-types.js';
+import { matchesDeclaredFailure, type DeclaredNetFailure } from '@/question/declared.js';
+
+export interface NetCall {
+  /** When the call settled, on the session clock. */
+  t: number;
+  method: string;
+  url: string;
+  /** Grader haystack — the raw request when redaction rewrote `url`. */
+  matchUrl: string;
+  status: number | undefined;
+  /**
+   * `undefined` means NO VERDICT — not failure.
+   *
+   * A one-way IPC `send` hands the message to the main process and returns; the renderer never learns
+   * whether it was handled. The observer deliberately omits both `ok` and `status` rather than
+   * manufacture a success nobody reported. Collapsing that to `false` here manufactured a FAILURE
+   * nobody reported instead, which is the same sin pointing the other way: every fire-and-forget send
+   * raised `ui-advanced-request-failed` against a UI that had done nothing wrong.
+   */
+  ok: boolean | undefined;
+  /**
+   * The document before this one made the call, and that document then unloaded (#1944). Its
+   * client reaction happened there, or was the unload itself, so no rule may read this window's
+   * quiet as "the client ignored the response".
+   */
+  departed?: true;
+}
+
+export function netCall(e: ReticleEvent): NetCall {
+  const status = asNumber(e.data['status']);
+  return {
+    t: e.t,
+    method: (asString(e.data['method']) ?? '').toUpperCase(),
+    url: asString(e.data['url']) ?? '',
+    matchUrl: urlForMatch(e.data),
+    status,
+    // `ok` is authoritative when present (IPC sets it explicitly); status is the HTTP fallback.
+    // Neither present = no verdict was ever reported, which stays undefined all the way through.
+    ok:
+      e.data['ok'] === undefined && status === undefined
+        ? undefined
+        : true === e.data['ok'] || (e.data['ok'] === undefined && (status ?? 0) < 400),
+    ...(true === e.data[DepartedNetField.FROM_DEPARTED_DOCUMENT] ? { departed: true } : {}),
+  };
+}
+
+/**
+ * The failed calls that a LATER successful call to the same endpoint replaced.
+ *
+ * Identity, not index: each `netCall` is a fresh object held by `settled`, and `settled` is built
+ * from events in sequence order, so "later" is simply "further along the array". Compared on
+ * `matchUrl` so a cache-buster or a changing query token cannot make a retry look like a different
+ * call — the same normalisation every other url comparison here uses.
+ */
+export function recoveredByRetry(settled: readonly NetCall[]): ReadonlySet<NetCall> {
+  const out = new Set<NetCall>();
+  for (let i = 0; i < settled.length; i += 1) {
+    const call = settled[i];
+    if (call === undefined || false !== call.ok) {
+      continue;
+    }
+    for (let j = i + 1; j < settled.length; j += 1) {
+      const later = settled[j];
+      if (later === undefined) {
+        continue;
+      }
+      if (true === later.ok && later.method === call.method && later.matchUrl === call.matchUrl) {
+        out.add(call);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Did the user-visible application state move forward? DOM, store and route only — deliberately NOT
+ * network, animation or signal. The question every rule below asks is "did the app act as if it
+ * succeeded", and a request firing is not the app acting as if anything.
+ */
+export function isMutating(call: NetCall): boolean {
+  return MUTATING_METHODS.includes(call.method);
+}
+
+export function describe(call: NetCall): string {
+  return `${call.method} ${call.url}${call.status === undefined ? '' : ` → ${String(call.status)}`}`;
+}
+
+/**
+ * Actions that are SUPPOSED to make something happen, so producing nothing is a finding.
+ *
+ * Deliberately narrow. `hover`, `focus` and `scrollIntoView` can legitimately move nothing, and
+ * `fill`/`type` change an input's value without necessarily mutating the DOM tree — flagging those
+ * would manufacture noise, which is the failure mode opposite to a false green and just as bad.
+ */
+export const NET_TYPES: ReadonlySet<EventType> = new Set([
+  EventType.NET_PENDING,
+  EventType.NET_REQUEST,
+  EventType.NET_STREAM,
+]);
+
+/**
+ * Hash-router paths put the route in the fragment (`#/settings`, `#!/home`). An in-page skip link
+ * does not (`#main-content`, `#`, empty). The blank-destination rule must still see the former.
+ */
+export function isInPageFragment(hash: string): boolean {
+  if ('' === hash || '#' === hash) {
+    return true;
+  }
+  const body = hash.startsWith('#') ? hash.slice(1) : hash;
+  return !body.startsWith('/') && !body.startsWith('!');
+}
+
+export function hrefAsUrl(value: string | undefined): URL | undefined {
+  if (value === undefined || '' === value) {
+    return undefined;
+  }
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Same origin + pathname + search, different in-page fragment — a skip link, not a new view.
+ *
+ * Returns false when `from`/`to` are missing, so older events without hrefs keep the existing rule.
+ */
+export function isSameDocumentHashAnchor(event: ReticleEvent): boolean {
+  if (event.type !== EventType.ROUTE_CHANGE) {
+    return false;
+  }
+  const from = hrefAsUrl(asString(event.data['from']));
+  const to = hrefAsUrl(asString(event.data['to']));
+  if (from === undefined || to === undefined) {
+    return false;
+  }
+  if (from.origin !== to.origin || from.pathname !== to.pathname || from.search !== to.search) {
+    return false;
+  }
+  if (from.hash === to.hash) {
+    return false;
+  }
+  return isInPageFragment(to.hash);
+}
+
+/**
+ * A `replaceState` that keeps the pathname recorded state in the URL. It is not a navigation.
+ *
+ * Search and an in-page fragment may change (`?zoom=125`, `#main-content`). A hash-router fragment
+ * (`#/invoices`) is still a new view, and so is a replace onto a different pathname. Missing hrefs
+ * stay under the blank-destination rule: an event that cannot show the path stayed put is not exempt.
+ */
+export function isSamePathnameReplace(event: ReticleEvent): boolean {
+  if (event.type !== EventType.ROUTE_CHANGE) {
+    return false;
+  }
+  if (asString(event.data[ROUTE_CHANGE_HOW_FIELD]) !== RouteChangeHow.REPLACE) {
+    return false;
+  }
+  const from = hrefAsUrl(asString(event.data['from']));
+  const to = hrefAsUrl(asString(event.data['to']));
+  if (from === undefined || to === undefined) {
+    return false;
+  }
+  if (from.origin !== to.origin || from.pathname !== to.pathname) {
+    return false;
+  }
+  if (from.hash !== to.hash && !isInPageFragment(to.hash)) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Did this event show a field whose post-handler reading differs from its pre-action one?
+ *
+ * React writes `checked` and `value` as properties, so a controlled checkbox that re-renders
+ * produces no attribute mutation. The field change from the input event itself cannot fill that
+ * gap: it is emitted from the user's own event, before a controlled component restores the
+ * property, and counting it would treat a box React immediately reverted as rendered.
+ *
+ * A settled read carries the value from before the action beside the value after the handlers
+ * ran. The browser only sends one when the app itself wrote the property during the action, so an
+ * uncontrolled field the browser toggled on its own never counts. The screen moved only when the
+ * two readings differ.
+ */
+export function settledFieldRendered(event: ReticleEvent): boolean {
+  if (event.type !== EventType.FIELD_CHANGE) {
+    return false;
+  }
+  if (event.data[FieldChangeField.KIND] !== FieldChangeKind.SETTLED) {
+    return false;
+  }
+  const checked = event.data[FieldChangeField.CHECKED];
+  const previousChecked = event.data[FieldChangeField.PREVIOUS_CHECKED];
+  if ('boolean' === typeof checked && 'boolean' === typeof previousChecked) {
+    return checked !== previousChecked;
+  }
+  const value = event.data[FieldChangeField.VALUE];
+  const previous = event.data[FieldChangeField.PREVIOUS];
+  return 'string' === typeof value && 'string' === typeof previous && value !== previous;
+}
+
+/**
+ * Did this event show the screen moving, for the state-vs-render rule? A DOM node added, removed or
+ * changed, route movement (a navigation IS a render), or a field the app itself wrote to a new
+ * value (`settledFieldRendered`). The input event's own field change does not count: that is the
+ * keystroke or the browser's own toggle, true of a component that never re-rendered.
+ */
+export function screenMoved(event: ReticleEvent): boolean {
+  return (
+    event.type === EventType.DOM_ADDED ||
+    event.type === EventType.DOM_REMOVED ||
+    event.type === EventType.DOM_ATTR ||
+    event.type === EventType.DOM_TEXT ||
+    event.type === EventType.ROUTE_CHANGE ||
+    settledFieldRendered(event)
+  );
+}
+
+/**
+ * What the canvases on the page show about a window (#1525). A canvas renders as pixels, so a
+ * repaint makes no DOM mutation. The SDK sends a `CANVAS_DIGEST` for each canvas on its poll when the
+ * digest changed, and at the end of every act.
+ */
+export const CanvasPaint = {
+  /** No digest of a visible canvas in the window. */
+  NONE: 'none',
+  /** A visible canvas that was steady before the action showed something different: a render. */
+  PAINTED: 'painted',
+  /**
+   * A visible canvas was on screen and no change the action caused was seen. Not proof that it did
+   * not paint: the digest is a 16x16 sample, a canvas can paint after the act's own sample was taken,
+   * and a canvas that was already changing (a spinner, a live chart) cannot show what the action drew.
+   */
+  UNOBSERVED: 'unobserved',
+} as const;
+export type CanvasPaint = (typeof CanvasPaint)[keyof typeof CanvasPaint];
+
+/**
+ * How long a canvas must have held its digest before the action for a change to count as the
+ * action's render: two of the SDK's 500 ms poll periods. The poll reports only a change, so a canvas
+ * that animates reports one every period, and its last change is always closer than this.
+ */
+export const CANVAS_STEADY_MS = 1_000;
+
+/**
+ * How far back a canvas that changed on its own disqualifies it. A dashboard chart, a clock or a
+ * ticker refreshes on a timer slower than `CANVAS_STEADY_MS`, so its last change can be seconds old
+ * and its next tick can land in the window. A change the poll found, not just after an act, is
+ * such a tick. A timer slower than this can still read as the render.
+ */
+export const CANVAS_QUIET_MS = 10_000;
+
+/** What the canvas showed last, when it last changed, and when it last changed on its own. */
+interface CanvasHistory {
+  digest: string;
+  changedAt: number | undefined;
+  driftAt: number | undefined;
+}
+
+/**
+ * Did a canvas paint in this window, because of the action at `since`?
+ *
+ * A digest is a paint when it differs from the last digest of the same canvas (from `prior` or from
+ * earlier in the window), that canvas held its digest for `CANVAS_STEADY_MS` before the action, and
+ * it did not change on its own in the `CANVAS_QUIET_MS` before it. A change on its own is one the
+ * SDK's poll found more than `CANVAS_STEADY_MS` after the last act's digest: no act drew it. A
+ * canvas with no earlier digest is not a paint: nothing says what it showed before. A digest that
+ * says `visible: false` (no size, or outside the viewport) is never the paint, nor a canvas seen in
+ * the window: a hidden canvas cannot carry a render the user sees. It still counts as what the canvas
+ * showed before, since a click may scroll a canvas into view. An SDK older than the field sends no
+ * `visible`, and is read as visible.
+ */
+export function canvasPaint(
+  events: readonly ReticleEvent[],
+  prior: readonly ReticleEvent[],
+  since: number,
+): CanvasPaint {
+  const last = new Map<string, CanvasHistory>();
+  let actAt: number | undefined;
+  let seen = false;
+  for (const [event, inWindow] of [
+    ...prior.map((e) => [e, false] as const),
+    ...events.map((e) => [e, true] as const),
+  ]) {
+    const digest =
+      EventType.CANVAS_DIGEST === event.type ? asString(event.data['digest']) : undefined;
+    if (digest === undefined) {
+      continue;
+    }
+    const polled = CanvasTrigger.POLL === event.data['trigger'];
+    // A sample taken off screen is still the canvas's last picture, so it is the baseline; only a
+    // sample on screen can be the render the user saw.
+    const shown = false !== event.data['visible'];
+    const key = event.ref ?? '';
+    const before = last.get(key);
+    const changed = before !== undefined && before.digest !== digest;
+    const steady = before?.changedAt === undefined || before.changedAt < since - CANVAS_STEADY_MS;
+    const quiet = before?.driftAt === undefined || before.driftAt < since - CANVAS_QUIET_MS;
+    if (inWindow && shown && changed && steady && quiet) {
+      return CanvasPaint.PAINTED;
+    }
+    seen ||= inWindow && shown;
+    const onItsOwn =
+      changed && polled && (actAt === undefined || event.t > actAt + CANVAS_STEADY_MS);
+    last.set(key, {
+      digest,
+      changedAt: changed ? event.t : before?.changedAt,
+      driftAt: onItsOwn ? event.t : before?.driftAt,
+    });
+    actAt = polled ? actAt : event.t;
+  }
+  return seen ? CanvasPaint.UNOBSERVED : CanvasPaint.NONE;
+}
+
+/**
+ * Split the window into the app's traffic and the dev toolchain's own (see `DevToolingChannel`).
+ *
+ * NOTHING below may judge the toolchain. Reported from a real drive: a correct Next.js navigation
+ * graded `verified: "no"` because the dev overlay was resolving a source map for an unrelated React
+ * key warning, and that in-flight `POST /__nextjs_original-stack-frames` read as "the UI advanced
+ * over a request that never settled". Every app that logs one dev warning got a false negative on
+ * every action. The overlay's own 404s and duplicate fetches are the same story on other checks,
+ * which is why the split happens ONCE here rather than in the one check that reported it.
+ *
+ * CLASSIFY on `urlForMatch`, DISCLOSE `url`. Redaction rewrites a sensitive path segment at emit
+ * time (`/verify/refresh-token` -> `/verify/[REDACTED]`) and keeps the original only in `urlRaw`, so
+ * a project's DECLARED `background` pattern — matched with `String.includes` — never matched what
+ * this read. The endpoint went back in among the app's own traffic and every rule below judged it,
+ * which is the half of the same defect the settle wait had. Disclosure deliberately keeps the
+ * DISPLAYED spelling: the raw one is the match haystack, not something to project into a transcript.
+ */
+export function splitForeignTraffic(
+  events: readonly ReticleEvent[],
+  appOrigin: string | undefined,
+  background: readonly string[] = [],
+): {
+  app: readonly ReticleEvent[];
+  ignored: string[];
+} {
+  const ignored: string[] = [];
+  const app = events.filter((e) => {
+    if (!NET_TYPES.has(e.type)) {
+      return true;
+    }
+    const matchUrl = urlForMatch(e.data);
+    const shown = asString(e.data['url']);
+    // Somebody else's code, twice over: the toolchain's own channel, and any site that is not the
+    // app under test. Neither can answer the question every rule below asks.
+    const match = 0 === matchUrl.length ? undefined : matchUrl;
+    if (!isDevToolingUrl(match) && !isForeignTraffic(match, appOrigin, background)) {
+      return true;
+    }
+    if (shown !== undefined && !ignored.includes(shown)) {
+      ignored.push(shown);
+    }
+    return false;
+  });
+  return { app, ignored };
+}
+
+/**
+ * Cross-channel contradictions in this window, with the edit-epoch caveat attached when it applies.
+ *
+ * Cross-epoch evidence is LABELLED rather than excluded, which is the opposite of what the document
+ * scoping does, and the difference is the point. A navigation is total — it throws away the page,
+ * the refs, the in-flight requests and the state — so nothing recorded before it is still about the
+ * world, and dropping it is the only honest option. A hot update is not: most modules, most of the
+ * DOM, the whole network log and every console line survive one, so most of what was observed a
+ * second before an edit is still true a second after. Excluding it would empty windows that hold
+ * real findings, and an emptied window reads as "nothing happened" — which is the more expensive of
+ * the two wrong answers and the one this whole family of checks exists to prevent.
+ *
+ * So the findings stand and the caveat is said out loud, and only when it is unambiguous: EVERY
+ * observation in the window predates the edit. One post-edit observation and the agent is already
+ * looking at the code it wrote, so the label would be noise.
+ */
+/**
+ * Below this, repeated writes are a BURST, whatever their spacing.
+ *
+ * A double submit is two clicks, or one click and a re-render: milliseconds apart. Nothing a human
+ * or a StrictMode remount does lands on a quarter-second grid, so this is the floor under which
+ * regularity means nothing.
+ */
+export const POLL_MIN_INTERVAL_MS = 250;
+
+/**
+ * How far a gap may sit from the median and still count as the same cadence.
+ *
+ * Loose on purpose: a real poll drifts under load, and a `setInterval` competing with a busy main
+ * thread is not metronomic. Tight enough that a burst followed by a late retry — the shape a double
+ * submit plus a user's second attempt makes — is not read as a rhythm.
+ */
+export const POLL_JITTER_RATIO = 0.4;
+
+/**
+ * Is this the same write on a steady interval, rather than the same write twice?
+ *
+ * THREE samples minimum, and that is the load-bearing part: two writes give one gap, and a single
+ * gap cannot distinguish a cadence from a coincidence. Two writes stay a duplicate however far
+ * apart they are, which is the classic double submit and every case this rule was written for.
+ */
+export function isSteadyCadence(times: readonly number[]): boolean {
+  if (times.length < 3) {
+    return false;
+  }
+  const ordered = [...times].sort((a, b) => a - b);
+  const gaps: number[] = [];
+  for (let i = 1; i < ordered.length; i += 1) {
+    gaps.push((ordered[i] ?? 0) - (ordered[i - 1] ?? 0));
+  }
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
+  if (median < POLL_MIN_INTERVAL_MS) {
+    return false;
+  }
+  return gaps.every((gap) => Math.abs(gap - median) <= median * POLL_JITTER_RATIO);
+}
+
+/**
+ * What this request CARRIED, as far as the record knows — `undefined` when it does not know.
+ *
+ * The page's shape fingerprint first: it is present on every request from an instrumented page,
+ * including the overwhelming majority where body capture is off. A captured body is the fallback for
+ * a realm that records one without a fingerprint (desktop IPC). Neither means the record does not
+ * say what this request carried — a body the page could not read as text, or an SDK too old to
+ * compute a fingerprint — and that is an ABSENCE of identity, not an identity shared with every
+ * other silent request.
+ *
+ * A Server Action's action id joins both halves, and it is the half that survives a `FormData`
+ * body: several actions POST to the page's own URL, so without it every call is an unknown identity
+ * pooled with all the others, and no fingerprint can separate two that share a shape. The id alone
+ * SPLITS two different actions; it cannot say that two runs of one action carried the same thing,
+ * and `carried` keeps that limit on the record for the finding to say.
+ */
+export interface WriteIdentity {
+  /** The value the grouping compares. */
+  readonly key: string;
+  /** Whether the key also describes WHAT the request carried, not only which action ran. */
+  readonly carried: boolean;
+}
+
+const nonEmpty = (text: string | undefined): string | undefined =>
+  text === undefined || 0 === text.length ? undefined : text;
+
+export function identityOf(event: ReticleEvent): WriteIdentity | undefined {
+  const action = asString(event.data[NEXT_ACTION_FIELD]);
+  const shape = asString(event.data[REQUEST_SHAPE_FIELD]);
+  const body = asString(event.data['requestBody']);
+  const carried = nonEmpty(shape) ?? nonEmpty(body);
+  if (action === undefined || 0 === action.length) {
+    return carried === undefined ? undefined : { key: carried, carried: true };
+  }
+  return carried === undefined
+    ? { key: action, carried: false }
+    : { key: `${action}:${carried}`, carried: true };
+}
+
+/** Split calls to one endpoint into the sets that sent the same thing. Callers check first that
+ * every identity is known; an unknown one would otherwise pool with every other unknown. */
+export function groupByIdentity<T extends { identity: WriteIdentity | undefined }>(
+  calls: readonly T[],
+): T[][] {
+  const byIdentity = new Map<string, T[]>();
+  for (const call of calls) {
+    const key = call.identity?.key ?? '';
+    byIdentity.set(key, [...(byIdentity.get(key) ?? []), call]);
+  }
+  return [...byIdentity.values()];
+}
+
+/**
+ * The `net` clause that declares each of these failures, worded as a condition.
+ *
+ * A designed error path (a 402 paywall, a 429, a 428 confirmation) asserted through the UI it renders
+ * gets `ui-advanced-request-failed`, and declaring the failing call in the oracle is what exempts it
+ * (`matchesDeclaredFailure`). Nothing in the finding said so, so agents dropped the check or
+ * weakened it until it proved nothing (#1418). The clause is built from the call itself, so it is
+ * exactly what would match, and it is conditional: the finding is still a finding, and a clause
+ * pasted to make a red go away would be the same false green with extra steps.
+ *
+ * Built from the DISPLAY url, which is redacted, never from `matchUrl`, which is not: the detail is
+ * copied into crawl anomalies, and a hint must not put back a token the description took out. A
+ * call whose path cannot be named exactly and narrowly gets no clause rather than a loose one: a
+ * bare `/` is a substring of every url and would exempt unrelated failures with the same method.
+ */
+export function declareFailureHint(
+  calls: readonly { method: string; url: string; matchUrl?: string; status: number | undefined }[],
+): string {
+  const clauses = calls.flatMap((c) => {
+    const urlContains = narrowPathOf(c);
+    if (urlContains === undefined) {
+      return [];
+    }
+    const clause = {
+      kind: PredicateKind.NET,
+      method: c.method.toUpperCase(),
+      urlContains,
+      ...(c.status === undefined || 0 === c.status ? { ok: false } : { status: c.status }),
+    };
+    return [JSON.stringify(clause)];
+  });
+  if (0 === clauses.length) {
+    return '';
+  }
+  const subject = 1 === clauses.length ? 'this failure is' : 'these failures are';
+  return `. If ${subject} the outcome you expect, declare it in the predicate: ${clauses.join(', ')}`;
+}
+
+/** Resolves a relative call url so its path can be read; the host is never shown or matched. */
+const RELATIVE_URL_BASE = 'http://reticle.invalid';
+
+/**
+ * The display url's path, when it is both safe to show and narrow enough to declare one call.
+ *
+ * Only when it is literally in the url the declaration is matched against: `urlContains` is a
+ * substring test, so a path the parser re-encoded, or one the redaction changed, would never match.
+ */
+function narrowPathOf(call: { url: string; matchUrl?: string }): string | undefined {
+  let path: string;
+  try {
+    path = new URL(call.url, RELATIVE_URL_BASE).pathname;
+  } catch {
+    return undefined;
+  }
+  if (0 === path.replace(/\/+$/, '').length) {
+    return undefined;
+  }
+  if (!call.url.includes(path) || !(call.matchUrl ?? call.url).includes(path)) {
+    return undefined;
+  }
+  return path;
+}
+
+/** Query parameters that say which page of a list is being asked for. */
+const PAGE_PARAMS = ['page', 'offset', 'cursor', 'after', 'start', 'skip', 'from'] as const;
+
+/** "Page 2", "page 2 of 6", "2 / 6", "2 of 6". */
+const PAGE_LABEL = /\bpage\s+(\d+)\b|\b(\d+)\s*(?:of|\/)\s*\d+(?:,\d{3})*\b/i;
+const RECORD_RANGE_LABEL =
+  /\b\d[\d,]*\s*(?:[-–—]|\bto\b)\s*\d[\d,]*\s+of\s+\d[\d,]*\b|\b\d[\d,]*\s+of\s+\d[\d,]*\s+(?:records|items|results)\b/i;
+
+/**
+ * The page number a label shows, or undefined when the text is not a page label.
+ *
+ * A bare "N of M" with N = 0 is a count, not a page: no pager shows page 0, and a progress label
+ * such as "0 of 4 generated" does. Reading it as a page made a list that refetched its first page
+ * look like stalled pagination, and the verdict read `no` with no paging action at all.
+ */
+export function pageNumber(text: unknown): number | undefined {
+  if ('string' !== typeof text) {
+    return undefined;
+  }
+  if (RECORD_RANGE_LABEL.test(text)) {
+    return undefined;
+  }
+  const match = PAGE_LABEL.exec(text);
+  const explicit = match?.[1];
+  if (explicit !== undefined) {
+    return Number(explicit);
+  }
+  const bare = match?.[2];
+  if (bare === undefined || 0 === Number(bare)) {
+    return undefined;
+  }
+  return Number(bare);
+}
+
+/** The endpoint, page parameter and remaining query, for a GET that carries a page parameter. */
+export function pageRequest(
+  event: ReticleEvent,
+): { path: string; param: string; value: string; query: string } | undefined {
+  if (event.type !== EventType.NET_REQUEST) {
+    return undefined;
+  }
+  const method = event.data['method'];
+  if ('string' !== typeof method || 'GET' !== method.toUpperCase()) {
+    return undefined;
+  }
+  const raw = event.data['url'];
+  if ('string' !== typeof raw) {
+    return undefined;
+  }
+  let url: URL;
+  try {
+    url = new URL(raw, 'http://app.invalid');
+  } catch {
+    return undefined;
+  }
+  for (const param of PAGE_PARAMS) {
+    const value = url.searchParams.get(param);
+    if (value !== null) {
+      url.searchParams.delete(param);
+      // jQuery `cache: false` changes `_` on every otherwise identical GET.
+      url.searchParams.delete('_');
+      url.searchParams.sort();
+      return { path: url.pathname, param, value, query: url.searchParams.toString() };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True when the app published no signal and no store change, in the window or before it.
+ *
+ * Undefined `prior` means the caller did not look before the window, so it cannot say: false. A
+ * zero-install page is the common case here. With no voice of its own, the app cannot say whether
+ * it handled a failure, so a finding that rests on that is weak rather than proof.
+ */
+export function appIsSilent(
+  events: readonly ReticleEvent[],
+  prior: readonly ReticleEvent[] | undefined,
+): boolean {
+  if (prior === undefined) {
+    return false;
+  }
+  const speaks = (e: ReticleEvent): boolean => {
+    if (e.type === EventType.SIGNAL) {
+      return !isReticleVoice(asString(e.data['name']) ?? '');
+    }
+    if (e.type !== EventType.STATE_CHANGE) {
+      return false;
+    }
+    return !isReticleVoice(asString(e.data['store']) ?? asString(e.data['name']) ?? '');
+  };
+  return !prior.some(speaks) && !events.some(speaks);
+}
+
+/**
+ * What became of the acted control's own change once its failed request settled.
+ *
+ * `ui-advanced-request-failed` asks whether the UI moved over a failed write. "Moved" was any DOM,
+ * store or route change in the window, and that reads a correct optimistic UI as a lie. Measured on
+ * a live incident feed with no SDK signals: acknowledging a row disables its button, POSTs, gets a
+ * 500, and enables the button again with a banner. The fixed build and the build that swallows the
+ * 500 both got the finding, twice each, because the feed appends a row every 800 ms on its own and
+ * the button was disabled while the request was in flight.
+ *
+ * What separates the two builds is the control's fate AFTER the failure:
+ *
+ *  - REVERTED: every change the action made to the control before the failure is back at its value
+ *    from before the action. The app handled the failure on the thing the user touched.
+ *  - PENDING: the control still shows its in-flight value and nothing on it moved after the failure.
+ *    The request was in flight; the app did not go on as if it succeeded.
+ *  - PERSISTED: the control moved on after the failure. The app went on as if it succeeded.
+ *
+ * Undefined when this cannot be told: no ref was acted on, or the control did not change before the
+ * failure settled. The caller then keeps the old window-wide reading.
+ *
+ * Only the control's own changes count, so rows the action did not touch (a live feed, a clock)
+ * decide nothing.
+ *
+ * ponytail: the control alone decides. A control rolled back while an unrelated element keeps a
+ * change (an item added to a list as its button re-enables) reads as handled. Telling that apart
+ * needs the DOM ancestry of each event, which the wire does not carry.
+ */
+export const TargetFate = {
+  PERSISTED: 'persisted',
+  REVERTED: 'reverted',
+  PENDING: 'pending',
+} as const;
+export type TargetFate = (typeof TargetFate)[keyof typeof TargetFate];
+
+/** A value the control did not have: an absent attribute, or no text. */
+const ABSENT = '\u0000absent';
+
+interface Change {
+  key: string;
+  t: number;
+  old: string;
+  now: string;
+}
+
+/** The attribute or text change this event made to `ref`, or undefined. No-op writes are skipped. */
+function changeOf(event: ReticleEvent, ref: string): Change | undefined {
+  if (event.ref !== ref) {
+    return undefined;
+  }
+  let key: string;
+  let now: string;
+  if (event.type === EventType.DOM_ATTR) {
+    key = `attr:${asString(event.data['attr']) ?? ''}`;
+    now = asString(event.data['value']) ?? ABSENT;
+  } else if (event.type === EventType.DOM_TEXT) {
+    key = 'text';
+    now = asString(event.data['text']) ?? ABSENT;
+  } else {
+    return undefined;
+  }
+  const old = asString(event.data['old']) ?? ABSENT;
+  return old === now ? undefined : { key, t: event.t, old, now };
+}
+
+export function targetFate(
+  events: readonly ReticleEvent[],
+  ref: string | undefined,
+  failedAt: number,
+): TargetFate | undefined {
+  if (ref === undefined) {
+    return undefined;
+  }
+  const before = new Map<string, string>();
+  const atFailure = new Map<string, string>();
+  const last = new Map<string, string>();
+  for (const event of events) {
+    const change = changeOf(event, ref);
+    if (change === undefined) {
+      continue;
+    }
+    if (!before.has(change.key)) {
+      before.set(change.key, change.old);
+    }
+    if (change.t <= failedAt) {
+      atFailure.set(change.key, change.now);
+    }
+    last.set(change.key, change.now);
+  }
+  if (0 === atFailure.size) {
+    return undefined;
+  }
+  const reverted = [...last].every(([key, value]) => before.get(key) === value);
+  if (reverted) {
+    return TargetFate.REVERTED;
+  }
+  const movedAfter = [...last].some(
+    ([key, value]) => (atFailure.get(key) ?? before.get(key)) !== value,
+  );
+  return movedAfter ? TargetFate.PERSISTED : TargetFate.PENDING;
+}
+
+// ── Success claims over a declared failure ────────────────────────────────────────────────────
+
+/** The name a signal is reported under when the app gave it none. */
+export const UNNAMED_SIGNAL = 'signal';
+
+const nameOf = (e: ReticleEvent): string => asString(e.data['name']) ?? UNNAMED_SIGNAL;
+
+/** Whether `a` was emitted before `b`. The sequence number is exact; the clock can tie. */
+export function emittedBefore(a: ReticleEvent, b: ReticleEvent): boolean {
+  return a.seq !== undefined && b.seq !== undefined ? a.seq < b.seq : a.t < b.t;
+}
+
+/** The event that recorded when this call was SENT, if the window holds it. */
+export function sendOf(events: readonly ReticleEvent[], call: NetCall): ReticleEvent | undefined {
+  const answer = events.find((e) => {
+    if (e.type !== EventType.NET_REQUEST || e.t !== call.t) {
+      return false;
+    }
+    const recorded = netCall(e);
+    return recorded.method === call.method && recorded.matchUrl === call.matchUrl;
+  });
+  const id = answer === undefined ? undefined : asString(answer.data['id']);
+  if (id === undefined) {
+    return undefined;
+  }
+  return events.find((e) => e.type === EventType.NET_PENDING && asString(e.data['id']) === id);
+}
+
+/**
+ * The success signals that can claim the failed writes in this window landed.
+ *
+ * A caller that declared the failure (`net { status: 409 }`) tests the failure path. A signal that the
+ * app fired BEFORE it sent the failed write cannot report the outcome of that write, so it is not a
+ * claim about it (#2172). A `form:submit` on the click, or an analytics beacon, is that kind of signal.
+ *
+ * The limit is when the write was SENT, not when its answer was recorded. The browser observer reads
+ * a failed response's body before it records the answer, so the app's own handler can fire its
+ * signal first. A limit on the answer would then hide the false green this rule exists for.
+ *
+ * Every failed write must be declared, and the window must hold when each one was sent. Otherwise
+ * every success signal stays a claim, as before.
+ */
+export function successClaims(
+  events: readonly ReticleEvent[],
+  failedWrites: readonly NetCall[],
+  successSignals: readonly string[],
+  declared: readonly DeclaredNetFailure[] = [],
+): readonly string[] {
+  if (
+    0 === failedWrites.length ||
+    !failedWrites.every((c) => matchesDeclaredFailure(c, declared))
+  ) {
+    return successSignals;
+  }
+  const sends: ReticleEvent[] = [];
+  for (const call of failedWrites) {
+    const send = sendOf(events, call);
+    if (send === undefined) {
+      return successSignals;
+    }
+    sends.push(send);
+  }
+  const claims = new Set(successSignals);
+  return events
+    .filter((e) => e.type === EventType.SIGNAL && sends.some((send) => !emittedBefore(e, send)))
+    .map(nameOf)
+    .filter((name) => claims.has(name));
+}
+
+const isPlainObject = (value: unknown): value is Readonly<Record<string, unknown>> =>
+  'object' === typeof value && value !== null && !Array.isArray(value);
+
+/**
+ * The values one store write set: the value itself, or each key of an object that changed. The
+ * store observer diffs only the top level, so `invite: { status: 429 }` arrives as one object.
+ */
+function writtenValues(value: unknown, old: unknown): readonly unknown[] {
+  if (!isPlainObject(value)) {
+    return [value];
+  }
+  const before = isPlainObject(old) ? old : {};
+  return Object.entries(value).flatMap(([key, v]) => (Object.is(before[key], v) ? [] : [v]));
+}
+
+/**
+ * Each call that failed in this window, with the event after which the app can react to it: the
+ * send, or the answer when the window does not hold the send. The limit is the send and not the
+ * answer for the reason `successClaims` gives: the browser observer records the answer after the
+ * app's own handler ran.
+ */
+function failedCalls(
+  events: readonly ReticleEvent[],
+): readonly { readonly call: NetCall; readonly after: ReticleEvent }[] {
+  return events.flatMap((answer) => {
+    if (answer.type !== EventType.NET_REQUEST) {
+      return [];
+    }
+    const call = netCall(answer);
+    if (false !== call.ok) {
+      return [];
+    }
+    const id = asString(answer.data['id']);
+    const sent = events.find(
+      (e) => e.type === EventType.NET_PENDING && id !== undefined && asString(e.data['id']) === id,
+    );
+    return [{ call, after: sent ?? answer }];
+  });
+}
+
+/**
+ * Did the store record the HTTP status of a call that failed in this window?
+ *
+ * A structural echo, like the echo of the error text: an app that keeps `status: 429` beside a
+ * retry button knows that the call failed. Strict, because a false acknowledgement hides a failed
+ * write. The value must be exactly that status (a number or its string), it must change in this
+ * write, and the write must come after the call was sent. The status of a call that succeeded is
+ * not one.
+ */
+export function storeEchoesFailedStatus(events: readonly ReticleEvent[]): boolean {
+  return failedCalls(events).some(({ call, after }) => {
+    if (call.status === undefined) {
+      return false;
+    }
+    const status = String(call.status);
+    return events.some(
+      (e) =>
+        e.type === EventType.STATE_CHANGE &&
+        emittedBefore(after, e) &&
+        writtenValues(e.data['value'], e.data['old']).some(
+          (v) => ('number' === typeof v || 'string' === typeof v) && String(v) === status,
+        ),
+    );
+  });
+}
+
+/** Core's `LivePoliteness.ASSERTIVE`; not imported: coupling only shrinks. */
+const LIVE_ASSERTIVE = 'assertive';
+
+/**
+ * Did the app write text into an existing ASSERTIVE live region after a failed call was sent?
+ *
+ * The common way to show "Wrong email or password" is to write it into a `role="alert"` region that
+ * is already on the page, which a mount event does not record (#2173). The words do not decide, the
+ * level does. ARIA keeps the assertive level for errors and urgent warnings. A polite region
+ * (`role="status"`) is where an app writes "Saved", so text there is not an acknowledgement. The
+ * ceiling: an app that writes a success word into an alert region over a failed write is read as
+ * acknowledging it, as a mounted alert already is. Text written before the send cannot answer the
+ * call, and a cleared region says nothing.
+ */
+export function liveAlertAfterFailedSend(events: readonly ReticleEvent[]): boolean {
+  return failedCalls(events).some(({ after }) =>
+    events.some(
+      (e) =>
+        e.type === EventType.DOM_TEXT &&
+        LIVE_ASSERTIVE === e.data['live'] &&
+        (asString(e.data['text']) ?? '').length > 0 &&
+        emittedBefore(after, e),
+    ),
+  );
+}
+
+/** Reticle's own instrumentation's signals (core's `RETICLE_HYDRATION_SIGNAL`); not imported: coupling only shrinks. */
+export const RETICLE_SIGNAL_NAMESPACE = 'reticle:';
+
+/**
+ * Whether NOTHING in this window is attributable to the action.
+ *
+ * Ambient churn is deliberately not counted as evidence the action worked — a background event
+ * stream, a polling store, a perf sample and a scroll position all move on their own. What counts:
+ *
+ *  - a mutation inside the target's own subtree (what the target itself did),
+ *  - a request (the action asked the server for something),
+ *  - a navigation, or a dialog/live region appearing — the two ways a real reaction legitimately
+ *    lands OUTSIDE the target, e.g. a modal portalled to the body,
+ *  - a store change or an app signal tied to the action (#1531): see
+ *    `tiedReaction`.
+ *
+ * The last two clauses are what keep this from manufacturing noise: a button that opens a modal
+ * mutates nothing within itself, and a Pause button whose store updates on the media `pause` event
+ * renders its new label only later. Neither must be called dead.
+ */
+export function didNothing(
+  events: readonly ReticleEvent[],
+  requests: readonly NetCall[],
+  options: ContradictionOptions,
+): boolean {
+  const mutatedWithin = options.mutatedWithin;
+  if (mutatedWithin === undefined) {
+    return 0 === events.length;
+  }
+  if (mutatedWithin > 0 || requests.length > 0) {
+    return false;
+  }
+  const tied = tiedAppReaction(options);
+  return !events.some(
+    (e) => e.type === EventType.ROUTE_CHANGE || e.type === EventType.VISIBLE_SHOWN || tied(e),
+  );
+}
+
+const STATE_KEY_PREFIX = 'state:';
+const SIGNAL_KEY_PREFIX = 'signal:';
+
+/** Which store path or signal an event moved, keyed the same way in the window and in `prior`. */
+function appReactionKey(e: ReticleEvent): string | undefined {
+  if (e.type === EventType.STATE_CHANGE) {
+    return `${STATE_KEY_PREFIX}${asString(e.data['name']) ?? ''}:${asString(e.data['path']) ?? ''}`;
+  }
+  if (e.type !== EventType.SIGNAL) {
+    return undefined;
+  }
+  const name = asString(e.data['name']) ?? '';
+  // Reticle's own instrumentation is not the app reacting.
+  return name.startsWith(RETICLE_SIGNAL_NAMESPACE) ? undefined : `${SIGNAL_KEY_PREFIX}${name}`;
+}
+
+/** A store change or app signal tied to the action: see `tiedReaction` (#1531). */
+function tiedAppReaction(options: ContradictionOptions): (e: ReticleEvent) => boolean {
+  const namedPaths = new Set(options.namedStatePaths ?? []);
+  const namedSignals = new Set(options.namedSignals ?? []);
+  return tiedReaction(options.prior ?? [], {
+    keyOf: appReactionKey,
+    isNamed: (e) =>
+      e.type === EventType.STATE_CHANGE
+        ? namedPaths.has(asString(e.data['path']) ?? '')
+        : namedSignals.has(asString(e.data['name']) ?? ''),
+  });
+}

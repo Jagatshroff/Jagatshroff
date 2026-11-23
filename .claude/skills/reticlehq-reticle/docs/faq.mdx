@@ -1,0 +1,116 @@
+---
+title: 'FAQ: frequently asserted questions'
+sidebarTitle: FAQ
+description: Does it run in production, does it need React, does it replace Playwright, and the other questions people actually ask.
+icon: circle-question
+---
+
+Reticle is a verification layer that an AI coding agent uses to prove that a change worked in your running app. By default it runs only in development, on localhost. It does not need React, and it does not replace Playwright. The rest of the questions people actually ask are below.
+
+<AccordionGroup>
+
+<Accordion title="Does this run in production?">
+  Not by default. Keep `reticle.connect()` behind a dev guard. The SDK has no side effects and
+  tree-shakes out of production builds. In a production `vite build`, the Vite plugin replaces the
+  SDK with an inert stub and injects nothing.
+
+To let an agent drive a staging or production deployment, use [production mode](/production-mode). It is opt-in. A visitor who did not activate it gets no SDK, no socket and no prompt.
+
+</Accordion>
+
+<Accordion title="Do I have to change my components?">
+  No, for look, act and observe. You get DOM, network, console and routing with zero changes.
+
+You get considerably better results by adding `data-testid` attributes and by [emitting signals](/instrumentation). That is the difference between a verdict that says "something appeared" and one that says "the app declared success".
+
+</Accordion>
+
+<Accordion title="Does it work without React?">
+  Yes. The core is framework-agnostic: DOM, network, routing, console, animations, snapshots and actions are gated against a vanilla TypeScript app. What varies by framework is how `connect()` gets in and whether you get a source pointer on top.
+
+[Frameworks](/frameworks) is the one list of what is proven for each, from "driven to a verdict in CI" to "install gated" to "wired, unverified".
+
+</Accordion>
+
+<Accordion title="Can it tell me whether my UI looks good?">
+  Reticle verifies behaviour, not aesthetics. Visual correctness and "does this feel right" remain a human job, or a visual-diff tool's, and Reticle pairs well with one.
+
+It does read design tokens. [`reticle_look { action: "element" }`](/tools/inspect) reports whether a colour came from your theme or from someone's clipboard. But that is a consistency check, not taste.
+
+</Accordion>
+
+<Accordion title="Does it replace Playwright or Cypress?">
+  No. Those are your scripted CI suite. Reticle is for in-loop verification while an agent is coding, and for the flows you never got round to automating. They compose.
+
+  <Card title="The full comparison" icon="masks-theater" href="/vs-playwright-mcp">
+    Where Playwright is the right choice, stated plainly.
+  </Card>
+</Accordion>
+
+<Accordion title="How does it compare to Playwright MCP or Chrome DevTools MCP?">
+  Those drive a **separate** browser from the outside. Reticle verifies your **own running app** from the inside, with your real session and auth, and with assertions and regression as first-class.
+
+Measured on the same app: Reticle caught 10 of 10 injected bugs, Playwright MCP 9, Chrome DevTools MCP 8. DevTools MCP is about 7% cheaper per look on a simple page, and more expensive on a real one.
+
+</Accordion>
+
+<Accordion title="Can I run several apps or tabs at once?">
+  Yes. Each is a session. Pass `sessionId` to any tool when more than one is connected, and [`reticle_session { action: "list" }`](/tools/sessions) lists them.
+
+Reticle scopes to your project and prefers the active tab, and it **refuses rather than guesses** when the choice is ambiguous. A refusal you can act on beats a silent pick of the wrong tab.
+
+</Accordion>
+
+<Accordion title='Why did I get `verified: "unknown"` on something that clearly worked?'>
+  Because Reticle could not confirm it saw the whole story, and it will not call that a pass.
+
+The most common cause is a **throttled tab**: a backgrounded browser tab has its timers suppressed, which suppresses the quiescence detection used to decide the page has settled. Focus the tab, or drive a dedicated context.
+
+If you believe an `unknown` is wrong, report it. Reticle's own response says as much: "an unknown verdict is our defect, not yours".
+
+</Accordion>
+
+<Accordion title="Does my data leave the machine?">
+  By default Reticle runs only in development, on localhost. Nothing from your app leaves the machine until you link a project (`reticle connect`, or `RETICLE_API_KEY` in CI). After that, what syncs is set by `reticle config`, and when the Harness drives, the platform sees the steps it drives. Secret values never leave. Credential-shaped values are redacted before they leave the page. You will see `[REDACTED]` in request bodies without configuring anything.
+
+Anonymous usage counts are sent by default, separately, and carry nothing from your app. `reticle telemetry disable`, `RETICLE_TELEMETRY=0` or `DO_NOT_TRACK=1` turns them off.
+
+  <Card title="Exactly what is collected" icon="chart-line" href="/telemetry">
+    The complete list. If it is not on that page, it is not sent.
+  </Card>
+</Accordion>
+
+<Accordion title="Does it work with WebGL / react-three-fiber?">
+  Partially. Reticle's model of an app is DOM + store + network. A WebGL or react-three-fiber
+  subtree is a single `<canvas>` to `reticle_look { action: "find" }` / `reticle_look { action: "page" }`: Reticle cannot pick faces
+  or drive the camera inside the scene.
+
+DOM, registered store state, and network **around** the canvas still work, and that is often where the consequential bugs live (import counts, mesh stats, solver results that contradict the UI). `init` prints this limit when it detects react-three-fiber so an adopting team does not discover it only after trying to verify the feature they care about.
+
+</Accordion>
+
+<Accordion title="Is Reticle proven to make agents fix more bugs?">
+  No. A fix-loop test on a small fixture found the same fix rate with and without Reticle, at two model tiers, and the Reticle arm made more tool calls. The fixture was small enough to read whole and the pass check looked for a string rather than behaviour, so the question is open. [Why Reticle](/why-reticle#what-the-fix-rate-test-measured) has the details.
+
+What Reticle is built to improve is the verdict: in the 88-bug head-to-head against a Playwright script it reported one false green to the script's 29, and on a known-good control it raised no false alarms.
+
+</Accordion>
+
+<Accordion title="Why does my agent only see some of Reticle's tools?">
+  Because MCP re-sends every advertised tool definition on **every turn**, so the tool list is rent, not a one-time cost. Reticle advertises the verify loop directly and keeps the cold tail one call away.
+
+`reticle_tools` lists every registered tool (pass `names: [...]` for full parameters), and `reticle_run { tool, args }` calls any of them by name, whether or not it is advertised. That hatch is what makes a trimmed surface honest: a tool it does not show is one hop away rather than out of reach. If you want the whole surface advertised directly, set `RETICLE_ADVERTISE_ALL_TOOLS=1` in the **daemon's** environment and restart it, which costs roughly seven times the per-turn schema tax and is meant for suites that call by name rather than for running agents.
+
+  <Card title="The surface, explained" icon="wrench" href="/tools/overview">
+    Which tools are advertised directly, and why each earned its slot.
+  </Card>
+</Accordion>
+
+<Accordion title="Can I use it for security, accessibility, performance or SEO checks?">
+  Yes, for how your own running app behaves: access control by role, calls that must never fire, CSP violations, roles and focus, request counts and long tasks, titles, headings, links and redirects. It pairs with a vulnerability scanner, an accessibility audit tool such as axe and an SEO crawler, which cover what an in-app check does not.
+
+  <Card title="Use cases" icon="list-check" href="/use-cases">
+    What each one checks, with a call you can run.
+  </Card>
+</Accordion>
+</AccordionGroup>

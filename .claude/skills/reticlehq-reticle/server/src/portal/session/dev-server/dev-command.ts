@@ -1,0 +1,348 @@
+/**
+ * The literal command that starts THIS project's dev server, read from the project's own scripts.
+ *
+ * The no-session diagnosis has always said "ask the human to start it (`npm run dev`)". That is a
+ * guess on two axes — the script name and the package manager — and a guessed command is worse than
+ * none: the agent runs it, gets an error about a missing script, and concludes the app is broken
+ * rather than that Reticle was wrong. So this reads, and returns nothing when it cannot read.
+ *
+ * Pure apart from one injected reader, so every case is a unit test rather than a temp directory.
+ */
+
+import { accessSync, constants, readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
+import {
+  RETICLE_NPM_PACKAGE,
+  desktopLaunch,
+  isWebApp,
+  workspacePackageDirs,
+} from '@reticlehq/init';
+
+/** A dev script, as something an agent can actually run. */
+export interface DevCommand {
+  /** The literal shell command, e.g. `pnpm run dev`. */
+  command: string;
+  /** The package.json script it runs. Absent when the command runs a CLI directly (`npx tauri dev`). */
+  script?: string;
+  /** The port the script PINS, when it pins one. Absent means the tool picks — never a guess. */
+  port?: number;
+  /** The app's directory, when it is not the project root. The caller must run the command there. */
+  directory?: string;
+}
+
+/**
+ * Script names checked, in order.
+ *
+ * `start` is last on purpose: in a Next or CRA app it is the PRODUCTION server, which serves a build
+ * with no dev-only SDK in it, so starting it would look like success and connect nothing. It is only
+ * reached when the project offers nothing better.
+ */
+const DEV_SCRIPTS = ['dev', 'develop', 'start'] as const;
+
+/** Lockfile → package manager, in precedence order. Anything else is npm. */
+const LOCKFILES = [
+  { file: 'pnpm-lock.yaml', manager: 'pnpm' },
+  { file: 'yarn.lock', manager: 'yarn' },
+  { file: 'bun.lockb', manager: 'bun' },
+  { file: 'bun.lock', manager: 'bun' },
+] as const;
+
+/** The one-off runner each manager ships, for running Reticle's CLI without installing it. */
+const RUNNER: Readonly<Record<string, string>> = { pnpm: 'pnpm dlx', bun: 'bunx' };
+const NPX = 'npx';
+const YARN = 'yarn';
+/** `yarn dlx` exists only on Yarn 2+, which is the yarn that writes this file; classic yarn has none. */
+const YARN_BERRY_MARKER = '.yarnrc.yml';
+const YARN_DLX = 'yarn dlx';
+const INIT_VERB = 'init';
+
+const DEFAULT_PACKAGE_MANAGER = 'npm';
+const PACKAGE_JSON = 'package.json';
+const PNPM_WORKSPACE = 'pnpm-workspace.yaml';
+
+/** `--port 4311` / `--port=4311`, the flag every dev server in this list accepts. */
+const PORT_FLAG = /--port[= ]\s*(\d+)/;
+/**
+ * `-p 3005`, the short form Next, Nuxt and Astro accept (reticle#1367).
+ *
+ * Anchored to a start or a whitespace so the `-p` inside a longer flag (`--pretty`) is not a port.
+ */
+const PORT_SHORT_FLAG = /(?:^|\s)-p\s*(\d+)/;
+/** `PORT=8080 remix dev` — the other half of how a project pins its port. */
+const PORT_ENV = /(?:^|\s)PORT=(\d+)/;
+
+/** Reads a file, or undefined if it is not there / not readable. */
+function readTextFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch {
+    return undefined;
+  }
+}
+
+/** The port the script pins, when it pins one at all. */
+function pinnedPort(script: string): number | undefined {
+  const match = PORT_FLAG.exec(script) ?? PORT_SHORT_FLAG.exec(script) ?? PORT_ENV.exec(script);
+  const digits = match?.[1];
+  if (digits === undefined) {
+    return undefined;
+  }
+  const port = Number.parseInt(digits, 10);
+  return Number.isSafeInteger(port) ? port : undefined;
+}
+
+/** The parsed package.json, or undefined for anything unreadable/unparseable. */
+function readManifest(raw: string | undefined): unknown {
+  if (raw === undefined) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
+
+/** The scripts block of a parsed package.json, or an empty one. */
+function scriptsOf(manifest: unknown): Record<string, unknown> {
+  if (null === manifest || 'object' !== typeof manifest) {
+    return {};
+  }
+  const scripts = (manifest as { scripts?: unknown }).scripts;
+  if (null === scripts || 'object' !== typeof scripts) {
+    return {};
+  }
+  return scripts as Record<string, unknown>;
+}
+
+/** The package manager the lockfiles under `directory` identify. Anything else is npm. */
+function packageManager(directory: string, read: (path: string) => string | undefined): string {
+  return (
+    LOCKFILES.find(({ file }) => read(join(directory, file)) !== undefined)?.manager ??
+    DEFAULT_PACKAGE_MANAGER
+  );
+}
+
+/** The dev command for the package in `directory`, with the manager chosen by the caller. */
+function devCommandFor(
+  directory: string,
+  manager: string,
+  read: (path: string) => string | undefined,
+): DevCommand | undefined {
+  const manifest = readManifest(read(join(directory, PACKAGE_JSON)));
+  const scripts = scriptsOf(manifest);
+  // A desktop shell's `dev` is its renderer's dev server, which no window ever opens onto. init's
+  // rule decides which launcher it is, so the command the daemon hands an agent and the one init
+  // spawns are the same.
+  const desktop = desktopLaunch(manifest);
+  if (desktop !== undefined) {
+    if ('command' in desktop) {
+      return { command: desktop.command };
+    }
+    const command = `${manager} run ${desktop.script}`;
+    return {
+      command: 0 < desktop.args.length ? `${command} ${desktop.args}` : command,
+      script: desktop.script,
+    };
+  }
+  for (const script of DEV_SCRIPTS) {
+    const body = scripts[script];
+    if ('string' !== typeof body || 0 === body.trim().length) {
+      continue;
+    }
+    const port = pinnedPort(body);
+    return {
+      command: `${manager} run ${script}`,
+      script,
+      ...(port === undefined ? {} : { port }),
+    };
+  }
+  return undefined;
+}
+
+/** Folders never read as an app: dependencies, and anything hidden (`.git`, `.cache`). */
+const NODE_MODULES = 'node_modules';
+const HIDDEN_PREFIX = '.';
+
+/** Whether the process can write in `path`. Asked of every web-app candidate — see `preferWebApps`. */
+function isWritableDirectory(path: string): boolean {
+  try {
+    accessSync(path, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether the package in `directory` is a web app, using init's own signal.
+ *
+ * A backend can have a dev script too, so the script alone is not enough. init already answers
+ * "is this a page somebody can open", and a second answer here would let the two disagree.
+ */
+function isWebAppAt(directory: string, read: (path: string) => string | undefined): boolean {
+  return isWebApp('.', {
+    exists: (path) => read(join(directory, path)) !== undefined,
+    readFile: (path) => read(join(directory, path)) ?? null,
+  });
+}
+
+/**
+ * Web apps first, and of those the ones this process can write. When nothing here reads as a web
+ * app, every candidate comes back, in its original order.
+ *
+ * `isWebApp` is a detector, and a detector has gaps: a custom webpack or esbuild setup, a framework
+ * it does not know yet, a repository whose only candidate is a backend. Gating on it — as this code
+ * first did — hands the agent no next action where `main` hands it a command, and silence is the
+ * worse failure: a command that starts the wrong thing can be corrected, no command cannot. So the
+ * web-app check RANKS candidates instead of gating them.
+ *
+ * Writability is the exception: asked of the web apps only, where it is absolute. The reported bug
+ * (#2017) is a read-only backup copy sitting beside the real app, and a folder nobody can write must
+ * never be the one chosen while a writable sibling exists.
+ */
+function preferWebApps<T>(
+  candidates: readonly T[],
+  isWebAppCandidate: (candidate: T) => boolean,
+  isWritable: (candidate: T) => boolean,
+): readonly T[] {
+  const apps = candidates.filter(isWebAppCandidate);
+  return 0 < apps.length ? apps.filter(isWritable) : candidates;
+}
+
+/**
+ * The direct child folders of `directory` that are apps with a dev command, sorted by name: the web
+ * apps when there are any, every dev-script folder when there are none (see `preferWebApps`).
+ *
+ * Only for a folder with no package.json of its own. A task folder holds the app one level down, and
+ * no workspace file lists it, so `workspacePackageDirs` never finds it. `node_modules`, hidden
+ * folders and folders with no dev script are never candidates.
+ */
+export function childDevApps(
+  directory: string,
+  read: (path: string) => string | undefined = readTextFile,
+  listDirs: (path: string) => readonly string[] = readDirNames,
+  writable: (path: string) => boolean = isWritableDirectory,
+): readonly string[] {
+  if (read(join(directory, PACKAGE_JSON)) !== undefined) {
+    return [];
+  }
+  const candidates = listDirs(directory)
+    .filter((name) => NODE_MODULES !== name && !name.startsWith(HIDDEN_PREFIX))
+    .filter((name) => {
+      const child = join(directory, name);
+      return devCommandFor(child, packageManager(child, read), read) !== undefined;
+    })
+    .sort();
+  return preferWebApps(
+    candidates,
+    (name) => isWebAppAt(join(directory, name), read),
+    (name) => writable(join(directory, name)),
+  );
+}
+
+/** Directory names under `path`, or none when it cannot be read. */
+function readDirNames(path: string): readonly string[] {
+  try {
+    return readdirSync(path, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The dev command for the project in `directory`, or undefined when there is not one to be sure of.
+ *
+ * `read` is injected so the whole decision is testable without a filesystem; the daemon uses the
+ * default disk reader.
+ */
+export function detectDevCommand(
+  directory: string,
+  read: (path: string) => string | undefined = readTextFile,
+): DevCommand | undefined {
+  return devCommandFor(directory, packageManager(directory, read), read);
+}
+
+/**
+ * The dev command for the project, looking one level down when the root has none.
+ *
+ * `reticle init` is run at the repo root, and in a monorepo the app is a directory down — so the
+ * daemon's "this project declares no dev script" was false for a root whose `frontend/package.json`
+ * held `"dev": "vite"`, and the agent asked a human for a command that was on disk (reticle#1368).
+ * init's own workspace listing answers which directories to consider; the root's lockfile picks the
+ * package manager, because a workspace package usually has no lockfile of its own.
+ */
+export function detectDevCommandInProject(
+  directory: string,
+  read: (path: string) => string | undefined = readTextFile,
+  listDirs: (path: string) => readonly string[] = readDirNames,
+  writable: (path: string) => boolean = isWritableDirectory,
+): DevCommand | undefined {
+  const manager = packageManager(directory, read);
+  const here = devCommandFor(directory, manager, read);
+  if (here !== undefined) {
+    return here;
+  }
+  // No package.json and no pnpm workspace file: a task folder, with the app one level down. With two
+  // apps there, choosing the first would start the wrong one; the caller names them through
+  // `childDevApps`. With none, the workspace search below still looks a level deeper.
+  if (
+    read(join(directory, PACKAGE_JSON)) === undefined &&
+    read(join(directory, PNPM_WORKSPACE)) === undefined
+  ) {
+    const [only, ...others] = childDevApps(directory, read, listDirs, writable);
+    if (0 < others.length) {
+      return undefined;
+    }
+    if (only !== undefined) {
+      const child = join(directory, only);
+      const found = devCommandFor(child, packageManager(child, read), read);
+      if (found !== undefined) {
+        return { ...found, directory: only };
+      }
+    }
+  }
+  const packages = workspacePackageDirs({
+    readFile: (path) => read(join(directory, path)) ?? null,
+    listDirs: (path) => listDirs(join(directory, path)),
+  });
+  const candidates: { sub: string; child: string; command: DevCommand }[] = [];
+  for (const sub of packages) {
+    const child = join(directory, sub);
+    const command = devCommandFor(child, manager, read);
+    if (command !== undefined) {
+      candidates.push({ sub, child, command });
+    }
+  }
+  // Same rule as the child folders above, so a workspace and a task folder cannot disagree.
+  const [first] = preferWebApps(
+    candidates,
+    (entry) => isWebAppAt(entry.child, read),
+    (entry) => writable(entry.child),
+  );
+  return first === undefined ? undefined : { ...first.command, directory: first.sub };
+}
+
+/**
+ * The command that wires THIS project for good: `init`, in the app's own folder, through the
+ * one-off runner the project's package manager ships.
+ *
+ * Handed to an agent whose install never ran `init` (an MCP-only route), so it has to be right first
+ * time: `init` run in a folder that is not the app stops on a missing package.json, and a runner the
+ * machine does not have is "command not found". npx whenever there is doubt — it ships with Node.
+ */
+export function initCommandIn(
+  directory: string,
+  read: (path: string) => string | undefined = readTextFile,
+  listDirs: (path: string) => readonly string[] = readDirNames,
+  writable: (path: string) => boolean = isWritableDirectory,
+): string {
+  const manager = packageManager(directory, read);
+  const berry = read(join(directory, YARN_BERRY_MARKER)) !== undefined;
+  const runner = YARN === manager ? (berry ? YARN_DLX : NPX) : (RUNNER[manager] ?? NPX);
+  const command = `${runner} ${RETICLE_NPM_PACKAGE} ${INIT_VERB}`;
+  const app = detectDevCommandInProject(directory, read, listDirs, writable)?.directory;
+  return app === undefined ? command : `cd ${app} && ${command}`;
+}

@@ -1,0 +1,169 @@
+import { describe, expect, it } from 'vitest';
+import {
+  RUN_FILE_VERSION,
+  RiskSeverity,
+  RiskSurface,
+  RunAgentKind,
+  PredicateKind,
+  Verified,
+  RunConfidence,
+  RunFlowStatus,
+  RunFramework,
+  RunProfile,
+  RunTrigger,
+  VerdictStatus,
+} from '@reticlehq/core';
+import {
+  buildVerificationRun,
+  computeVerdict,
+  type VerificationRunInput,
+} from './build-verification-run.js';
+
+const FROZEN = 1_700_000_000_000;
+
+const base: VerificationRunInput = {
+  runId: 'run-1',
+  durationMs: 100,
+  profile: RunProfile.DEV,
+  project: { name: 'demo', framework: RunFramework.REACT },
+  agent: { id: 'a', kind: RunAgentKind.CODING_AGENT },
+  trigger: { kind: RunTrigger.EDIT },
+  changedFiles: [],
+  flows: [],
+  checks: [],
+  risks: [],
+  evidence: { consoleErrors: [], networkAnomalies: [], stateAssertions: [], timeline: [] },
+};
+
+const flow = (name: string, status: RunFlowStatus, oracle?: string) => ({
+  name,
+  status,
+  steps: 2,
+  durationMs: 10,
+  ...(oracle !== undefined ? { oracle } : {}),
+});
+
+describe('computeVerdict', () => {
+  it('all flows pass → PASS, HIGH confidence when oracle-backed', () => {
+    const v = computeVerdict({ ...base, flows: [flow('a', RunFlowStatus.PASS, 'order:saved')] });
+    expect(v.status).toBe(VerdictStatus.PASS);
+    expect(v.confidence).toBe(RunConfidence.HIGH);
+    expect(v.blockingRisks).toBe(0);
+  });
+
+  it('a healed flow counts as a pass', () => {
+    const v = computeVerdict({ ...base, flows: [flow('a', RunFlowStatus.HEALED, 'x')] });
+    expect(v.status).toBe(VerdictStatus.PASS);
+  });
+
+  it('mixed pass + fail → FAIL: a failure beside a pass is still a failure', () => {
+    const v = computeVerdict({
+      ...base,
+      flows: [flow('a', RunFlowStatus.PASS, 'x'), flow('b', RunFlowStatus.FAIL, 'y')],
+    });
+    expect(v.status).toBe(VerdictStatus.FAIL);
+    expect(v.reasons.some((r) => r.includes('flow b'))).toBe(true);
+  });
+
+  it('mixed pass + skipped flow → PARTIAL, reasons name the skipped flow', () => {
+    const v = computeVerdict({
+      ...base,
+      flows: [
+        flow('a', RunFlowStatus.PASS, 'x'),
+        { ...flow('b', RunFlowStatus.SKIPPED), failureReason: 'precondition unmet' },
+      ],
+    });
+    expect(v.status).toBe(VerdictStatus.PARTIAL);
+    expect(v.reasons.some((r) => r.includes('flow b: precondition unmet'))).toBe(true);
+  });
+
+  // Persona drive: the agent's session end said "not proved · 1 of 2 checks undecided" and the
+  // dashboard said Passed for the same run: an undecided check counted for nothing.
+  it('a held check beside an undecided one → PARTIAL, never PASS', () => {
+    const check = (status: Verified) => ({
+      predicate: `p-${status}`,
+      status,
+    });
+    const v = computeVerdict({ ...base, checks: [check(Verified.YES), check(Verified.UNKNOWN)] });
+    expect(v.status).toBe(VerdictStatus.PARTIAL);
+    expect(v.reasons.some((r) => r.includes('undecided'))).toBe(true);
+  });
+
+  // Driven over MCP: a passive assert read the text Generate produces before its POST answered,
+  // and the same claim held a moment later; the run said PARTIAL for a journey that worked.
+  it('a passive check superseded by the same claim holding later does not fail the run', () => {
+    const early = { predicate: "text 'Done'", status: Verified.NO, declaredBeforeActing: false };
+    const later = { predicate: "text 'Done'", status: Verified.YES, declaredBeforeActing: false };
+    expect(computeVerdict({ ...base, checks: [early, later] }).status).toBe(VerdictStatus.PASS);
+    // A declared check that failed stays a failure, and so does a probe nothing later proved.
+    const declared = { ...early, declaredBeforeActing: true };
+    expect(computeVerdict({ ...base, checks: [declared, later] }).status).toBe(VerdictStatus.FAIL);
+    expect(computeVerdict({ ...base, checks: [later, early] }).status).toBe(VerdictStatus.FAIL);
+  });
+
+  it('only failures → FAIL', () => {
+    const v = computeVerdict({ ...base, flows: [flow('b', RunFlowStatus.FAIL)] });
+    expect(v.status).toBe(VerdictStatus.FAIL);
+  });
+
+  it('a gated risk blocks even when everything else passed', () => {
+    const v = computeVerdict({
+      ...base,
+      flows: [flow('a', RunFlowStatus.PASS, 'x')],
+      risks: [
+        {
+          surface: RiskSurface.PAYMENT,
+          severity: RiskSeverity.HIGH,
+          detail: 'checkout changed',
+          gated: true,
+        },
+      ],
+    });
+    expect(v.status).toBe(VerdictStatus.FAIL);
+    expect(v.blockingRisks).toBe(1);
+    expect(v.reasons.some((r) => r.includes('blocked'))).toBe(true);
+  });
+
+  it('a failing check fails the run', () => {
+    const v = computeVerdict({
+      ...base,
+      checks: [{ kind: PredicateKind.NET, predicate: 'POST /api 200', status: Verified.NO }],
+    });
+    expect(v.status).toBe(VerdictStatus.FAIL);
+  });
+
+  it('nothing ran → UNKNOWN, and says so in its reasons', () => {
+    const v = computeVerdict(base);
+    expect(v.status).toBe(VerdictStatus.UNKNOWN);
+    expect(v.confidence).toBe(RunConfidence.LOW);
+    expect(v.reasons.join(' ')).toContain('nothing was proved');
+  });
+
+  it('every flow skipped → UNKNOWN, not PASS', () => {
+    // The same hole one step along: skipping is neither passing nor failing, so a run of nothing but
+    // skips proves exactly as much as an empty one.
+    const v = computeVerdict({
+      ...base,
+      flows: [flow('checkout', RunFlowStatus.SKIPPED)],
+    });
+    expect(v.status).toBe(VerdictStatus.UNKNOWN);
+  });
+
+  it('smoke flow with no oracle and no checks → MEDIUM confidence', () => {
+    const v = computeVerdict({ ...base, flows: [flow('a', RunFlowStatus.PASS)] });
+    expect(v.confidence).toBe(RunConfidence.MEDIUM);
+  });
+});
+
+describe('buildVerificationRun', () => {
+  it('stamps schemaVersion + createdAt from the injected clock and is schema-valid', () => {
+    const run = buildVerificationRun(
+      { ...base, flows: [flow('a', RunFlowStatus.PASS, 'x')] },
+      () => FROZEN,
+    );
+    expect(run.schemaVersion).toBe(RUN_FILE_VERSION);
+    expect(run.createdAt).toBe(FROZEN);
+    expect(run.verdict.status).toBe(VerdictStatus.PASS);
+    expect(run.runId).toBe('run-1');
+  });
+});

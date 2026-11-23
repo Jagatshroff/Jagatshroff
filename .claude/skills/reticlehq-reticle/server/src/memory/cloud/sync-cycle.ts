@@ -1,0 +1,933 @@
+/**
+ * One full conversation with the dashboard: ask, send the difference, collect what came back.
+ *
+ * ── WHY IT LOOKS LIKE THIS ─────────────────────────────────────────────────────────────────────
+ * `.reticle/` is the source of truth and always will be. Reticle has to work with no account and no
+ * network; a verification that blocks on an HTTP round trip is one somebody switches off. So the
+ * dashboard is a REPLICA, and this is the replication protocol:
+ *
+ *   1. ASK      GET /v1/sync/status  → run ids it already holds, a content hash per derived record
+ *   2. SEND     POST /v1/sync        → only unseen runs, only records whose hash moved
+ *   3. COLLECT  GET /v1/sync/pull    → decisions a human made there, since our cursor
+ *   4. APPLY    write them to .reticle/issues.json so the HUD and the next run can see them
+ *
+ * ASK-THEN-SEND, not send-everything. A three-hour session rewrites impact.json on every tool call;
+ * uploading it each time would re-send the same megabytes dozens of times, and a sync that costs
+ * that much is one people turn off — which is the real failure, because a dashboard nobody syncs to
+ * is a dashboard nobody opens. When nothing has moved, a cycle sends nothing at all, and that is
+ * what makes running it on a timer affordable.
+ *
+ * HASHES, NOT TIMESTAMPS. Two machines comparing their own clocks is a guess: they drift, and a
+ * laptop that was asleep will cheerfully decide it is current. A content hash is an answer.
+ *
+ * BOTH DIRECTIONS, ALWAYS. The pull runs even when there is nothing to push — a quiet machine is
+ * precisely the one whose dashboard somebody has been triaging on, so skipping the pull when the
+ * push is empty would starve the direction that matters most.
+ *
+ * NOTHING IS DELETED LOCALLY ON SUCCESS. A lost response costs one redundant upload rather than a
+ * hole in the record, and the server dedupes by run id anyway.
+ *
+ * Every dependency is injected — the clock, the fetch, the reads and writes — because this is the
+ * one piece of Reticle that talks to a network AND to a disk, and it must be provable without either.
+ */
+import { FlowErrorCode, ReticleDir, SYNC_BATCH_LIMITS, flowJsonReplacer } from '@reticlehq/core';
+import { hashPayload } from './sync-hash.js';
+import { syncScreenshots, type ScreenshotSyncState } from './sync-screenshots.js';
+import { describeTransportError, problemsOf } from './sync-describe.js';
+import { conflictOf, flowBases, versionsIn } from './sync-flow-versions.js';
+import {
+  asJson,
+  flowName,
+  isRecord,
+  numberAt,
+  numbersIn,
+  partResult,
+  type PullResponse,
+  type StatusResponse,
+} from './sync-answer.js';
+
+export { FLOW_CONFLICT_CODE } from './sync-flow-versions.js';
+
+/** The server's own doors. Kept beside the code that calls them, like the other cloud paths. */
+const SYNC_PATH = '/v1/sync';
+const SYNC_STATUS_PATH = '/v1/sync/status';
+const SYNC_PULL_PATH = '/v1/sync/pull';
+const FLOWS_PATH = '/v1/flows';
+
+/**
+ * The derived records that ride along with runs, and the file each one lives in.
+ *
+ * One list, so adding a record is one line and cannot be half-done: the bundle, the hashing, the
+ * reporting and the disk source (`sync-disk.ts`) all read it.
+ */
+export const DERIVED_RECORDS = [
+  { kind: 'impact', file: ReticleDir.IMPACT_FILE },
+  { kind: 'flake', file: ReticleDir.FLAKE_FILE },
+  { kind: 'intent', file: ReticleDir.INTENT_FILE },
+  // How each page normally behaves, and how strong each flow's checks are. Kept only here, they
+  // cannot tell a server a page that drifted from one that always behaved that way.
+  { kind: 'envelopes', file: ReticleDir.ENVELOPES_FILE },
+  { kind: 'assertion-tiers', file: ReticleDir.TIERS_FILE },
+  // Reticle Coverage: what the platform's Overview shows as controls proved and routes reached.
+  { kind: 'coverage', file: ReticleDir.COVERAGE_FILE },
+  // The notes a human pinned in the HUD, pending and resolved: the review trail a team reads.
+  { kind: 'notes', file: ReticleDir.NOTES_FILE },
+] as const;
+
+type DerivedKind = (typeof DERIVED_RECORDS)[number]['kind'];
+
+/** What the machine reads from disk. Injected so a cycle is testable with no filesystem at all. */
+export interface SyncSource {
+  /** Every run artifact currently on disk. */
+  runs: () => ReadonlyArray<{ runId: string; payload: unknown }>;
+  /** Every saved flow. Upserted by name, so the set is sent only when it changed. */
+  flows: () => readonly unknown[];
+  /**
+   * Every bug capsule on disk — the minimal failing flow that reproduces a defect, plus its evidence.
+   *
+   * Sent like flows, only when the set changed: upserted by id, and worth nothing on the
+   * machine that found the bug. A verdict count tells a dashboard THAT something broke; the capsule
+   * is the only artifact that lets somebody else make it break again.
+   */
+  capsules: () => readonly unknown[];
+  /** One derived record, or undefined when the file is absent. */
+  derived: (kind: DerivedKind) => unknown;
+  /** One step screenshot of a run. Absent when this project keeps its screenshots local. */
+  screenshot?: (runId: string, file: string) => Uint8Array | undefined;
+}
+
+/** What the machine writes back. Separated from reads so a dry run is a source with no sink. */
+export interface SyncSink {
+  /** Persist the triage decisions pulled from the dashboard. */
+  writeIssues: (issues: PulledIssues) => void;
+  /** Persist the cursor and the bookkeeping. */
+  writeState: (state: CloudSyncState) => void;
+  /**
+   * Keep this machine's edit of a flow as a named copy beside it and write the platform's version in
+   * its place; answers the copy's name. Absent (a dry run): the conflict is reported as a refusal.
+   */
+  resolveFlowConflict?: (name: string, theirs: unknown) => string | undefined;
+}
+
+/** A decision a human made on the dashboard, as the machine stores it. */
+interface PulledIssue {
+  status: string;
+  flowName: string | null;
+  title: string;
+  at: number;
+}
+
+export interface PulledIssues {
+  /** Keyed by the server's fingerprint — stable across runs, which is the point of it. */
+  triage: Record<string, PulledIssue>;
+}
+
+/** `.reticle/cloud-state.json`. This machine's side of the conversation, never git-checked. */
+export interface CloudSyncState extends ScreenshotSyncState {
+  /** Opaque. Handed back to the server verbatim; the machine must never parse or invent one. */
+  cursor?: string;
+  lastPushAt?: number;
+  lastPullAt?: number;
+  /** The last failure, kept so `reticle sync` can say why it is behind instead of just "0 sent". */
+  lastError?: string;
+  /**
+   * Run ids this machine has watched the server accept, kept only for the runs still held locally.
+   *
+   * Read ONLY when the server says its own `knownRunIds` was truncated. A complete list is a
+   * complete answer — a run missing from one is genuinely missing and must be re-sent — so this
+   * fills the gap the server declared and never overrides the server on a question it answered.
+   */
+  sentRunIds?: string[];
+  /**
+   * The content hash of each run as the server last ACCEPTED it, for the runs still held locally.
+   *
+   * A run is not immutable: a session's live drive run is rewritten after every verdict under the
+   * same id. Sending by id alone delivered its first version and never the rest, so the server held
+   * a tab's first few verdicts and none after. The server upserts a run by id, so a changed run is
+   * simply sent again; this is how the machine tells a changed run from one it already delivered.
+   */
+  sentRunHashes?: Record<string, string>;
+  /**
+   * Runs the server refused, by run id: its reason, and the two things that could change the answer
+   * (a hash of the run file, and of what the platform said it reads). A refused run is not offered
+   * again until one of them changes; re-offering it every cycle got the same refusal and dragged
+   * every flow and capsule along with it.
+   */
+  refusedRuns?: Record<string, RefusedRun>;
+  /**
+   * Hashes of the flow set and the capsule set the platform last answered for. A flow saved or
+   * edited with no new run used to wait for one, because flows only rode along with other data; now
+   * a changed set is sent on its own, and an unchanged one is not sent again.
+   */
+  sentFlowsHash?: string;
+  /**
+   * The hash of each flow, by name, as the platform last took it from here. A flow goes when IT
+   * changed: re-sending the whole set on every save sent each of a repo's flows once per save, and
+   * the platform stamped every one of them as updated. `sentFlowsHash` is read only to adopt a
+   * record from before this existed, so an upgrade does not re-send an unchanged set.
+   */
+  sentFlowHashes?: Record<string, string>;
+  /** The platform's version of each flow as last taken or adopted here: what a push is based on. */
+  flowVersions?: Record<string, string>;
+  /** Conflict copies still on disk: this machine's edits kept beside the platform's version. */
+  flowConflicts?: string[];
+  sentCapsulesHash?: string;
+  /**
+   * The hash of each derived record the platform last ACCEPTED from here. A platform that reports
+   * a hash of its own form of a record never matches ours, so the same record went every cycle.
+   */
+  sentDerivedHashes?: Record<string, string>;
+  /** The names of the flows the platform last took from here: one gone from disk is deleted there. */
+  sentFlowNames?: string[];
+  /**
+   * The link everything above was kept for: cloud, workspace and project (`credentialSlot`). A
+   * folder re-linked elsewhere starts a fresh record, so the new link gets the flows the old one
+   * already had, and none of the old link's runs.
+   */
+  link?: string;
+  /** When this folder was re-linked: runs made before it stay here unless the person moves them. */
+  linkedAt?: number;
+  /**
+   * A flow or capsule set the platform refused, kept so the refusal stays visible on the cycles that
+   * do not resend it, and so the set is offered again once it changes or the platform reads more.
+   */
+  refusedSets?: Partial<Record<SetPart, RefusedSet>>;
+}
+
+type SetPart = 'flow' | 'capsule';
+
+interface RefusedSet extends RefusalStamp {
+  hash: string;
+  count: number;
+  reason: string;
+}
+
+/**
+ * What could change a refusal's answer besides the item itself. A refusal used to stand until the
+ * item changed or the platform's `accepts` did, so a refused flow set stayed refused after the
+ * platform relaxed its rule, until somebody deleted the entry by hand. The platform sends no version
+ * of its own, so the CLI's version stands in for "the conversation changed", and age bounds the rest.
+ */
+interface RefusalStamp {
+  acceptsHash: string;
+  /** The CLI version that heard the refusal. Absent on a refusal recorded before this existed. */
+  version?: string;
+  /** When it was heard. Absent on a refusal recorded before this existed. */
+  at?: number;
+}
+
+/** A refusal older than this is offered again, whatever else is unchanged. */
+export const REFUSAL_RETRY_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Does an earlier refusal still hold? An entry from before the stamp existed is asked once more. */
+function refusalHolds(prior: RefusalStamp, now: RefusalStamp & { at: number }): boolean {
+  return (
+    prior.acceptsHash === now.acceptsHash &&
+    prior.version === now.version &&
+    'number' === typeof prior.at &&
+    now.at - prior.at < REFUSAL_RETRY_AFTER_MS
+  );
+}
+
+interface RefusedRun extends RefusalStamp {
+  reason: string;
+  payloadHash: string;
+}
+
+export interface SyncReport {
+  /**
+   * False if the cycle failed, the server refused anything, or a run or flow was held back for a
+   * version the platform does not read. A completed HTTP exchange alone is not a successful push.
+   * A record KIND the platform does not know yet is reported in `held` and does not fail it.
+   */
+  ok: boolean;
+  /** Runs the server accepted this cycle. */
+  runsSent: number;
+  /** Step screenshots the server took this cycle, for runs it holds. */
+  screenshotsSent?: number;
+  /** Runs it refused, with the reason, so a bad artifact is visible rather than silently stuck. */
+  runsRejected: Array<{ index: number; reason: string }>;
+  flowsSent: number;
+  /** Open conflict copies: edits of a flow another machine saved over first, kept beside it. */
+  flowConflicts?: string[];
+  /** Capsules the server accepted. Zero when it reported none, which includes not knowing the field. */
+  capsulesSent: number;
+  /** Derived records the server ACCEPTED this cycle. Empty on a quiet cycle, the normal case. */
+  derivedSent: DerivedKind[];
+  /**
+   * Everything else the server refused: a flow, a capsule, or a derived record. Each reason is a
+   * complete sentence naming the item, because this is often read from a background daemon's log.
+   */
+  refused: Refusal[];
+  /**
+   * What was deliberately NOT sent, and why: a record kind or a file version this platform does
+   * not read. Sending it would only be refused again on every cycle.
+   */
+  held: string[];
+  /** Runs refused on an earlier cycle and not offered again, because nothing has changed since. */
+  notRetried: Array<{ runId: string; reason: string }>;
+  /** Flow or capsule sets refused on an earlier cycle and not offered again. */
+  setsNotRetried: Array<{ part: SetPart; count: number; reason: string }>;
+  /** Decisions collected from the dashboard. */
+  pulled: number;
+  /** True when the pull page was full — call again now rather than waiting for the next tick. */
+  morePending: boolean;
+  /**
+   * The repo holds NO artifacts at all — no runs, no flows, no derived records.
+   *
+   * Distinct from "everything here is already pushed", which is the healthy steady state and looks
+   * identical from the outside. An empty repo usually means the app announces no projectId, so its
+   * runs are pooling into a different root and this binding will never report anything. Tracked so
+   * the summary can tell a user which of the two they are looking at.
+   */
+  localIsEmpty?: boolean;
+  /** Set when the cycle could not complete. The local record is untouched either way. */
+  error?: string;
+}
+
+/** One item the server refused that is not a run. */
+export interface Refusal {
+  /** `flow`, `capsule`, or the derived record's kind. */
+  part: string;
+  reason: string;
+}
+
+interface SyncDeps {
+  config: { url: string; apiKey: string };
+  /** The link this cycle sends for (`credentialSlot`); absent for an env-only key (CI). */
+  link?: string;
+  /** Send runs made under a previous link too: only ever because the person asked. */
+  moveHistory?: boolean;
+  /** The project flows are synced for. Absent when this cycle does not send flows: none is deleted. */
+  projectId?: string;
+  source: SyncSource;
+  sink: SyncSink;
+  state: CloudSyncState;
+  now: () => number;
+  /** This CLI's version, stamped on each refusal: a new one asks the platform again. */
+  clientVersion?: string;
+  /** Injected so a cycle can be driven against a scripted server with no network. */
+  request: (
+    url: string,
+    init: { method: string; headers: Record<string, string>; body?: string },
+  ) => Promise<{ status: number; text: string }>;
+}
+
+const FLOW_VERSION_FIX = 'update the platform or remove `compare` from the flow';
+const RUN_VERSION_FIX = 'update the platform';
+
+/** A 200 that never confirmed the runs it was sent. Kept queued, and said, rather than dropped. */
+export const MSG_RUNS_UNCONFIRMED =
+  'sync 200 without a runs result: the server did not confirm the runs it was sent, so they stay queued';
+
+/** The delivery record, kept only for the runs still on disk — the same bound as `sentRunIds`. */
+function heldHashes(
+  runs: ReadonlyArray<{ runId: string }>,
+  recorded: Record<string, string>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { runId } of runs) {
+    const hash = recorded[runId];
+    if (hash !== undefined) out[runId] = hash;
+  }
+  return out;
+}
+
+/**
+ * Split runs into requests bounded by count and by serialized size. A run bigger than the byte
+ * bound on its own still goes, alone: it cannot be split, and holding it back would hide it.
+ */
+function batchRuns<T extends { payload: unknown }>(runs: readonly T[]): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let bytes = 0;
+  for (const run of runs) {
+    const size = Buffer.byteLength(JSON.stringify(run.payload));
+    const full =
+      current.length >= SYNC_BATCH_LIMITS.MAX_RUNS || bytes + size > SYNC_BATCH_LIMITS.MAX_BYTES;
+    if (current.length > 0 && full) {
+      batches.push(current);
+      current = [];
+      bytes = 0;
+    }
+    current.push(run);
+    bytes += size;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/** The command that moves a folder's earlier runs to the link it has now. */
+export const MOVE_HISTORY_COMMAND = 'reticle sync --move-history';
+
+/**
+ * The record this cycle keeps, for this link. Re-linked to another cloud, workspace or project, it
+ * starts afresh from now: what the old link was sent says nothing about the new one, and the runs
+ * made under the old link are that workspace's (a person's email can be in their steps), so they go
+ * only when the person moves them. A first link, or a record from before links were kept, is
+ * adopted as it is.
+ */
+function stateForLink(deps: SyncDeps): CloudSyncState {
+  const { state, link } = deps;
+  if (link === undefined) return state;
+  if (state.link === undefined || state.link === link) {
+    const { linkedAt, ...rest } = state;
+    return true === deps.moveHistory || linkedAt === undefined
+      ? { ...rest, link }
+      : { ...rest, link, linkedAt };
+  }
+  return { link, ...(true === deps.moveHistory ? {} : { linkedAt: deps.now() }) };
+}
+
+/**
+ * Run one cycle. Never throws: the local record is already safe on disk, and a sync that can take
+ * down the thing it is backing up is worse than no sync.
+ */
+export async function runSyncCycle(given: SyncDeps): Promise<SyncReport> {
+  const deps: SyncDeps = { ...given, state: stateForLink(given) };
+  const empty: SyncReport = {
+    ok: false,
+    runsSent: 0,
+    runsRejected: [],
+    flowsSent: 0,
+    capsulesSent: 0,
+    derivedSent: [],
+    refused: [],
+    held: [],
+    notRetried: [],
+    setsNotRetried: [],
+    pulled: 0,
+    morePending: false,
+  };
+
+  const call = async (
+    path: string,
+    init?: { method: string; body?: string },
+  ): Promise<{ status: number; json: unknown; text: string }> => {
+    const res = await deps.request(`${deps.config.url}${path}`, {
+      method: init?.method ?? 'GET',
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${deps.config.apiKey}`,
+      },
+      ...(init?.body === undefined ? {} : { body: init.body }),
+    });
+    return { status: res.status, json: asJson(res.text), text: res.text };
+  };
+
+  const nextState: CloudSyncState = { ...deps.state };
+
+  try {
+    // 1. ASK.
+    const status = await call(SYNC_STATUS_PATH);
+    if (200 !== status.status) {
+      const error = `status ${String(status.status)}: ${status.text.slice(0, 200)}`;
+      deps.sink.writeState({ ...nextState, lastError: error });
+      return { ...empty, error };
+    }
+    const held = isRecord(status.json) ? (status.json as StatusResponse) : {};
+    /*
+     * Validated, not trusted. `new Set(someString)` builds a set of CHARACTERS, so a `knownRunIds`
+     * that arrived as a string made `known.has('a')` true and silently skipped any run whose id was
+     * one of those letters — the client deciding, on the server's malformed word, not to upload
+     * something the server does not have. Silent data loss is the one failure this protocol must
+     * not have, and an unreadable answer has to mean "it knows nothing", never "it knows this".
+     */
+    const onlyStrings = (value: unknown): string[] =>
+      Array.isArray(value) ? value.filter((id): id is string => 'string' === typeof id) : [];
+    /*
+     * The server may answer "here are the ids I hold, and there are more than I listed". Read as the
+     * whole truth, that short list made every run past the server's page look unsent, so a project
+     * with enough runs to truncate it re-uploaded its history on every single cycle, forever. The
+     * field was declared on this response and read nowhere.
+     *
+     * Only then is the machine's own record consulted, and it is subject to the same rule as the
+     * server's: anything that is not a list of strings reads as "nothing is known".
+     */
+    const known = new Set([
+      ...onlyStrings(held.knownRunIds),
+      ...(true === held.truncated ? onlyStrings(deps.state.sentRunIds) : []),
+    ]);
+    // Same rule for the hashes: only a string can equal a hash we computed, so anything else reads
+    // as "unknown" and the record is sent once. Re-sending costs a request; skipping costs the data.
+    const hashes = isRecord(held.stateHashes) ? held.stateHashes : {};
+    /*
+     * What this platform reads. `accepts` says so outright; a platform that predates it still lists
+     * every record kind it knows in `stateHashes`, null when it holds nothing. A kind it does not
+     * list is one it does not know, and it will never answer with a hash for it: sending on "hash
+     * differs" then re-sent that record, and every flow and capsule riding with it, on every cycle.
+     */
+    const accepts = isRecord(held.accepts) ? held.accepts : {};
+    const acceptedKinds = new Set(
+      Array.isArray(accepts['derived']) ? onlyStrings(accepts['derived']) : Object.keys(hashes),
+    );
+    const flowVersions = numbersIn(accepts['flowVersions']);
+    const runVersions = numbersIn(accepts['runVersions']);
+    const heldBack: string[] = [];
+    /** Held runs and flows mean the dashboard is missing something; unknown record kinds do not. */
+    let heldArtifacts = false;
+
+    // 2. SEND — only what the server does not already have, and only what it can read.
+    const allRuns = deps.source.runs();
+    const acceptsHash = hashPayload(held.accepts ?? null);
+    const stamp = {
+      acceptsHash,
+      ...(deps.clientVersion === undefined ? {} : { version: deps.clientVersion }),
+      at: deps.now(),
+    };
+    const priorRefusals = isRecord(deps.state.refusedRuns) ? deps.state.refusedRuns : {};
+    const refusedRuns: Record<string, RefusedRun> = {};
+    const notRetried: Array<{ runId: string; reason: string }> = [];
+    // Same rule as every record read from disk: only a string can equal a hash we computed.
+    const recorded: Record<string, string> = {};
+    if (isRecord(deps.state.sentRunHashes))
+      for (const [id, hash] of Object.entries(deps.state.sentRunHashes))
+        if ('string' === typeof hash) recorded[id] = hash;
+    /*
+     * Changed means no record, or a record that differs. No record has to count: a machine upgraded
+     * onto this can hold runs the server has only in an older version, and a tab that has closed
+     * never changes again to earn a re-send. So each such run is
+     * sent once and recorded, a one-time cost bounded by what retention keeps.
+     */
+    const delivered = (run: { runId: string; payload: unknown }): boolean =>
+      known.has(run.runId) && recorded[run.runId] === hashPayload(run.payload);
+    const unsent = allRuns.filter((run) => {
+      if (delivered(run)) return false;
+      const prior = priorRefusals[run.runId];
+      const unchanged =
+        prior !== undefined &&
+        'string' === typeof prior.reason &&
+        refusalHolds(prior, stamp) &&
+        prior.payloadHash === hashPayload(run.payload);
+      if (!unchanged) return true;
+      refusedRuns[run.runId] = prior;
+      notRetried.push({ runId: run.runId, reason: prior.reason });
+      return false;
+    });
+    // Made before this folder was linked here: the previous link's, kept until the person moves it.
+    const linkedAt = deps.state.linkedAt;
+    const earlier = unsent.filter(
+      (run) => linkedAt !== undefined && !((numberAt(run.payload, 'createdAt') ?? 0) >= linkedAt),
+    );
+    if (0 < earlier.length)
+      heldBack.push(
+        `${String(earlier.length)} run${1 === earlier.length ? '' : 's'} made before this folder was linked to this workspace stay${1 === earlier.length ? 's' : ''} on this machine (recorded under its previous link): run \`${MOVE_HISTORY_COMMAND}\` to send ${1 === earlier.length ? 'it' : 'them'} here`,
+      );
+    const sendable = unsent.filter((run) => {
+      if (earlier.includes(run)) return false;
+      const version = numberAt(run.payload, 'schemaVersion');
+      if (runVersions === undefined || version === undefined || runVersions.includes(version))
+        return true;
+      heldBack.push(
+        `this platform reads run versions ${runVersions.join(', ')}; run ${run.runId} is version ${String(version)} — ${RUN_VERSION_FIX}`,
+      );
+      heldArtifacts = true;
+      return false;
+    });
+    const derivedOffered: DerivedKind[] = [];
+    const unsupported: DerivedKind[] = [];
+    const bundle: Record<string, unknown> = {};
+    // A folder re-linked elsewhere keeps what it derived under the old link (its counts, defects,
+    // notes) here with the runs: those records add up the whole history and cannot be split by time.
+    // ponytail: held until `--move-history`; a per-link reset of the counters would let new ones go.
+    const derivedHeld: DerivedKind[] = [];
+    for (const { kind } of DERIVED_RECORDS) {
+      const payload = deps.source.derived(kind);
+      if (payload === undefined) continue;
+      if (linkedAt !== undefined) {
+        derivedHeld.push(kind);
+        continue;
+      }
+      if (!acceptedKinds.has(kind)) {
+        unsupported.push(kind);
+        continue;
+      }
+      // The one comparison the whole protocol rests on. Same hash, do not send it: the platform's,
+      // or the one it accepted from here while it still holds the record (a null means it does not).
+      const hash = hashPayload(payload);
+      if (hash === hashes[kind]) continue;
+      if ('string' === typeof hashes[kind] && hash === deps.state.sentDerivedHashes?.[kind])
+        continue;
+      bundle[kind] = payload;
+      derivedOffered.push(kind);
+    }
+    if (unsupported.length > 0)
+      heldBack.push(`this platform does not accept ${unsupported.join(', ')} yet`);
+    if (0 < derivedHeld.length)
+      heldBack.push(
+        `the ${derivedHeld.join(', ')} record${1 === derivedHeld.length ? '' : 's'} made under this folder's previous link stay${1 === derivedHeld.length ? 's' : ''} on this machine: run \`${MOVE_HISTORY_COMMAND}\` to send ${1 === derivedHeld.length ? 'it' : 'them'} here`,
+      );
+    // Flows and capsules are upserted by name/id, so the whole set goes whenever it differs from the
+    // set the platform last answered for — and only then. Riding along with every run push re-sent
+    // ~1.3 MB per push on a real repo, and a POST that size timed out and failed the run with it.
+    // Made before this folder was linked here, like the runs: the previous link's, kept until moved.
+    // A flow carries the steps of whoever drove it, so it is that workspace's as much as a run is.
+    // One read for both halves: the disk source rebuilds every flow per read, so a second read's
+    // objects are never `includes` of the first's, and every held-back flow went out anyway.
+    const flowsAll = deps.source.flows();
+    const madeBefore = (flow: unknown): boolean =>
+      linkedAt !== undefined && !((numberAt(flow, 'createdAt') ?? 0) >= linkedAt);
+    const flowsBefore = flowsAll.filter(madeBefore);
+    if (0 < flowsBefore.length)
+      heldBack.push(
+        `${String(flowsBefore.length)} flow${1 === flowsBefore.length ? '' : 's'} made before this folder was linked to this workspace stay${1 === flowsBefore.length ? 's' : ''} on this machine: run \`${MOVE_HISTORY_COMMAND}\` to send ${1 === flowsBefore.length ? 'it' : 'them'} here`,
+      );
+    const flows = flowsAll.filter((flow, index) => {
+      if (madeBefore(flow)) return false;
+      const version = numberAt(flow, 'version');
+      if (flowVersions === undefined || version === undefined || flowVersions.includes(version))
+        return true;
+      heldBack.push(
+        `this platform reads flow versions ${flowVersions.join(', ')}; ${flowName(flow, index)} is version ${String(version)} — ${FLOW_VERSION_FIX}`,
+      );
+      heldArtifacts = true;
+      return false;
+    });
+    const capsulesAll = deps.source.capsules();
+    const named = flows.map((flow, index) => ({ flow, name: flowName(flow, index) }));
+    const priorFlowHashes: Record<string, string> = {};
+    if (isRecord(deps.state.sentFlowHashes)) {
+      for (const [name, hash] of Object.entries(deps.state.sentFlowHashes))
+        if ('string' === typeof hash) priorFlowHashes[name] = hash;
+    } else if (deps.state.sentFlowsHash === hashPayload(flows))
+      for (const { flow, name } of named) priorFlowHashes[name] = hashPayload(flow);
+    // Only the flows that changed since the platform last took them; the platform upserts by name.
+    const pendingFlows = named.filter(
+      ({ flow, name }) => priorFlowHashes[name] !== hashPayload(flow),
+    );
+    const flowsHash = hashPayload(pendingFlows.map(({ flow }) => flow));
+    const capsulesHash = hashPayload(capsulesAll);
+    const priorSets = isRecord(deps.state.refusedSets) ? deps.state.refusedSets : {};
+    const setsNotRetried: Array<{ part: SetPart; count: number; reason: string }> = [];
+    const refusedSets: Partial<Record<SetPart, RefusedSet>> = {};
+    /** A set is due when it changed, or when it was refused and the platform now reads more. */
+    const due = (
+      part: SetPart,
+      hash: string,
+      size: number,
+      sentHash: string | undefined,
+    ): boolean => {
+      if (0 === size) return false;
+      const prior = priorSets[part];
+      if (prior !== undefined && prior.hash === hash) {
+        if (!refusalHolds(prior, stamp)) return true;
+        refusedSets[part] = prior;
+        setsNotRetried.push({ part, count: prior.count, reason: prior.reason });
+        return false;
+      }
+      return hash !== sentHash;
+    };
+    const flowsChanged = due('flow', flowsHash, pendingFlows.length, undefined);
+    const capsulesChanged = due(
+      'capsule',
+      capsulesHash,
+      capsulesAll.length,
+      deps.state.sentCapsulesHash,
+    );
+    // Each flow names the version it was based on; a stale base is answered with a conflict.
+    const priorVersions = versionsIn(deps.state.flowVersions);
+    const taken: Record<string, string> = {};
+    if (flowsChanged) {
+      bundle['flows'] = pendingFlows.map(({ flow }) => flow);
+      bundle['flowBases'] = flowBases(pendingFlows, priorVersions, priorFlowHashes);
+    }
+    const conflictCopies: string[] = [];
+    // What the platform holds from here once this cycle is answered: kept for the flows still here.
+    const flowHashes: Record<string, string> = {};
+    for (const { name } of named) {
+      const hash = priorFlowHashes[name];
+      if (hash !== undefined) flowHashes[name] = hash;
+      const v = priorVersions[name];
+      if (v !== undefined) taken[name] = v;
+    }
+    const capsules = capsulesChanged ? capsulesAll : [];
+    if (capsules.length > 0) bundle['capsules'] = capsules;
+
+    let runsSent = 0;
+    let flowsSent = 0;
+    let capsulesSent = 0;
+    const runsRejected: Array<{ index: number; reason: string }> = [];
+    const refused: Refusal[] = [];
+    const derivedSent: DerivedKind[] = [];
+    let pushError: string | undefined;
+    /*
+     * Runs go up in bounded batches; everything else rides in the first. One request used to carry
+     * the whole backlog, and a backlog over the platform's body limit was refused whole, forever.
+     */
+    const batches = batchRuns(sendable);
+    const requests =
+      Object.keys(bundle).length > 0 || batches.length > 0 ? Math.max(1, batches.length) : 0;
+    let offset = 0;
+    for (let i = 0; i < requests; i += 1) {
+      const batch = batches[i] ?? [];
+      const body: Record<string, unknown> = 0 === i ? { ...bundle } : {};
+      if (batch.length > 0) body['runs'] = batch.map((r) => r.payload);
+      // The flows ride here too: a default flag stays out of them, as on disk.
+      const pushed = await call(SYNC_PATH, {
+        method: 'POST',
+        body: JSON.stringify(body, flowJsonReplacer),
+      });
+      if (200 !== pushed.status) {
+        pushError = `sync ${String(pushed.status)}: ${pushed.text.slice(0, 200)}`;
+        break;
+      }
+      const answer = isRecord(pushed.json) ? pushed.json : {};
+      // Runs were sent and the answer says nothing about them: a proxy's 200 page, an empty body.
+      // Delivered means the server said so. Recording them as sent here dropped them for good while
+      // the cycle reported ok; they stay queued, and the reason is the cycle's error.
+      if (batch.length > 0 && !isRecord(answer['runs'])) {
+        pushError = MSG_RUNS_UNCONFIRMED;
+        break;
+      }
+      const runs = partResult(answer, 'runs');
+      runsSent += runs.accepted;
+      // Accepted means the server has it. A rejected run was refused by index, so it is exactly as
+      // unsent as it was before and must never be remembered as delivered.
+      const refusedHere = new Map(runs.rejected.map((r) => [r.index, r.reason]));
+      batch.forEach((run, index) => {
+        const reason = refusedHere.get(index);
+        if (reason === undefined) {
+          known.add(run.runId);
+          recorded[run.runId] = hashPayload(run.payload);
+        } else refusedRuns[run.runId] = { reason, payloadHash: hashPayload(run.payload), ...stamp };
+      });
+      runsRejected.push(
+        ...runs.rejected.map((r) => ({ index: r.index + offset, reason: r.reason })),
+      );
+      offset += batch.length;
+      if (0 !== i) continue;
+      // Absent means the server said nothing about a part — an older one that does not know the
+      // field. Read as zero accepted, never as an error: an added field must not break a sync.
+      const flowsPart = partResult(answer, 'flows');
+      const capsulesPart = partResult(answer, 'capsules');
+      flowsSent = flowsPart.accepted;
+      capsulesSent = capsulesPart.accepted;
+      const refusedFlows = new Set(flowsPart.rejected.map((r) => r.index));
+      const answered = isRecord(answer['flows']) ? answer['flows']['versions'] : undefined;
+      if (flowsChanged)
+        pendingFlows.forEach(({ flow, name }, index) => {
+          if (refusedFlows.has(index)) return;
+          flowHashes[name] = hashPayload(flow);
+          const v = isRecord(answered) ? answered[name] : undefined;
+          if ('string' === typeof v) taken[name] = v;
+        });
+      // Another machine saved over the version this edit was based on: keep both, take theirs.
+      flowsPart.rejected = flowsPart.rejected.filter((r) => {
+        const name = pendingFlows[r.index]?.name;
+        const theirs = conflictOf(r);
+        if (name === undefined || theirs === undefined) return true;
+        const copy = deps.sink.resolveFlowConflict?.(name, theirs.flow);
+        if (copy === undefined) return true;
+        conflictCopies.push(copy);
+        flowHashes[name] = hashPayload(theirs.flow);
+        taken[name] = theirs.version;
+        return false;
+      });
+      for (const r of flowsPart.rejected) {
+        const name = pendingFlows[r.index]?.name ?? flowName(undefined, r.index);
+        refused.push({
+          part: 'flow',
+          reason:
+            FlowErrorCode.WRONG_VERSION === r.code && 'number' === typeof r.version
+              ? `${name} is version ${String(r.version)} — ${FLOW_VERSION_FIX}`
+              : `flow ${name}: ${r.reason}`,
+        });
+      }
+      for (const r of capsulesPart.rejected)
+        refused.push({ part: 'capsule', reason: `capsule #${String(r.index)}: ${r.reason}` });
+      const firstOf = (part: SetPart): string =>
+        refused.find((r) => r.part === part)?.reason ?? 'no reason given';
+      if (flowsPart.rejected.length > 0)
+        refusedSets.flow = {
+          hash: flowsHash,
+          ...stamp,
+          count: flowsPart.rejected.length,
+          reason: firstOf('flow'),
+        };
+      if (capsulesPart.rejected.length > 0)
+        refusedSets.capsule = {
+          hash: capsulesHash,
+          ...stamp,
+          count: capsulesPart.rejected.length,
+          reason: firstOf('capsule'),
+        };
+      // `state` has a key per record sent: "accepted", or the message that refused it.
+      const state = isRecord(answer['state']) ? answer['state'] : {};
+      for (const kind of derivedOffered) {
+        const verdict = state[kind];
+        if ('accepted' === verdict) {
+          derivedSent.push(kind);
+          nextState.sentDerivedHashes = {
+            ...nextState.sentDerivedHashes,
+            [kind]: hashPayload(bundle[kind]),
+          };
+        } else if ('string' === typeof verdict)
+          refused.push({ part: kind, reason: `${kind}: ${verdict}` });
+      }
+    }
+    // A flow the platform took from here and that is gone from disk is deleted there by name: it
+    // does not infer a deletion from a missing name, since another clone may still hold the flow.
+    const onDisk = new Set(deps.source.flows().map(flowName));
+    const kept: string[] = [];
+    for (const name of deps.projectId === undefined ? [] : (deps.state.sentFlowNames ?? [])) {
+      if (onDisk.has(name)) {
+        kept.push(name);
+        continue;
+      }
+      const gone = await call(
+        `${FLOWS_PATH}/${encodeURIComponent(name)}?projectId=${encodeURIComponent(deps.projectId ?? '')}`,
+        { method: 'DELETE' },
+      );
+      if (2 !== Math.floor(gone.status / 100) && 404 !== gone.status) kept.push(name);
+    }
+    if (deps.projectId !== undefined) nextState.sentFlowNames = kept;
+    // Every cycle, so a flow gone from here is forgotten too: saved again, it goes again.
+    nextState.sentFlowHashes = flowHashes;
+    nextState.flowVersions = taken;
+    // Open until the person deletes the copy (or merges it back): counted on every cycle till then.
+    const flowConflicts = [...(deps.state.flowConflicts ?? []), ...conflictCopies].filter(
+      (copy, i, all) =>
+        all.indexOf(copy) === i && (onDisk.has(copy) || conflictCopies.includes(copy)),
+    );
+    nextState.flowConflicts = flowConflicts;
+    delete nextState.sentFlowsHash;
+    if (requests > 0 && pushError === undefined) {
+      nextState.lastPushAt = deps.now();
+      // The platform answered for these sets, refusals included (reported above, and not re-offered
+      // until the set changes — the same rule as a refused run).
+      if (flowsChanged && deps.projectId !== undefined)
+        nextState.sentFlowNames = [...new Set([...kept, ...flows.map(flowName)])];
+      if (capsules.length > 0) nextState.sentCapsulesHash = capsulesHash;
+    }
+    nextState.refusedRuns = refusedRuns;
+    nextState.refusedSets = refusedSets;
+    if (pushError !== undefined) {
+      nextState.sentRunIds = allRuns.map((r) => r.runId).filter((id) => known.has(id));
+      nextState.sentRunHashes = heldHashes(allRuns, recorded);
+      deps.sink.writeState({ ...nextState, lastError: pushError });
+      return {
+        ...empty,
+        runsSent,
+        runsRejected,
+        flowsSent,
+        capsulesSent,
+        derivedSent,
+        refused,
+        held: heldBack,
+        notRetried,
+        error: pushError,
+      };
+    }
+
+    /*
+     * Bounded by the runs still on disk rather than by a cap. Retention already decides how many
+     * runs a workspace keeps, and an id for a run nobody holds any more cannot stop an upload that
+     * will never be attempted — so the record follows the artifacts and needs no number of its own.
+     */
+    nextState.sentRunIds = allRuns.map((r) => r.runId).filter((id) => known.has(id));
+    nextState.sentRunHashes = heldHashes(allRuns, recorded);
+
+    // 2b. The step screenshots of every run the platform now holds, once each.
+    let screenshotsSent = 0;
+    const readImage = deps.source.screenshot;
+    if (readImage !== undefined) {
+      const shots = await syncScreenshots({
+        runs: allRuns,
+        accepted: (runId) => known.has(runId),
+        readImage,
+        state: deps.state,
+        post: (path, body) => call(path, { method: 'POST', body }),
+      });
+      screenshotsSent = shots.sent;
+      Object.assign(nextState, shots.state);
+      if (shots.error !== undefined) heldBack.push(shots.error);
+    }
+
+    // 3. COLLECT — always, even when there was nothing to send.
+    const query =
+      nextState.cursor === undefined ? '' : `?since=${encodeURIComponent(nextState.cursor)}`;
+    const pull = await call(`${SYNC_PULL_PATH}${query}`);
+    if (200 !== pull.status) {
+      // The push already landed; report it rather than throwing the whole cycle away.
+      const error = `pull ${String(pull.status)}: ${pull.text.slice(0, 200)}`;
+      deps.sink.writeState({ ...nextState, lastError: error });
+      return {
+        ...empty,
+        ok: false,
+        runsSent,
+        flowsSent,
+        capsulesSent,
+        derivedSent,
+        runsRejected,
+        refused,
+        held: heldBack,
+        notRetried,
+        error,
+      };
+    }
+    const pulled = isRecord(pull.json) ? (pull.json as PullResponse) : {};
+    const decisions = pulled.triage ?? [];
+
+    // 4. APPLY.
+    if (decisions.length > 0) {
+      const triage: Record<string, PulledIssue> = {};
+      for (const d of decisions) {
+        triage[d.fingerprint] = {
+          status: d.status,
+          flowName: d.flowName ?? null,
+          title: d.title ?? '',
+          at: d.at,
+        };
+      }
+      deps.sink.writeIssues({ triage });
+    }
+    // The cursor is written even on an empty page: it is the server's, and it never goes backwards.
+    if ('string' === typeof pulled.cursor) nextState.cursor = pulled.cursor;
+    nextState.lastPullAt = deps.now();
+
+    const report: SyncReport = {
+      // Anything refused, or any artifact held back, means the dashboard is missing something.
+      ok:
+        0 === runsRejected.length &&
+        0 === refused.length &&
+        0 === notRetried.length &&
+        0 === setsNotRetried.length &&
+        !heldArtifacts,
+      runsSent,
+      ...(0 === screenshotsSent ? {} : { screenshotsSent }),
+      runsRejected,
+      flowsSent,
+      ...(0 === flowConflicts.length ? {} : { flowConflicts }),
+      capsulesSent,
+      derivedSent,
+      refused,
+      held: heldBack,
+      notRetried,
+      setsNotRetried,
+      pulled: decisions.length,
+      morePending: true === pulled.more,
+      /*
+       * Nothing on disk at all, as opposed to nothing NEW. Computed from what the source offered
+       * before any cursor filtering, because a repo whose runs were all already pushed is healthy
+       * and a repo that has never recorded one is usually misconfigured.
+       */
+      localIsEmpty:
+        0 === allRuns.length &&
+        0 === deps.source.flows().length &&
+        DERIVED_RECORDS.every(({ kind }) => deps.source.derived(kind) === undefined),
+    };
+    /*
+     * A refusal is kept as the last error rather than cleared by a completed exchange: it is what
+     * `reticle whoami` shows, and "the transfer worked" is not "the dashboard has it".
+     */
+    if (report.ok) delete nextState.lastError;
+    else nextState.lastError = problemsOf(report).join('; ');
+    deps.sink.writeState(nextState);
+    return report;
+  } catch (error: unknown) {
+    // A network that is down is not an error condition for a local-first tool; it is Tuesday.
+    const message = describeTransportError(error, deps.config.url);
+    deps.sink.writeState({ ...nextState, lastError: message });
+    return { ...empty, error: message };
+  }
+}

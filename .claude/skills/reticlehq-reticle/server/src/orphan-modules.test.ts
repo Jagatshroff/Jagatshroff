@@ -1,0 +1,62 @@
+import { describe, expect, it } from 'vitest';
+import { join } from 'node:path';
+
+import { scanPackage } from '../../scripts/orphan-scan.mjs';
+
+/**
+ * A module that nothing imports must be declared unwired, not discovered later as dead code.
+ *
+ * The last package to get this, and deliberately the last: it is the largest, and a first run
+ * over fifty-nine directories is exactly the situation that produced seventeen false findings in
+ * `engine`. So it was measured first, then written.
+ *
+ * Eleven modules have no PRODUCTION importer, and every one of them is imported by tests. That
+ * splits two ways, and the split is the point of the list below:
+ *
+ *   **Test infrastructure living in `src/`** — `machine/temp-dir` (33 test importers), `fake-session`
+ *   (11), `memory-fs` (7), `workspace-packages` (4), `import-graph` (2). Real, used constantly,
+ *   and invisible to this scan because the scan deliberately ignores test importers: a module
+ *   kept alive only by tests is exactly what it is looking for. These are the false positives
+ *   that shape has, and naming them is cheaper than teaching the scanner about helper files.
+ *
+ *   **Product code whose only caller is its own test** — the other six. Each is finished,
+ *   tested, and unreachable from `index.ts` or any command. That is not the same as dead: one
+ *   says outright that it exists to prove a gate. But "written, proved by a test, and called by
+ *   nothing" is a state worth being able to see, and until now this package could not show it.
+ *
+ * The list is the finding. It is not a backlog this file is asking anybody to clear, and
+ * shortening it by deleting working code would be the wrong reading.
+ */
+
+const PACKAGE_DIR = join(__dirname, '..');
+
+/** Modules with no production importer, each with the reason it is allowed to stay. */
+const DECLARED_UNWIRED: Record<string, string> = {
+  // ── test infrastructure that happens to live in src/ ────────────────────────────────────────
+  'machine/temp-dir.ts': 'test helper: makes and removes scratch directories. 33 test importers.',
+  'portal/session/fake-session.ts':
+    'the typed Session double every connection test builds on. 11 test importers, and the ' +
+    'reason those tests cannot silently drift from the real interface.',
+  'memory/project/memory-fs.ts':
+    'an in-memory FileSystemPort, so a test can exercise project code without touching disk.',
+  'features/harness/explore/console-pages.ts':
+    'pages of the real console read by a live drive, which the exploratory Harness tests replay.',
+  'features/harness/explore/fake-app.ts':
+    'a pretend app the exploratory Harness tests replay recorded persona misses against.',
+  'workspace-packages.ts': 'reads the workspace layout; used by the cross-package guards.',
+  'import-graph.ts': 'builds the import graph the boundary guards assert over.',
+};
+
+describe('no undeclared orphan modules', () => {
+  const { orphans, stale } = scanPackage(PACKAGE_DIR, DECLARED_UNWIRED);
+
+  it('every module without a production importer is declared, with a reason', () => {
+    expect(orphans).toEqual([]);
+  });
+
+  it('every declared entry is still an orphan — a wired one must be removed from the list', () => {
+    // The half that keeps the list honest as the code moves. Wiring one of these up without
+    // removing its line would leave a reason that is no longer true sitting in the file.
+    expect(stale).toEqual([]);
+  });
+});

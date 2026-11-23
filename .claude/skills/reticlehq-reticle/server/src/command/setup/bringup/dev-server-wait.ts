@@ -1,0 +1,202 @@
+/**
+ * Deciding when a dev server we started is up, hung, or gone.
+ *
+ * Nothing else in the package owns a spawned dev server, so this is the one genuinely new decision
+ * setup contributes. All three cases below were failures in the field:
+ *
+ * - a url in the output is an ANNOUNCEMENT, not readiness. Next prints `- Local: …` before it can
+ *   serve, so a tab opened on that line lands on a 404 and the whole connect budget is then spent
+ *   blaming the SDK for a server that had not finished starting.
+ * - a launcher that EXITS is not necessarily a dead server. `astro dev` forks the real one, prints
+ *   the url and returns, which was read as death and failed Astro every time.
+ * - a fixed budget is the wrong instrument for "is this hung?". The heaviest real monorepo builds
+ *   two shared packages before its app serves and was measured taking twenty minutes, while a
+ *   genuinely wedged server writes nothing at all and gets exactly the same budget.
+ */
+
+/** Everything the decision needs, gathered by the caller. */
+export interface WaitFacts {
+  /** The dev server's own output so far. */
+  readonly output: string;
+  /** Whether the process we spawned has exited. */
+  readonly launcherExited: boolean;
+  /** Whether the url we are watching answers. */
+  readonly serving: boolean;
+  /** Milliseconds since the dev server last wrote anything. */
+  readonly quietForMs: number;
+  /** Milliseconds since the wait began. */
+  readonly elapsedMs: number;
+  /** Explicit caller limit; otherwise a busy build keeps the default ceiling. */
+  readonly budgetMs?: number | undefined;
+  /**
+   * How long silence may mean "still starting" on THIS machine. Defaults to QUIET_MEANS_HUNG_MS.
+   *
+   * Passed in rather than read from the platform here, so this stays a pure decision and exactly one
+   * caller owns the platform check. 45s is generous on a laptop and tight on a cold Windows runner,
+   * where a first `npm run dev` optimises dependencies before Vite prints a line.
+   */
+  readonly quietMeansHungMs?: number;
+}
+
+export const WaitVerdict = {
+  /** It is up. Carry on. */
+  READY: 'ready',
+  /** Still building or still starting; keep waiting. */
+  WAITING: 'waiting',
+  /** The launcher exited and nothing it started is answering. */
+  DEAD: 'dead',
+  /** It has gone silent without ever serving. */
+  HUNG: 'hung',
+} as const;
+export type WaitVerdict = (typeof WaitVerdict)[keyof typeof WaitVerdict];
+
+/** Silence for this long, with nothing served, means hung rather than busy. */
+export const QUIET_MEANS_HUNG_MS = 45_000;
+/** Even a talkative dev server has had enough rope by here. */
+export const WAIT_CEILING_MS = 25 * 60_000;
+
+/**
+ * Whether to keep waiting.
+ *
+ * `serving` outranks everything: a launcher that exited while the port answers has DAEMONIZED, and
+ * that is a live server whatever its parent did.
+ */
+export function judgeWait(facts: WaitFacts): WaitVerdict {
+  if (facts.serving) return WaitVerdict.READY;
+  if (facts.launcherExited) return WaitVerdict.DEAD;
+  if (facts.elapsedMs >= (facts.budgetMs ?? WAIT_CEILING_MS)) return WaitVerdict.HUNG;
+  // Output IS progress. Silence is what distinguishes a build from a wedge.
+  return facts.quietForMs >= (facts.quietMeansHungMs ?? QUIET_MEANS_HUNG_MS)
+    ? WaitVerdict.HUNG
+    : WaitVerdict.WAITING;
+}
+
+/**
+ * CRA (and webpack) print a prompt rather than a URL when their default port is taken, then exit
+ * or hang waiting for a tty. Setup used to report only "exited without serving anything", which
+ * hid the port that was actually busy (#802).
+ */
+const CRA_PORT_BUSY = /Something is already running on port (\d+)/i;
+const NAMED_PORT_BUSY = /Port (\d+) is (?:already )?in use/i;
+// Node prints `address already in use <address>:<port>`; the port sits after the last colon of the
+// address, so the first digit can belong to the host (`0.0.0.0:3000` said port 0, #1846). The scan
+// also stops at the line end: the stack frame under the error (`at Server (node:net:1817:16)`)
+// carries digits of its own, and they are not the port.
+const EADDRINUSE_PORT = /(?:EADDRINUSE|address already in use)[^\d\n]*(?:.*:)?(\d+)/i;
+
+export function portBusyMessage(output: string): string | undefined {
+  const match =
+    CRA_PORT_BUSY.exec(output) ?? NAMED_PORT_BUSY.exec(output) ?? EADDRINUSE_PORT.exec(output);
+  const port = match?.[1];
+  if (undefined === port) return undefined;
+  return (
+    `port ${port} is already in use — something else is serving there, so this launcher did not ` +
+    `bind. Pass --url http://localhost:${port} if that process is this app, or free the port and re-run.`
+  );
+}
+
+/** How many of the dev server's last lines a failure quotes. Enough for a stack's first frames. */
+const DIED_TAIL_LINES = 6;
+
+/**
+ * The dev server died before serving: say so, and quote the end of what it printed.
+ *
+ * Without the tail the reason was invisible: a missing `vite` binary printed `vite: command not
+ * found` to its own log, setup said only "exited without serving anything", and its first remedy
+ * ("start the dev server yourself") failed the same way.
+ */
+export function devServerDiedMessage(output: string): string {
+  const tail = output
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => 0 < line.trim().length)
+    .slice(-DIED_TAIL_LINES);
+  return 0 === tail.length
+    ? 'The dev server exited without serving anything, and printed nothing.'
+    : `The dev server exited without serving anything. The last it printed:\n${tail.map((line) => `    ${line}`).join('\n')}`;
+}
+
+/** A url the dev server announced, if it has announced one. Never composed, only read. */
+const URL_IN_OUTPUT = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d+/;
+
+export function announcedUrl(output: string): string | undefined {
+  return URL_IN_OUTPUT.exec(output)?.[0];
+}
+
+/**
+ * The url to watch: whatever the tool announced, else one composed from a port we OBSERVED our own
+ * process group binding.
+ *
+ * The second is not a guess. `react-scripts` prints no parseable url outside a tty, so a CRA app
+ * compiled successfully, served happily, and setup timed out insisting no url appeared — the
+ * evidence there is the process we spawned, not a convention.
+ */
+/** Every url announced in the output, with the line that announced it, in order. */
+const URLS_IN_OUTPUT = new RegExp(URL_IN_OUTPUT.source, 'g');
+
+/** What says which announced url is the app's: the port it should take, and its folder or package. */
+export interface AppUrlHint {
+  readonly port?: number | undefined;
+  readonly names?: readonly string[] | undefined;
+}
+
+/** Does the text before a url name `name` as a whole word (`frontend dev:`, `@acme/web:dev:`)? */
+function lineNames(prefix: string, name: string): boolean {
+  if (0 === name.length) {
+    return false;
+  }
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s/@:])${escaped}(?=[\\s:]|$)`).test(prefix);
+}
+
+/**
+ * The app's url among those the output announced.
+ *
+ * Reported from the field: in a pnpm workspace `init` ran the root `dev` script, which started the
+ * Vite app and a Fastify API. The API announced first, init probed it and reported "the SDK is NOT
+ * in the page". When several urls are announced, the one on the port the app is expected to take
+ * wins, else the one on a line that names the app (workspace runners prefix each line with the
+ * package). With neither, the first url, as before.
+ */
+function announcedInOrder(output: string, hint: AppUrlHint | undefined): string[] {
+  const found: { url: string; prefix: string }[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    for (const match of line.matchAll(URLS_IN_OUTPUT)) {
+      found.push({ url: match[0], prefix: line.slice(0, match.index) });
+    }
+  }
+  const names = hint?.names ?? [];
+  const isApp = (f: { url: string; prefix: string }): boolean =>
+    (hint?.port !== undefined && Number(new URL(f.url).port) === hint.port) ||
+    names.some((name) => lineNames(f.prefix, name));
+  const urls = [...found.filter(isApp), ...found.filter((f) => !isApp(f))].map((f) => f.url);
+  return [...new Set(urls)];
+}
+
+/**
+ * Every url that may be the app's, best first: the announced urls the hint names as the app's,
+ * then the other announced urls in order, then a url for each port our process group bound.
+ */
+export function candidateUrls(
+  output: string,
+  observedPorts: readonly number[],
+  hint?: AppUrlHint,
+): string[] {
+  const announced = announcedInOrder(output, hint);
+  const announcedPorts = new Set(announced.map((u) => Number(new URL(u).port)));
+  const observed = observedPorts
+    .filter((port) => !announcedPorts.has(port))
+    .map((port) => `http://localhost:${String(port)}`);
+  return [...announced, ...observed];
+}
+
+export function urlToWatch(
+  output: string,
+  observedPorts: readonly number[],
+  hint?: AppUrlHint,
+): string | undefined {
+  const announced = announcedInOrder(output, hint)[0];
+  if (undefined !== announced) return announced;
+  const port = observedPorts[0];
+  return undefined === port ? undefined : `http://localhost:${port}`;
+}
