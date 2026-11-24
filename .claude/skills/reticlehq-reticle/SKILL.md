@@ -1,3 +1,8 @@
+---
+name: reticlehq-reticle
+description: Reticle overview — the proof layer for AI coding agents. A dev-only SDK inside the user's running app exposes reticle_* MCP tools that read the DOM, network, routing, console and framework state, so you act on the real app and get a verdict (yes/no/unknown) with evidence and file:line. Use when verifying a UI/web-app change against the running app, or when deciding to wire Reticle into an app.
+---
+
 # Reticle
 
 Reticle is the proof layer for AI coding agents. A dev-only SDK inside the user's running app gives you `reticle_*` MCP tools that read the DOM, network, routing, console and framework state. You act on the real app and get a verdict: `yes`, `no`, or `unknown` (could not tell), with evidence and the `file:line` to open. No screenshots: it drives the tab the user already has open.

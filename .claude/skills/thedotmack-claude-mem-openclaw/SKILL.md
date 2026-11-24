@@ -1,3 +1,8 @@
+---
+name: thedotmack-claude-mem-openclaw
+description: Set up the claude-mem OpenClaw plugin on an OpenClaw gateway, giving agents persistent memory across sessions via system-prompt context injection, with an optional real-time observation feed to a messaging channel. Use when configuring claude-mem memory on an OpenClaw gateway.
+---
+
 # Claude-Mem OpenClaw Plugin — Setup Guide
 
 This guide walks through setting up the claude-mem plugin on an OpenClaw gateway. By the end, your agents will have persistent memory across sessions via system prompt context injection, and optionally a real-time observation feed streaming to a messaging channel.
